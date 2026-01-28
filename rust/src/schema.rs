@@ -64,16 +64,24 @@ impl SchemaType {
 #[derive(Debug, Clone)]
 pub struct PropertyBlueprint {
     pub name: String,
-    /// the allowed types for this property (supports union types like ["string", "null"])
+    /// allowed types (supports union types)
     pub schema_types: Vec<SchemaType>,
     pub properties: HashMap<String, PropertyBlueprint>,
-    /// for arrays: the schema of array items
+    /// for arrays: item schema
     pub items: Option<Box<PropertyBlueprint>>,
     pub required: bool,
-    /// for enums: the allowed values (as serialized JSON bytes)
+    /// for enums: allowed values (serialized json bytes)
     pub enum_values: Option<Vec<Vec<u8>>>,
-    /// for strings: regex pattern constraint
+    /// for strings: regex pattern
     pub pattern: Option<String>,
+    /// for strings: min char count
+    pub min_length: Option<usize>,
+    /// for strings: max char count
+    pub max_length: Option<usize>,
+    /// for arrays: min item count
+    pub min_items: Option<usize>,
+    /// for arrays: max item count
+    pub max_items: Option<usize>,
 }
 
 impl PropertyBlueprint {
@@ -115,6 +123,14 @@ impl PropertyBlueprint {
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
         
+        // parse string length constraints
+        let min_length = value.get("minLength").and_then(|v| v.as_u64()).map(|n| n as usize);
+        let max_length = value.get("maxLength").and_then(|v| v.as_u64()).map(|n| n as usize);
+        
+        // parse array length constraints
+        let min_items = value.get("minItems").and_then(|v| v.as_u64()).map(|n| n as usize);
+        let max_items = value.get("maxItems").and_then(|v| v.as_u64()).map(|n| n as usize);
+        
         PropertyBlueprint {
             name: name.to_string(),
             schema_types,
@@ -123,6 +139,10 @@ impl PropertyBlueprint {
             required: false,
             enum_values,
             pattern,
+            min_length,
+            max_length,
+            min_items,
+            max_items,
         }
     }
     

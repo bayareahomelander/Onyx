@@ -95,7 +95,7 @@ def format_metrics_log(
     ]
     
     if ffi_overhead_us < 1.0:
-        lines.append("ffi overhead is sub-microsecond, the hybrid architecture is viable for high-frequency token generation.")
+        lines.append("ffi overhead is sub-microsecond, hybrid architecture viable for high-frequency token generation.")
     elif ffi_overhead_us < 5.0:
         lines.append("ffi overhead < 5 microseconds, acceptable for token generation loops.")
     elif ffi_overhead_us < 10.0:

@@ -28,19 +28,25 @@ pub enum ObjectSyntaxState {
     ExpectCommaOrEnd,
 }
 
-/// state for parsing a JSON string value
+/// state for parsing a json string value
 #[derive(Debug, Clone)]
 pub struct StringState {
-    /// whether we've seen the opening quote
+    /// opening quote seen
     started: bool,
-    /// whether we're in an escape sequence
+    /// in escape sequence
     in_escape: bool,
-    /// optional compiled DFA for pattern validation
+    /// compiled dfa for pattern validation
     pattern_dfa: Option<dense::DFA<Vec<u32>>>,
-    /// current DFA state (if pattern is active)
+    /// current dfa state
     dfa_state: Option<StateID>,
-    /// initial DFA state for reset
+    /// initial dfa state
     dfa_initial: Option<StateID>,
+    /// chars consumed so far
+    char_count: usize,
+    /// min chars required
+    min_length: Option<usize>,
+    /// max chars allowed
+    max_length: Option<usize>,
 }
 
 impl Default for StringState {
@@ -51,12 +57,15 @@ impl Default for StringState {
             pattern_dfa: None,
             dfa_state: None,
             dfa_initial: None,
+            char_count: 0,
+            min_length: None,
+            max_length: None,
         }
     }
 }
 
 impl StringState {
-    /// create a new string state with the opening quote already seen
+    /// new string state with opening quote seen
     pub fn new_started() -> Self {
         StringState {
             started: true,
@@ -64,10 +73,27 @@ impl StringState {
             pattern_dfa: None,
             dfa_state: None,
             dfa_initial: None,
+            char_count: 0,
+            min_length: None,
+            max_length: None,
         }
     }
     
-    /// create a string state with a regex pattern constraint
+    /// string state with length constraints
+    pub fn with_constraints(min_len: Option<usize>, max_len: Option<usize>) -> Self {
+        StringState {
+            started: true,
+            in_escape: false,
+            pattern_dfa: None,
+            dfa_state: None,
+            dfa_initial: None,
+            char_count: 0,
+            min_length: min_len,
+            max_length: max_len,
+        }
+    }
+    
+    /// string state with regex pattern
     pub fn with_pattern(pattern: &str) -> Self {
         match compile_pattern_dfa(pattern) {
             Ok(compiled) => {
@@ -77,13 +103,25 @@ impl StringState {
                     pattern_dfa: Some(compiled.dfa),
                     dfa_state: Some(compiled.initial_state),
                     dfa_initial: Some(compiled.initial_state),
+                    char_count: 0,
+                    min_length: None,
+                    max_length: None,
                 }
             }
-            Err(_) => {
-                // if pattern compilation fails, fall back to unconstrained string
-                StringState::new_started()
-            }
+            Err(_) => StringState::new_started()
         }
+    }
+    
+    /// string state with pattern and length constraints
+    pub fn with_pattern_and_constraints(pattern: Option<&str>, min_len: Option<usize>, max_len: Option<usize>) -> Self {
+        let mut state = if let Some(p) = pattern {
+            StringState::with_pattern(p)
+        } else {
+            StringState::new_started()
+        };
+        state.min_length = min_len;
+        state.max_length = max_len;
+        state
     }
 }
 
@@ -156,13 +194,19 @@ pub enum ArraySyntaxState {
     ExpectCommaOrEnd,
 }
 
-/// state for parsing a JSON array
+/// state for parsing a json array
 #[derive(Debug, Clone)]
 pub struct ArrayState {
     /// current syntax state
     pub syntax_state: ArraySyntaxState,
-    /// the schema for array items
+    /// schema for array items
     pub item_blueprint: Option<Box<PropertyBlueprint>>,
+    /// items consumed so far
+    pub item_count: usize,
+    /// min items required
+    pub min_items: Option<usize>,
+    /// max items allowed
+    pub max_items: Option<usize>,
 }
 
 impl ArrayState {
@@ -170,6 +214,19 @@ impl ArrayState {
         ArrayState {
             syntax_state: ArraySyntaxState::Start,
             item_blueprint,
+            item_count: 0,
+            min_items: None,
+            max_items: None,
+        }
+    }
+    
+    pub fn with_constraints(item_blueprint: Option<Box<PropertyBlueprint>>, min: Option<usize>, max: Option<usize>) -> Self {
+        ArrayState {
+            syntax_state: ArraySyntaxState::Start,
+            item_blueprint,
+            item_count: 0,
+            min_items: min,
+            max_items: max,
         }
     }
 }
@@ -678,13 +735,13 @@ impl JsonEngine {
                                 *syntax_state = ObjectSyntaxState::ExpectCommaOrEnd;
                                 match prop_type {
                                     SchemaType::String => {
-                                        // check for regex pattern in property
+                                        // get pattern and length constraints
                                         let string_state = if let Some(prop) = blueprint.get_property(&key) {
-                                            if let Some(ref pattern) = prop.pattern {
-                                                StringState::with_pattern(pattern)
-                                            } else {
-                                                StringState::new_started()
-                                            }
+                                            StringState::with_pattern_and_constraints(
+                                                prop.pattern.as_deref(),
+                                                prop.min_length,
+                                                prop.max_length,
+                                            )
                                         } else {
                                             StringState::new_started()
                                         };
@@ -731,9 +788,11 @@ impl JsonEngine {
                                         return true;
                                     }
                                     SchemaType::Array => {
-                                        let items = blueprint.get_property(&key)
-                                            .and_then(|p| p.items.clone());
-                                        let mut arr_state = ArrayState::new(items);
+                                        let prop = blueprint.get_property(&key);
+                                        let items = prop.as_ref().and_then(|p| p.items.clone());
+                                        let min_items = prop.as_ref().and_then(|p| p.min_items);
+                                        let max_items = prop.as_ref().and_then(|p| p.max_items);
+                                        let mut arr_state = ArrayState::with_constraints(items, min_items, max_items);
                                         arr_state.syntax_state = ArraySyntaxState::ExpectValueOrEnd;
                                         stack.push(Scope::Array(arr_state));
                                         return true;
@@ -776,15 +835,16 @@ impl JsonEngine {
                 Scope::String(state) => {
                     if state.in_escape {
                         state.in_escape = false;
-                        // if pattern DFA exists, feed the escaped byte
+                        // feed escaped byte to dfa
                         if let (Some(dfa), Some(dfa_state)) = (&state.pattern_dfa, &mut state.dfa_state) {
-                            // advance DFA by the escaped byte
                             let new_state = dfa.next_state(*dfa_state, byte);
                             if dfa.is_dead_state(new_state) {
-                                return false;  // escaped character violates pattern
+                                return false;
                             }
                             *dfa_state = new_state;
                         }
+                        // count escaped char
+                        state.char_count += 1;
                         return true;
                     }
                     if byte == b'\\' {
@@ -792,26 +852,39 @@ impl JsonEngine {
                         return true;
                     }
                     if byte == b'"' {
-                        // closing quote - check if DFA is in match state
+                        // check minlength
+                        if let Some(min) = state.min_length {
+                            if state.char_count < min {
+                                return false;
+                            }
+                        }
+                        // check dfa match state
                         if let (Some(dfa), Some(dfa_state)) = (&state.pattern_dfa, state.dfa_state) {
                             let eoi_state = dfa.next_eoi_state(dfa_state);
                             if !dfa.is_match_state(eoi_state) {
-                                return false;  // pattern not satisfied
+                                return false;
                             }
                         }
-                        // string complete, pop and return to parent
+                        // string complete
                         stack.pop();
                         return true;
                     }
-                    // regular character - validate against DFA if present
+                    // check maxlength before accepting char
+                    if let Some(max) = state.max_length {
+                        if state.char_count >= max {
+                            return false;
+                        }
+                    }
+                    // validate against dfa
                     if let (Some(dfa), Some(dfa_state)) = (&state.pattern_dfa, &mut state.dfa_state) {
                         let new_state = dfa.next_state(*dfa_state, byte);
                         if dfa.is_dead_state(new_state) {
-                            return false;  // character violates pattern
+                            return false;
                         }
                         *dfa_state = new_state;
                     }
-                    // any other byte is valid in a string (if DFA allows)
+                    // count this char
+                    state.char_count += 1;
                     return true;
                 }
 
@@ -898,7 +971,12 @@ impl JsonEngine {
                                 return true;
                             }
                             if byte == b']' {
-                                // empty array, pop and update parent
+                                // check minitems before allowing close
+                                if let Some(min) = state.min_items {
+                                    if state.item_count < min {
+                                        return false;
+                                    }
+                                }
                                 stack.pop();
                                 if stack.is_empty() {
                                     *finished = true;
@@ -907,8 +985,15 @@ impl JsonEngine {
                                 }
                                 return true;
                             }
-                            // push a scope for the item based on item schema
+                            // check maxitems before allowing new item
+                            if let Some(max) = state.max_items {
+                                if state.item_count >= max {
+                                    return false;
+                                }
+                            }
+                            // push scope for item
                             state.syntax_state = ArraySyntaxState::ExpectCommaOrEnd;
+                            state.item_count += 1;
                             let item_bp = state.item_blueprint.clone();
                             return Self::push_value_scope(stack, &item_bp, byte);
                         }
@@ -918,10 +1003,22 @@ impl JsonEngine {
                                 return true;
                             }
                             if byte == b',' {
+                                // check maxitems before allowing more
+                                if let Some(max) = state.max_items {
+                                    if state.item_count >= max {
+                                        return false;
+                                    }
+                                }
                                 state.syntax_state = ArraySyntaxState::ExpectValueOrEnd;
                                 return true;
                             }
                             if byte == b']' {
+                                // check minitems
+                                if let Some(min) = state.min_items {
+                                    if state.item_count < min {
+                                        return false;
+                                    }
+                                }
                                 stack.pop();
                                 if stack.is_empty() {
                                     *finished = true;
