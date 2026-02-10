@@ -830,8 +830,14 @@ impl JsonEngine {
                                 return true;
                             }
                             if byte == b',' {
-                                *syntax_state = ObjectSyntaxState::ExpectKeyOrEnd;
-                                return true;
+                                // only accept comma if there are unused keys to follow
+                                let has_unused_key = blueprint.allowed_keys.iter()
+                                    .any(|k| !used_keys.contains(k));
+                                if has_unused_key {
+                                    *syntax_state = ObjectSyntaxState::ExpectKeyOrEnd;
+                                    return true;
+                                }
+                                return false;
                             }
                             if byte == b'}' {
                                 // only allow closing if all required keys have been provided
