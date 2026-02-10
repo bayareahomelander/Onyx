@@ -279,10 +279,10 @@ curl -X POST http://localhost:8000/v1/chat/completions \
 │                      Rust Backend (PyO3)                    │
 │  ┌────────────────────────────────────────────────────────┐ │
 │  │              GrammarConstraint Engine                  │ │
-│  │  • JSON Schema Engine (stack-based state machine)     │ │
-│  │  • DFA Compilation (regex-automata)                   │ │
-│  │  • Vocabulary Filtering (O(V) per token)              │ │
-│  │  • State Traversal (~270µs per mask)                  │ │
+│  │  • JSON Schema Engine (stack-based state machine)      │ │
+│  │  • DFA Compilation (regex-automata)                    │ │
+│  │  • Vocabulary Filtering (O(V) per token)               │ │
+│  │  • State Traversal (~270µs per mask)                   │ │
 │  └────────────────────────────────────────────────────────┘ │
 └─────────────────────────────────────────────────────────────┘
 ```
