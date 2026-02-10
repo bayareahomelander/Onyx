@@ -2,7 +2,7 @@
 
 ## Abstract
 
-Large language models frequently fail to produce syntactically valid structured outputs, creating reliability challenges for agentic applications that depend on parseable JSON, SQL, or domain-specific formats. We present a method that combines grammar-constrained decoding with speculative execution to address both reliability and latency concerns. Our approach applies deterministic finite automaton (DFA) constraints to both draft and target models in a speculative decoding pipeline, ensuring that proposed tokens are grammatically valid before verification. Experiments on Apple Silicon hardware demonstrate that this "grammar-aware" speculation achieves 100% output compliance for simple patterns while providing measurable speedups on memory-bandwidth-bound models. With a 7B parameter target model, we observe a 1.09x throughput improvement over single-model constrained generation. We also report that smaller compute-bound models (1.5B) do not benefit from speculation, achieving 0.94x of baseline performance—an expected result given the different bottleneck characteristics. These findings suggest that grammar-aware speculative decoding offers a practical path toward reliable structured generation at scale, though its benefits are contingent on model size and hardware constraints.
+Large language models frequently fail to produce syntactically valid structured outputs, creating reliability challenges for agentic applications that depend on parseable JSON, SQL, or domain-specific formats. We present a method that combines grammar-constrained decoding with speculative execution to address both reliability and latency concerns. Our approach applies grammar constraints—both DFA-based regex enforcement and a stack-based JSON Schema engine—to both draft and target models in a speculative decoding pipeline, ensuring that proposed tokens are grammatically valid before verification. The JSON Schema engine supports nested objects, typed arrays, union types, enum restrictions, regex patterns on string fields, and length constraints, enabling structure-aware generation beyond regular languages. Experiments on Apple Silicon hardware demonstrate that this "grammar-aware" speculation achieves 100% output compliance while providing measurable speedups on memory-bandwidth-bound models. With a 7B parameter target model, we observe a 1.09x throughput improvement over single-model constrained generation. We also report that smaller compute-bound models (1.5B) do not benefit from speculation, achieving 0.94x of baseline performance—an expected result given the different bottleneck characteristics. These findings suggest that grammar-aware speculative decoding offers a practical path toward reliable structured generation at scale, though its benefits are contingent on model size and hardware constraints.
 
 ---
 
@@ -45,19 +45,32 @@ Can grammar constraints be integrated into speculative decoding in a way that pr
 
 Our system, Onyx, consists of three primary components:
 
-1. **Grammar Engine** (Rust): Compiles regex patterns into DFAs and performs vocabulary filtering
+1. **Grammar Engine** (Rust): Compiles regex patterns into DFAs and JSON schemas into stack-based state machines, performs vocabulary filtering
 2. **Speculative Engine** (Python/MLX): Coordinates draft-verify-rollback cycles with grammar state management
 3. **API Server** (FastAPI): Provides OpenAI-compatible REST interface with grammar constraint extensions
 
 ### 2.2 Grammar Constraint Engine
 
-The grammar engine is implemented in Rust for performance and exposed to Python via PyO3. It maintains:
+The grammar engine is implemented in Rust for performance and exposed to Python via PyO3. It supports two complementary constraint modes:
+
+**Regex Mode (DFA-based):** For regular-language constraints (e.g., `[A-Z]{3}-[0-9]{4}`), the engine compiles the pattern into a deterministic finite automaton and maintains:
 
 - A pre-computed vocabulary table mapping token IDs to UTF-8 byte sequences
 - A compiled DFA representing the grammar constraint
 - State traversal logic that advances through the DFA as tokens are generated
 
-The key operation is `get_valid_token_ids(state)`, which returns all token IDs that, when appended to the current generation, would lead to a non-dead DFA state. This operation has O(V) complexity where V is the vocabulary size, but completes in approximately 270 microseconds for a 151,000-token vocabulary—acceptable overhead for generation loops running at 20-200 tokens per second.
+**JSON Schema Mode (Stack-based FSM):** For structured JSON generation, the engine uses a stack-based finite state machine that tracks nested context. The state machine maintains a scope stack where each frame represents the current structural context (object, array, string, number, boolean, null, or enum). It supports:
+
+- **Typed properties**: `string`, `number`, `integer`, `boolean`, `null`, `object`, `array`
+- **Nested objects**: Arbitrary nesting depth with per-property schema enforcement
+- **Required fields**: Object closure is blocked until all required keys are emitted
+- **Union types**: e.g., `["string", "null"]` for nullable fields
+- **Enum values**: Byte-level prefix matching against a fixed set of allowed values
+- **Regex patterns on strings**: DFA-compiled `pattern` validation on string content, integrated into the string scope
+- **Length constraints**: `minLength`/`maxLength` for strings (blocking close quote or new characters), `minItems`/`maxItems` for arrays (blocking close bracket or new items)
+- **Typed array items**: Schema enforcement applied to every array element via the item blueprint
+
+In both modes, the key operation is `get_valid_token_ids(state)`, which returns all token IDs that, when appended to the current generation, would lead to a valid state. This operation has O(V) complexity where V is the vocabulary size, but completes in approximately 270 microseconds for a 151,000-token vocabulary—acceptable overhead for generation loops running at 20-200 tokens per second.
 
 ### 2.3 Speculative Decoding with Grammar Awareness
 
@@ -328,7 +341,9 @@ The speedup benefits of grammar-aware speculation are contingent on the target m
 
 ### 5.2 Grammar Complexity
 
-Our evaluation focused on regex patterns. More complex grammars (context-free, context-sensitive) may have different performance characteristics. The DFA-based approach is limited to regular languages; extending to JSON schemas or recursive structures would require additional machinery.
+Our initial evaluation focused on regex patterns using the DFA-based engine. We have since extended the system with a stack-based JSON Schema engine that supports nested objects, typed arrays, union types, enum restrictions, regex patterns on string fields, and length constraints. This addresses the limitation of DFA-only approaches, which are restricted to regular languages. The JSON Schema engine handles recursive nesting through an explicit scope stack, avoiding the need for a full context-free grammar parser while supporting the structural complexity of real-world schemas.
+
+Remaining limitations include: the engine does not yet support JSON Schema features such as `$ref` (recursive schema references), `additionalProperties`, `oneOf`/`anyOf`/`allOf` combinators, or conditional schemas (`if`/`then`/`else`). These extensions represent potential future work.
 
 ### 5.3 Acceptance Rate Variability
 
@@ -360,13 +375,14 @@ All experiments use Apple's MLX framework [3], which provides efficient array op
 
 We presented grammar-aware speculative decoding, a technique that integrates grammar constraints into both draft and target models in a speculative decoding pipeline. Our experiments demonstrate that this approach:
 
-1. **Solves the reliability problem**: Constrained generation produces outputs that are guaranteed to match the specified grammar
+1. **Solves the reliability problem**: Constrained generation produces outputs that are guaranteed to match the specified grammar or schema
 2. **Addresses the blind draft problem**: Applying grammar constraints to the draft model improves acceptance rates from as low as 0% (blind) to 18-100% (aware)
 3. **Provides speedups on memory-bound models**: With a 7B target model, we observed a 1.09x throughput improvement over single-model constrained generation
+4. **Extends beyond regular languages**: The stack-based JSON Schema engine supports nested objects, typed arrays, union types, enum restrictions, regex patterns, and length constraints—enabling structure-aware generation for real-world schemas
 
 The approach does not provide speedups for smaller, compute-bound models (0.94x for 1.5B), which is consistent with the theoretical basis of speculative decoding. The technique is most applicable to production deployments using larger models where memory bandwidth is the limiting factor.
 
-These results suggest a practical path toward reliable structured generation in agentic AI systems. By combining grammar constraints with speculative execution, it may be possible to achieve both the reliability required for downstream parsing and the low latency required for interactive applications—though the benefits are contingent on appropriate model sizing and hardware configuration.
+These results suggest a practical path toward reliable structured generation in agentic AI systems. By combining grammar constraints with speculative execution, it is possible to achieve both the reliability required for downstream parsing and the low latency required for interactive applications—though the throughput benefits are contingent on appropriate model sizing and hardware configuration.
 
 ---
 
@@ -401,7 +417,9 @@ These results suggest a practical path toward reliable structured generation in 
 
 ## Appendix A: API Usage
 
-The system is packaged as an OpenAI-compatible REST API:
+The system is packaged as an OpenAI-compatible REST API.
+
+**Regex constraint:**
 
 ```bash
 curl -X POST http://localhost:8000/v1/chat/completions \
@@ -413,7 +431,32 @@ curl -X POST http://localhost:8000/v1/chat/completions \
   }'
 ```
 
-The `regex` field is an extension to the OpenAI API that enables grammar-constrained generation.
+**JSON Schema constraint:**
+
+```bash
+curl -X POST http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "onyx-speculative",
+    "messages": [{"role": "user", "content": "Generate user data:"}],
+    "json_schema": {
+      "type": "object",
+      "required": ["name", "age"],
+      "properties": {
+        "name": {"type": "string", "pattern": "^[A-Z][a-z]+$"},
+        "age": {"type": "integer"},
+        "tags": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 3,
+          "items": {"type": "string", "maxLength": 10}
+        }
+      }
+    }
+  }'
+```
+
+Both `regex` and `json_schema` are extensions to the OpenAI API that enable grammar-constrained generation.
 
 ---
 
