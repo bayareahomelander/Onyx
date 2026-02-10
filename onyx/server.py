@@ -42,6 +42,10 @@ class ChatCompletionRequest(BaseModel):
         default=None,
         description="JSON Schema to constrain the output (Onyx extension)"
     )
+    compact_json: Optional[bool] = Field(
+        default=True,
+        description="When json_schema is active, compact the output to remove whitespace (Onyx extension)"
+    )
     top_p: Optional[float] = Field(default=1.0, description="Nucleus sampling parameter")
     n: Optional[int] = Field(default=1, description="Number of completions to generate")
     stop: Optional[List[str]] = Field(default=None, description="Stop sequences")
@@ -298,6 +302,13 @@ async def create_chat_completion(request: ChatCompletionRequest):
             json_schema=json_schema_str,
             draft_grammar_aware=True,
         )
+        
+        # compact json output if requested
+        if request.json_schema and request.compact_json:
+            try:
+                output = json.dumps(json.loads(output), separators=(',', ':'))
+            except json.JSONDecodeError:
+                pass  # leave as-is if parsing fails
         
         response = ChatCompletionResponse(
             model=request.model,
