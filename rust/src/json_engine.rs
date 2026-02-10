@@ -628,9 +628,15 @@ impl JsonEngine {
                                 return true;
                             }
                             if byte == b'"' {
-                                *syntax_state = ObjectSyntaxState::InKey;
-                                key_buffer.clear();
-                                return true;
+                                // only open a new key if at least one unused key exists
+                                let has_unused_key = blueprint.allowed_keys.iter()
+                                    .any(|k| !used_keys.contains(k));
+                                if has_unused_key {
+                                    *syntax_state = ObjectSyntaxState::InKey;
+                                    key_buffer.clear();
+                                    return true;
+                                }
+                                return false;
                             }
                             if byte == b'}' {
                                 // only allow closing if all required keys have been provided
@@ -666,7 +672,10 @@ impl JsonEngine {
                                 return false;
                             }
                             let test_key = format!("{}{}", key_buffer, byte as char);
-                            if blueprint.is_valid_key_prefix(&test_key) {
+                            // only accept prefix if it matches an unused key
+                            let prefix_valid = blueprint.allowed_keys.iter()
+                                .any(|key| key.starts_with(&test_key) && !used_keys.contains(key));
+                            if prefix_valid {
                                 key_buffer.push(byte as char);
                                 return true;
                             }
