@@ -100,7 +100,7 @@ fn validate_regex_oneshot(text: &str, pattern: &str) -> PyResult<bool> {
 /// the main Python module for the onyx rust extension
 
 #[pymodule]
-fn onyx_rust(m: &Bound<'_, PyModule>) -> PyResult<()> {
+fn _rust(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // add functions
     m.add_function(wrap_pyfunction!(hello, m)?)?;
     m.add_function(wrap_pyfunction!(version, m)?)?;

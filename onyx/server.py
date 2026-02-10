@@ -38,6 +38,10 @@ class ChatCompletionRequest(BaseModel):
         default=None,
         description="Regex pattern to constrain the output (Onyx extension)"
     )
+    json_schema: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="JSON Schema to constrain the output (Onyx extension)"
+    )
     top_p: Optional[float] = Field(default=1.0, description="Nucleus sampling parameter")
     n: Optional[int] = Field(default=1, description="Number of completions to generate")
     stop: Optional[List[str]] = Field(default=None, description="Stop sequences")
@@ -180,11 +184,14 @@ def create_streaming_response(
     yield f"data: {first_chunk.model_dump_json()}\n\n"
     
     try:
+        json_schema_str = json.dumps(request.json_schema) if request.json_schema else None
+        
         output, metrics = engine.generate(
             prompt=prompt,
             max_tokens=request.max_tokens or 256,
             gamma=4,
             regex=request.regex,
+            json_schema=json_schema_str,
             draft_grammar_aware=True,
         )
         
@@ -279,12 +286,16 @@ async def create_chat_completion(request: ChatCompletionRequest):
     
     try:
         prompt = format_messages_as_prompt(request.messages)
+        json_schema_str = json.dumps(request.json_schema) if request.json_schema else None
+        
+        grammar_active = request.regex is not None or request.json_schema is not None
         
         output, metrics = engine.generate(
             prompt=prompt,
             max_tokens=request.max_tokens or 256,
             gamma=4,
             regex=request.regex,
+            json_schema=json_schema_str,
             draft_grammar_aware=True,
         )
         
@@ -294,7 +305,7 @@ async def create_chat_completion(request: ChatCompletionRequest):
                 ChatCompletionChoice(
                     index=0,
                     message=ChatMessage(role="assistant", content=output),
-                    finish_reason="stop" if not request.regex else "grammar_complete",
+                    finish_reason="grammar_complete" if grammar_active else "stop",
                 )
             ],
             usage=UsageInfo(
@@ -306,7 +317,7 @@ async def create_chat_completion(request: ChatCompletionRequest):
                 "tokens_per_second": metrics.get("tokens_per_second", 0),
                 "acceptance_rate": metrics.get("acceptance_rate", 0),
                 "ttft_ms": metrics.get("ttft", 0) * 1000 if metrics.get("ttft") else None,
-                "grammar_constrained": request.regex is not None,
+                "grammar_constrained": grammar_active,
                 "speculative_iterations": metrics.get("speculative_iterations", 0),
             },
         )

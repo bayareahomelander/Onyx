@@ -7,7 +7,7 @@ description = "High-performance grammar constraint engine for Onyx"
 license = "MIT"
 
 [lib]
-name = "onyx_rust"
+name = "_rust"
 crate-type = ["cdylib"]
 
 [dependencies]

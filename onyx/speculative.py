@@ -250,6 +250,7 @@ class SpeculativeEngine:
         gamma: int = 4,
         stop_tokens: Optional[List[int]] = None,
         regex: Optional[str] = None,
+        json_schema: Optional[str] = None,
         draft_grammar_aware: bool = True,
     ) -> Tuple[str, dict]:
         """
@@ -261,7 +262,8 @@ class SpeculativeEngine:
             gamma: Number of speculative (draft) tokens per iteration
             stop_tokens: Token IDs that stop generation
             regex: Optional regex pattern to constrain generation
-            draft_grammar_aware: If True and regex is provided, the draft model also uses grammar constraints;
+            json_schema: Optional json schema string to constrain generation
+            draft_grammar_aware: If True and grammar is provided, the draft model also uses grammar constraints;
                                  if False, draft is unconstrained for comparison benchmarks.
         """
         if self.draft_model is None or self.target_model is None:
@@ -280,6 +282,8 @@ class SpeculativeEngine:
         
         prompt_tokens = self.tokenizer.encode(prompt)
         
+        grammar_active = regex is not None or json_schema is not None
+        
         metrics = {
             "prompt_tokens": len(prompt_tokens),
             "generated_tokens": 0,
@@ -292,8 +296,8 @@ class SpeculativeEngine:
             "tokens_per_second": 0.0,
             "cache_mode": self.cache_mode,
             "jit_compiled": self.use_compile,
-            "grammar_constrained": regex is not None,
-            "draft_grammar_aware": draft_grammar_aware and regex is not None,
+            "grammar_constrained": grammar_active,
+            "draft_grammar_aware": draft_grammar_aware and grammar_active,
             "mask_time_total": 0.0,
             "mask_time_avg": 0.0,
         }
@@ -301,7 +305,7 @@ class SpeculativeEngine:
         grammar_constraint = None
         grammar_state = None
         
-        if regex is not None:
+        if grammar_active:
             if _GrammarConstraint is None:
                 raise RuntimeError(
                     "Grammar constraints require the Rust backend"
@@ -310,7 +314,10 @@ class SpeculativeEngine:
             grammar_constraint = _GrammarConstraint(self.vocab_bytes)
             
             compile_start = time.perf_counter()
-            grammar_constraint.compile_regex(regex)
+            if json_schema is not None:
+                grammar_constraint.compile_json_schema(json_schema)
+            else:
+                grammar_constraint.compile_regex(regex)
             metrics["grammar_compile_time"] = time.perf_counter() - compile_start
             
             grammar_state = grammar_constraint.init_state()
@@ -519,6 +526,7 @@ class SpeculativeEngine:
         max_tokens: int = 50,
         stop_tokens: Optional[List[int]] = None,
         regex: Optional[str] = None,
+        json_schema: Optional[str] = None,
     ) -> Tuple[str, dict]:
         """
         generate text using only the target model. standard autoregressive decoding without speculation
@@ -529,6 +537,7 @@ class SpeculativeEngine:
             max_tokens: Maximum tokens to generate
             stop_tokens: Token IDs that stop generation
             regex: Optional regex pattern to constrain generation
+            json_schema: Optional json schema string to constrain generation
             
         returns a tuple of (generated_text, metrics_dict)
         """
@@ -552,6 +561,8 @@ class SpeculativeEngine:
         prompt_tokens = self.tokenizer.encode(prompt)
         input_ids = mx.array([prompt_tokens])
         
+        grammar_active = regex is not None or json_schema is not None
+        
         metrics = {
             "prompt_tokens": len(prompt_tokens),
             "generated_tokens": 0,
@@ -560,7 +571,7 @@ class SpeculativeEngine:
             "tokens_per_second": 0.0,
             "cache_mode": self.cache_mode,
             "jit_compiled": self.use_compile,
-            "grammar_constrained": regex is not None,
+            "grammar_constrained": grammar_active,
             "mask_time_total": 0.0,
             "mask_time_avg": 0.0,
         }
@@ -569,7 +580,7 @@ class SpeculativeEngine:
         grammar_state = None
         mask_times = []
         
-        if regex is not None:
+        if grammar_active:
             if _GrammarConstraint is None:
                 raise RuntimeError(
                     "Grammar constraints require the Rust backend"
@@ -577,7 +588,10 @@ class SpeculativeEngine:
             
             grammar_constraint = _GrammarConstraint(self.vocab_bytes)
             compile_start = time.perf_counter()
-            grammar_constraint.compile_regex(regex)
+            if json_schema is not None:
+                grammar_constraint.compile_json_schema(json_schema)
+            else:
+                grammar_constraint.compile_regex(regex)
             metrics["grammar_compile_time"] = time.perf_counter() - compile_start
             grammar_state = grammar_constraint.init_state()
         
