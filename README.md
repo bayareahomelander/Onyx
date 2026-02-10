@@ -75,7 +75,8 @@ curl -X POST http://localhost:8000/v1/chat/completions \
         "age": {"type": "integer"}
       },
       "required": ["name"]
-    }
+    },
+    "compact_json": true
   }'
 ```
 
@@ -332,6 +333,7 @@ OpenAI-compatible chat completion endpoint.
 | `stream` | boolean | Enable streaming response |
 | `regex` | string | **(Onyx extension)** Regex pattern to constrain output |
 | `json_schema` | object | **(Onyx extension)** JSON Schema to constrain output |
+| `compact_json` | boolean | **(Onyx extension)** Strip whitespace from JSON output (default: `true`) |
 
 ### `GET /v1/models`
 
