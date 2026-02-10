@@ -41,7 +41,7 @@ impl Error for ConstraintError {}
 ///
 /// implementations include:
 /// - `RegexEngine`: DFA-based regex pattern matching
-/// - (future) `JsonSchemaEngine`: pushdown automaton for JSON schema validation
+/// - `JsonEngine`: pushdown automaton for JSON schema validation
 pub trait ConstraintEngine: Send + Sync {
     /// reset the engine to its initial state
     ///
@@ -76,4 +76,10 @@ pub trait ConstraintEngine: Send + Sync {
     ///
     /// this is useful for debugging and for the Python bindings
     fn current_state_id(&self) -> u32;
+
+    /// create an independent clone of this engine
+    ///
+    /// this is critical for speculative decoding: checkpoint the engine state
+    /// before draft speculation by cloning, then restore by swapping the clone back.
+    fn clone_box(&self) -> Box<dyn ConstraintEngine>;
 }

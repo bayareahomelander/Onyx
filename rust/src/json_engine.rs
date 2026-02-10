@@ -1300,6 +1300,17 @@ impl ConstraintEngine for JsonEngine {
     fn current_state_id(&self) -> u32 {
         self.stack.len() as u32
     }
+
+    fn clone_box(&self) -> Box<dyn ConstraintEngine> {
+        Box::new(JsonEngine {
+            vocab: self.vocab.clone(),
+            vocab_size: self.vocab_size,
+            root_blueprint: self.root_blueprint.clone(),
+            stack: self.stack.clone(),
+            finished: self.finished,
+            dead: self.dead,
+        })
+    }
 }
 
 #[cfg(test)]

@@ -156,6 +156,16 @@ impl ConstraintEngine for RegexEngine {
     fn current_state_id(&self) -> u32 {
         self.current_state.as_u32()
     }
+
+    fn clone_box(&self) -> Box<dyn ConstraintEngine> {
+        Box::new(RegexEngine {
+            vocabulary: self.vocabulary.clone(),
+            dfa: self.dfa.clone(),
+            current_state: self.current_state,
+            initial_state: self.initial_state,
+            pattern: self.pattern.clone(),
+        })
+    }
 }
 
 #[cfg(test)]

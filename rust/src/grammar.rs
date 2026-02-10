@@ -21,6 +21,8 @@ pub struct GrammarConstraint {
     vocabulary: Vec<Vec<u8>>,
     /// the active constraint engine (None until a pattern is compiled)
     engine: Option<Box<dyn ConstraintEngine>>,
+    /// saved engine snapshot for speculative decoding checkpointing
+    snapshot: Option<Box<dyn ConstraintEngine>>,
     /// the original pattern/schema string for debugging
     pattern: Option<String>,
     /// the type of engine currently active
@@ -39,6 +41,7 @@ impl GrammarConstraint {
         Ok(GrammarConstraint {
             vocabulary,
             engine: None,
+            snapshot: None,
             pattern: None,
             engine_type: None,
         })
@@ -146,6 +149,30 @@ impl GrammarConstraint {
 
     fn vocab_size(&self) -> usize {
         self.vocabulary.len()
+    }
+
+    /// save a snapshot of the current engine state for checkpointing
+    ///
+    /// this clones the engine so that `restore_snapshot` can revert to this point.
+    /// critical for speculative decoding: call before draft speculation.
+    fn save_snapshot(&mut self) -> PyResult<()> {
+        let engine = self.engine.as_ref()
+            .ok_or_else(|| PyValueError::new_err("No constraint compiled."))?;
+
+        self.snapshot = Some(engine.clone_box());
+        Ok(())
+    }
+
+    /// restore the engine to the previously saved snapshot
+    ///
+    /// reverts the engine state to the point when `save_snapshot` was called.
+    /// critical for speculative decoding: call before verification begins.
+    fn restore_snapshot(&mut self) -> PyResult<()> {
+        let snap = self.snapshot.take()
+            .ok_or_else(|| PyValueError::new_err("No snapshot saved. Call save_snapshot first."))?;
+
+        self.engine = Some(snap);
+        Ok(())
     }
 
     fn get_pattern(&self) -> Option<String> {

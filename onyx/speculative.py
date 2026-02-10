@@ -378,6 +378,12 @@ class SpeculativeEngine:
                 
                 draft_grammar_state = grammar_state
                 
+                # checkpoint grammar state before draft speculation
+                # the engine uses internal state, so we must save before
+                # drafting and restore before verification
+                if grammar_constraint is not None:
+                    grammar_constraint.save_snapshot()
+                
                 draft_input = mx.array([[current_token]])
                 draft_logits = self.draft_model(draft_input, cache=self.draft_cache)
                 mx.eval(draft_logits)
@@ -427,6 +433,11 @@ class SpeculativeEngine:
                 
                 accepted_count = 0
                 verify_grammar_state = grammar_state
+                
+                # restore grammar state to pre-draft checkpoint
+                # so verification masks are computed from the correct state
+                if grammar_constraint is not None:
+                    grammar_constraint.restore_snapshot()
                 
                 for i, draft_token in enumerate(draft_tokens):
                     target_pos_logits = target_logits[:, i:i+1, :].squeeze(1)
