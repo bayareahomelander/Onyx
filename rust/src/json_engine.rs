@@ -406,7 +406,17 @@ impl JsonEngine {
             match schema_type {
                 SchemaType::String => {
                     if byte == b'"' {
-                        stack.push(Scope::String(StringState::new_started()));
+                        // pass constraints from item blueprint
+                        let string_state = if let Some(bp) = item_bp {
+                            StringState::with_pattern_and_constraints(
+                                bp.pattern.as_deref(),
+                                bp.min_length,
+                                bp.max_length,
+                            )
+                        } else {
+                            StringState::new_started()
+                        };
+                        stack.push(Scope::String(string_state));
                         return true;
                     }
                 }
