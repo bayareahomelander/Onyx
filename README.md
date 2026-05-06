@@ -19,6 +19,7 @@ Onyx is an inference engine that enforces structured output constraints (JSON Sc
 | 1.5B Target (compute-bound) | 73.5 tok/s | 69.2 tok/s | 0.94x |
 
 - **100% Grammar Compliance**: Output always matches the specified schema or pattern
+- **Adaptive Speculation**: Experimental adaptive γ controller matches the best fixed γ setting on a 7B forced-digits benchmark (31.8 tok/s vs 23.3 tok/s baseline, **1.37x**)
 - **OpenAI-Compatible API**: Drop-in replacement for existing agent frameworks
 - **Full JSON Schema Support**: Nested objects, typed arrays, regex patterns, enums, unions, and length constraints
 
@@ -275,7 +276,10 @@ curl -X POST http://localhost:8000/v1/chat/completions \
 │  │   MLX-LM     │  │ SpeculativeEngine│  │  FastAPI      │  │
 │  │  (Models)    │  │ (Draft + Target) │  │  (REST API)   │  │
 │  └──────┬───────┘  └────────┬─────────┘  └───────┬───────┘  │
-│         │                   │                    │          │
+│         │          ┌────────▼─────────┐          │          │
+│         │          │ AdaptiveGamma    │          │          │
+│         │          │ Controller (exp) │          │          │
+│         │          └──────────────────┘          │          │
 ├─────────┴───────────────────┴────────────────────┴──────────┤
 │                      Rust Backend (PyO3)                    │
 │  ┌────────────────────────────────────────────────────────┐ │
@@ -294,6 +298,7 @@ curl -X POST http://localhost:8000/v1/chat/completions \
 2. **Filter Vocabulary**: At each generation step, only tokens leading to valid states are allowed
 3. **Speculative Decoding**: A small draft model (0.5B) proposes tokens that a larger target model (1.5B/7B) verifies
 4. **Grammar-Aware Drafting**: Both models are constrained to the grammar, ensuring high acceptance rates
+5. **Adaptive Draft Length (Experimental)**: An optional controller adjusts γ based on recent acceptance rate and timing signals
 
 ---
 
@@ -316,6 +321,20 @@ All benchmarks run on Apple Silicon with 4-bit quantized Qwen2.5 models.
 | 7B Target | 17.4 tok/s | 18.9 tok/s | **1.09x** |
 
 The crossover point where speculation beats baseline occurs when the target model becomes memory-bandwidth-bound (typically 7B+ parameters).
+
+### Adaptive Gamma Benchmark
+
+The experimental adaptive path compares fixed speculative batch sizes against a controller initialized at γ=4 with bounds `[1, 8]`. Warmup runs are excluded from the reported averages.
+
+| Configuration | Throughput | vs Baseline | Acceptance |
+|---------------|------------|-------------|------------|
+| 7B Baseline (`[0-9]{32}`) | 23.3 tok/s | 1.00x | — |
+| Fixed γ=2 | 27.8 tok/s | 1.20x | 93.8% |
+| Fixed γ=4 | 31.8 tok/s | **1.37x** | 88.2% |
+| Fixed γ=8 | 30.0 tok/s | 1.29x | 78.9% |
+| Adaptive γ | 31.8 tok/s | **1.37x** | 88.2% |
+
+In this run, adaptive γ matched the best fixed setting while adjusting during generation (avg γ=4.2, final γ=8).
 
 ---
 
@@ -356,6 +375,9 @@ pytest tests/
 
 # Run API tests (requires server running)
 python test_api.py
+
+# Run adaptive speculative benchmark
+python run_adaptive_speculative.py
 
 # Build release
 maturin develop --release

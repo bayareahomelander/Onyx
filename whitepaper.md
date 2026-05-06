@@ -48,6 +48,7 @@ Our system, Onyx, consists of three primary components:
 1. **Grammar Engine** (Rust): Compiles regex patterns into DFAs and JSON schemas into stack-based state machines, performs vocabulary filtering
 2. **Speculative Engine** (Python/MLX): Coordinates draft-verify-rollback cycles with grammar state management
 3. **API Server** (FastAPI): Provides OpenAI-compatible REST interface with grammar constraint extensions
+4. **Adaptive Controller** (Python): Experimental controller that adjusts speculative draft length based on recent acceptance rate and timing signals
 
 ### 2.2 Grammar Constraint Engine
 
@@ -87,6 +88,8 @@ Grammar-aware speculation modifies this loop:
 2. **Verify (Grammar-Constrained)**: Run the target model, applying grammar masks during verification
 3. **Accept**: Compare draft and target predictions (both are now grammar-valid)
 4. **Rollback**: Reset caches; grammar state is only updated after acceptance
+
+We also implemented an experimental adaptive variant that treats γ as a control parameter rather than a fixed constant. The controller tracks a rolling window of draft acceptance rate, draft time, target verification time, and grammar-mask overhead. It increases γ when acceptance is high and target verification dominates, and decreases γ when acceptance is low or masking overhead becomes significant. This keeps the stable fixed-γ engine intact while making the benchmark harness more explicit about the performance tradeoff.
 
 The following diagram compares the two approaches:
 
@@ -230,6 +233,7 @@ We evaluated two grammar patterns of differing complexity:
 
 1. **Year Pattern**: `[0-9]{4}` — A bounded pattern requiring exactly 4 digits
 2. **Email Pattern**: `[a-z]+@[a-z]+\.com` — An unbounded pattern with multiple variable-length segments
+3. **Forced Digits Pattern**: `[0-9]{32}` — A longer bounded pattern used to evaluate fixed versus adaptive γ over enough speculative iterations for the controller to react
 
 ### 3.3 Evaluation Metrics
 
@@ -244,6 +248,8 @@ We compared three generation strategies:
 1. **Baseline**: Target model with grammar constraints, no speculation
 2. **Blind Draft**: Draft model unconstrained, target model constrained
 3. **Aware Draft**: Both draft and target models constrained to the same grammar
+
+For the adaptive benchmark, we additionally compared fixed γ values (`1`, `2`, `4`, `8`) against an adaptive controller initialized at γ=4 with bounds `[1, 8]`. Each benchmark scenario includes one unreported warmup run so first-run compilation effects do not distort the reported average.
 
 ---
 
@@ -331,6 +337,24 @@ The crossover point where speculation becomes beneficial occurs somewhere betwee
 
 This suggests that grammar-aware speculative decoding is most applicable to production scenarios using larger models (7B+), which are common for tasks requiring higher output quality.
 
+### 4.5 Adaptive Gamma on Longer Constrained Outputs
+
+Fixed γ is workload-dependent: too small a value underutilizes target-model verification, while too large a value wastes draft work when acceptance falls. We evaluated an experimental adaptive controller on the forced digits pattern (`[0-9]{32}`), comparing fixed γ settings against adaptive γ.
+
+**Table 5: Adaptive Gamma Results (7B Target, Forced Digits Pattern)**
+
+| Strategy | Throughput | vs Baseline | Acceptance |
+|----------|------------|-------------|------------|
+| Baseline | 23.3 tok/s | 1.00x | — |
+| Fixed γ=2 | 27.8 tok/s | 1.20x | 93.8% |
+| Fixed γ=4 | 31.8 tok/s | 1.37x | 88.2% |
+| Fixed γ=8 | 30.0 tok/s | 1.29x | 78.9% |
+| Adaptive γ | 31.8 tok/s | 1.37x | 88.2% |
+
+The adaptive controller matched the best fixed setting in this run, reaching a 1.37x speedup over baseline. Its average γ was 4.2, final γ was 8, and it made 6 adjustments during generation. This result supports the intuition that larger memory-bound targets benefit from longer speculative batches when acceptance remains high, while still allowing the controller to react when conditions change.
+
+On the 1.5B target, the same forced-digits task remained slower than baseline despite high acceptance. This is consistent with the compute-bound result above: adaptive γ can choose among speculative settings, but it cannot remove the fundamental overhead of running two models when speculation is not the right bottleneck match.
+
 ---
 
 ## 5. Limitations and Future Work
@@ -355,7 +379,11 @@ All experiments were conducted on Apple Silicon using the MLX framework. Results
 
 ### 5.5 Single-Turn Evaluation
 
-We evaluated single-turn generation with short outputs. Long-context scenarios, multi-turn conversations, and batched inference may exhibit different performance characteristics that we did not investigate.
+We evaluated single-turn generation, including both short bounded patterns and a 32-token forced-digits pattern. Long-context scenarios, multi-turn conversations, and batched inference may exhibit different performance characteristics that we did not investigate.
+
+### 5.6 Adaptive Controller Scope
+
+The adaptive γ controller is experimental and benchmark-oriented. It is implemented separately from the stable fixed-γ engine path and is not exposed through the OpenAI-compatible API. The current controller uses a simple heuristic rather than an offline tuner or statistically optimal bandit policy.
 
 ---
 
@@ -379,6 +407,7 @@ We presented grammar-aware speculative decoding, a technique that integrates gra
 2. **Addresses the blind draft problem**: Applying grammar constraints to the draft model improves acceptance rates from as low as 0% (blind) to 18-100% (aware)
 3. **Provides speedups on memory-bound models**: With a 7B target model, we observed a 1.09x throughput improvement over single-model constrained generation
 4. **Extends beyond regular languages**: The stack-based JSON Schema engine supports nested objects, typed arrays, union types, enum restrictions, regex patterns, and length constraints—enabling structure-aware generation for real-world schemas
+5. **Adapts speculative batch size experimentally**: On a 7B forced-digits benchmark, an adaptive γ controller matched the best fixed γ setting at 1.37x baseline throughput while adjusting γ during generation
 
 The approach does not provide speedups for smaller, compute-bound models (0.94x for 1.5B), which is consistent with the theoretical basis of speculative decoding. The technique is most applicable to production deployments using larger models where memory bandwidth is the limiting factor.
 
@@ -407,6 +436,11 @@ These results suggest a practical path toward reliable structured generation in 
 - Baseline: 17.4 tok/s
 - Blind Draft: 13.4 tok/s (12.5% acceptance)
 - Aware Draft: 18.9 tok/s (25% acceptance)
+
+**7B Target (Forced Digits Pattern, `[0-9]{32}`)**
+- Baseline: 23.3 tok/s
+- Fixed γ=4: 31.8 tok/s (88.2% acceptance, 1.37x)
+- Adaptive γ: 31.8 tok/s (88.2% acceptance, 1.37x; avg γ=4.2, final γ=8)
 
 **Email Pattern (1.5B Target)**
 - Baseline: 80.7 tok/s
