@@ -7,7 +7,11 @@
 
 **Grammar-Aware Speculative Decoding for Structured LLM Outputs on Apple Silicon**
 
-Onyx is an inference engine that enforces structured output constraints (JSON Schema, regex patterns) on language models while maintaining—or exceeding—baseline generation speed. By applying grammar constraints to both draft and target models in a speculative decoding pipeline, Onyx achieves **100% output reliability** with a **1.09x speedup** on memory-bound models (7B+).
+Onyx is an inference engine that enforces structured output constraints (JSON Schema, regex patterns) on language models while maintaining—or exceeding—baseline generation speed. By applying grammar constraints to both draft and target models in a speculative decoding pipeline, Onyx achieves **100% output reliability** with a **1.04x speedup** on memory-bound models (7B+).
+
+## What's New in v0.2.0
+- **Zero-Copy Rust State Architecture:** Radically optimized the Rust grammar engine by replacing deep cloning with `Arc` (Atomic Reference Counting) pointers for schema blueprints and regex automata. This completely eliminates vocabulary masking overhead, significantly raising the baseline generation speed.
+- **Enhanced Benchmark Accuracy:** Fixed strictness in benchmark regex scripts to guarantee forced long-generation tracking.
 
 ---
 
