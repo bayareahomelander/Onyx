@@ -8,10 +8,13 @@ license = "MIT"
 
 [lib]
 name = "_rust"
-crate-type = ["cdylib"]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+extension-module = ["pyo3/extension-module"]
 
 [dependencies]
-pyo3 = { version = "0.22", features = ["extension-module"] }
+pyo3 = { version = "0.22" }
 regex = "1"
 regex-automata = { version = "0.4", features = ["dfa", "dfa-build", "dfa-search", "syntax"] }
 serde = { version = "1", features = ["derive"] }

@@ -1,7 +1,7 @@
 # single-model baseline engine for benchmarking. production uses SpeculativeEngine.
 
 from abc import ABC, abstractmethod
-from typing import Optional, Generator, List, Callable, Any, Tuple
+from typing import Optional, Generator, List, Tuple
 import time
 
 import mlx.core as mx
@@ -167,22 +167,6 @@ class OnyxEngine:
                 self.vocab_bytes.append(token_bytes)
             except Exception:
                 self.vocab_bytes.append(b"")
-    
-    def _create_attention_mask(
-        self, 
-        seq_len: int, 
-        cache_offset: int = 0
-    ) -> Optional[mx.array]:
-        if seq_len <= 1:
-            return None
-            
-        mask = mx.triu(mx.full((seq_len, seq_len), float('-inf')), k=1)
-        
-        if cache_offset > 0:
-            prefix = mx.zeros((seq_len, cache_offset))
-            mask = mx.concatenate([prefix, mask], axis=1)
-        
-        return mask
     
     def _sample_token(
         self,

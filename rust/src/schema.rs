@@ -63,10 +63,11 @@ impl SchemaType {
 /// a parsed property definition from a JSON schema
 #[derive(Debug, Clone)]
 pub struct PropertyBlueprint {
-    pub name: String,
     /// allowed types (supports union types)
     pub schema_types: Vec<SchemaType>,
     pub properties: HashMap<String, PropertyBlueprint>,
+    /// for nested objects: keys required by this object's schema
+    pub required_keys: HashSet<String>,
     /// for arrays: item schema
     pub items: Option<Box<PropertyBlueprint>>,
     pub required: bool,
@@ -86,7 +87,7 @@ pub struct PropertyBlueprint {
 
 impl PropertyBlueprint {
     /// create a property blueprint from a JSON schema value
-    pub fn from_value(name: &str, value: &Value) -> Self {
+    pub fn from_value(_name: &str, value: &Value) -> Self {
         let schema_types = SchemaType::types_from_value(value);
         
         let mut properties = HashMap::new();
@@ -98,6 +99,20 @@ impl PropertyBlueprint {
                         prop_name.clone(),
                         PropertyBlueprint::from_value(prop_name, prop_value),
                     );
+                }
+            }
+        }
+
+        let mut required_keys = HashSet::new();
+        if schema_types.contains(&SchemaType::Object) {
+            if let Some(req_array) = value.get("required").and_then(|v| v.as_array()) {
+                for item in req_array {
+                    if let Some(name) = item.as_str() {
+                        required_keys.insert(name.to_string());
+                        if let Some(prop) = properties.get_mut(name) {
+                            prop.required = true;
+                        }
+                    }
                 }
             }
         }
@@ -132,9 +147,9 @@ impl PropertyBlueprint {
         let max_items = value.get("maxItems").and_then(|v| v.as_u64()).map(|n| n as usize);
         
         PropertyBlueprint {
-            name: name.to_string(),
             schema_types,
             properties,
+            required_keys,
             items,
             required: false,
             enum_values,
@@ -146,15 +161,6 @@ impl PropertyBlueprint {
         }
     }
     
-    /// check if this property has multiple allowed types (union type)
-    pub fn is_union_type(&self) -> bool {
-        self.schema_types.len() > 1
-    }
-    
-    /// get the primary (first) schema type
-    pub fn primary_type(&self) -> &SchemaType {
-        self.schema_types.first().unwrap_or(&SchemaType::Any)
-    }
 }
 
 /// a parsed JSON schema blueprint
@@ -226,15 +232,6 @@ impl SchemaBlueprint {
     /// check if a string is a valid prefix of any allowed key
     pub fn is_valid_key_prefix(&self, prefix: &str) -> bool {
         self.allowed_keys.iter().any(|key| key.starts_with(prefix))
-    }
-    
-    /// get all allowed keys that start with the given prefix
-    pub fn keys_with_prefix(&self, prefix: &str) -> Vec<&str> {
-        self.allowed_keys
-            .iter()
-            .filter(|key| key.starts_with(prefix))
-            .map(|s| s.as_str())
-            .collect()
     }
 }
 

@@ -5,7 +5,7 @@ demonstrates using onyx's grammarconstraint engine to enforce
 a complex json schema during token-by-token generation.
 """
 import json
-from onyx_rust import GrammarConstraint
+from onyx._rust import GrammarConstraint
 
 
 def main():

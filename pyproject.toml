@@ -35,7 +35,7 @@ dev = [
 ]
 
 [tool.maturin]
-features = ["pyo3/extension-module"]
+features = ["extension-module"]
 python-source = "."
 module-name = "onyx._rust"
 manifest-path = "rust/Cargo.toml"

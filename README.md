@@ -366,6 +366,20 @@ Health check endpoint.
 
 ## Development
 
+### Verification Scripts
+
+```bash
+# Regex-constrained generation (single model, correctness focus)
+python run_grammar.py
+
+# Speculative decoding + grammar (benchmark, acceptance rate focus)
+python run_speculative_grammar.py
+
+# API server end-to-end (requires server running)
+uvicorn onyx.server:app --port 8000
+python test_api.py
+```
+
 ```bash
 # Build Rust extension in development mode
 maturin develop

@@ -31,16 +31,12 @@ pub enum ObjectSyntaxState {
 /// state for parsing a json string value
 #[derive(Debug, Clone)]
 pub struct StringState {
-    /// opening quote seen
-    started: bool,
     /// in escape sequence
     in_escape: bool,
     /// compiled dfa for pattern validation
     pattern_dfa: Option<dense::DFA<Vec<u32>>>,
     /// current dfa state
     dfa_state: Option<StateID>,
-    /// initial dfa state
-    dfa_initial: Option<StateID>,
     /// chars consumed so far
     char_count: usize,
     /// min chars required
@@ -52,11 +48,9 @@ pub struct StringState {
 impl Default for StringState {
     fn default() -> Self {
         StringState { 
-            started: false, 
             in_escape: false,
             pattern_dfa: None,
             dfa_state: None,
-            dfa_initial: None,
             char_count: 0,
             min_length: None,
             max_length: None,
@@ -68,28 +62,12 @@ impl StringState {
     /// new string state with opening quote seen
     pub fn new_started() -> Self {
         StringState {
-            started: true,
             in_escape: false,
             pattern_dfa: None,
             dfa_state: None,
-            dfa_initial: None,
             char_count: 0,
             min_length: None,
             max_length: None,
-        }
-    }
-    
-    /// string state with length constraints
-    pub fn with_constraints(min_len: Option<usize>, max_len: Option<usize>) -> Self {
-        StringState {
-            started: true,
-            in_escape: false,
-            pattern_dfa: None,
-            dfa_state: None,
-            dfa_initial: None,
-            char_count: 0,
-            min_length: min_len,
-            max_length: max_len,
         }
     }
     
@@ -98,11 +76,9 @@ impl StringState {
         match compile_pattern_dfa(pattern) {
             Ok(compiled) => {
                 StringState {
-                    started: true,
                     in_escape: false,
                     pattern_dfa: Some(compiled.dfa),
                     dfa_state: Some(compiled.initial_state),
-                    dfa_initial: Some(compiled.initial_state),
                     char_count: 0,
                     min_length: None,
                     max_length: None,
@@ -159,15 +135,6 @@ pub struct BooleanState {
     target: &'static str,
     /// current position in the target
     position: usize,
-}
-
-impl BooleanState {
-    fn new_true() -> Self {
-        BooleanState { target: "true", position: 0 }
-    }
-    fn new_false() -> Self {
-        BooleanState { target: "false", position: 0 }
-    }
 }
 
 /// state for parsing a JSON null literal
@@ -240,20 +207,6 @@ pub struct EnumState {
     pub cursor: usize,
 }
 
-impl EnumState {
-    pub fn new(candidates: Vec<Vec<u8>>) -> Self {
-        EnumState {
-            candidates,
-            cursor: 0,
-        }
-    }
-    
-    /// check if any candidate is fully matched at current cursor
-    pub fn has_complete_match(&self) -> bool {
-        self.candidates.iter().any(|c| c.len() == self.cursor)
-    }
-}
-
 /// a scope on the parsing stack
 #[derive(Debug, Clone)]
 pub enum Scope {
@@ -286,13 +239,6 @@ pub enum Scope {
     Array(ArrayState),
     /// parsing an enum value (one of a fixed set of allowed JSON values)
     Enum(EnumState),
-    /// dispatch scope for union types - decides which type to enter based on first byte
-    Dispatch {
-        /// the allowed types for this value
-        allowed_types: Vec<SchemaType>,
-        /// the property blueprint (for nested properties)
-        property_blueprint: Option<Box<PropertyBlueprint>>,
-    },
 }
 
 /// a JSON schema constraint engine using stack-based scopes
@@ -452,7 +398,7 @@ impl JsonEngine {
                             SchemaBlueprint {
                                 root_type: SchemaType::Object,
                                 properties: bp.properties.clone(),
-                                required: std::collections::HashSet::new(),
+                                required: bp.required_keys.clone(),
                                 allowed_keys: bp.properties.keys().cloned().collect(),
                             }
                         } else {
@@ -792,7 +738,7 @@ impl JsonEngine {
                                             let nested_blueprint = SchemaBlueprint {
                                                 root_type: SchemaType::Object,
                                                 properties: prop.properties.clone(),
-                                                required: std::collections::HashSet::new(),
+                                                required: prop.required_keys.clone(),
                                                 allowed_keys: prop.properties.keys().cloned().collect(),
                                             };
                                             stack.push(Scope::Object {
@@ -1156,108 +1102,6 @@ impl JsonEngine {
                     }
                     
                     return true;
-                }
-                
-                Scope::Dispatch { allowed_types, property_blueprint } => {
-                    // clone the data needed before popping
-                    let allowed_types = allowed_types.clone();
-                    let property_blueprint = property_blueprint.clone();
-                    
-                    // dispatch scope: determine which specific type to push based on the first byte
-                    fn matches_type(byte: u8, t: &SchemaType) -> bool {
-                        match t {
-                            SchemaType::String => byte == b'"',
-                            SchemaType::Number | SchemaType::Integer => byte.is_ascii_digit() || byte == b'-',
-                            SchemaType::Boolean => byte == b't' || byte == b'f',
-                            SchemaType::Null => byte == b'n',
-                            SchemaType::Object => byte == b'{',
-                            SchemaType::Array => byte == b'[',
-                            SchemaType::Any => true,
-                        }
-                    }
-                    
-                    // find which type matches this byte
-                    let matched_type = allowed_types.iter().find(|t| matches_type(byte, t)).cloned();
-                    
-                    if let Some(prop_type) = matched_type {
-                        // pop the dispatch scope and push the specific scope
-                        stack.pop();
-                        
-                        match prop_type {
-                            SchemaType::String => {
-                                if byte == b'"' {
-                                    stack.push(Scope::String(StringState::new_started()));
-                                    return true;
-                                }
-                            }
-                            SchemaType::Number | SchemaType::Integer => {
-                                if byte.is_ascii_digit() || byte == b'-' {
-                                    let mut ns = NumberState::default();
-                                    ns.buffer.push(byte as char);
-                                    ns.expect_digit = byte == b'-';
-                                    ns.is_integer = prop_type == SchemaType::Integer;
-                                    stack.push(Scope::Number(ns));
-                                    return true;
-                                }
-                            }
-                            SchemaType::Boolean => {
-                                if byte == b't' {
-                                    stack.push(Scope::Boolean(BooleanState { target: "true", position: 1 }));
-                                    return true;
-                                }
-                                if byte == b'f' {
-                                    stack.push(Scope::Boolean(BooleanState { target: "false", position: 1 }));
-                                    return true;
-                                }
-                            }
-                            SchemaType::Null => {
-                                if byte == b'n' {
-                                    stack.push(Scope::Null(NullState { position: 1 }));
-                                    return true;
-                                }
-                            }
-                            SchemaType::Object => {
-                                if byte == b'{' {
-                                    let nested_blueprint = if let Some(bp) = &property_blueprint {
-                                        SchemaBlueprint {
-                                            root_type: SchemaType::Object,
-                                            properties: bp.properties.clone(),
-                                            required: std::collections::HashSet::new(),
-                                            allowed_keys: bp.properties.keys().cloned().collect(),
-                                        }
-                                    } else {
-                                        SchemaBlueprint {
-                                            root_type: SchemaType::Object,
-                                            properties: std::collections::HashMap::new(),
-                                            required: std::collections::HashSet::new(),
-                                            allowed_keys: Vec::new(),
-                                        }
-                                    };
-                                    stack.push(Scope::Object {
-                                        blueprint: nested_blueprint.clone(),
-                                        syntax_state: ObjectSyntaxState::ExpectKeyOrEnd,
-                                        key_buffer: String::new(),
-                                        used_keys: Vec::new(),
-                                        in_escape: false,
-                                        missing_required_keys: nested_blueprint.required.clone(),
-                                    });
-                                    return true;
-                                }
-                            }
-                            SchemaType::Array => {
-                                if byte == b'[' {
-                                    let nested_items = property_blueprint.as_ref().and_then(|bp| bp.items.clone());
-                                    stack.push(Scope::Array(ArrayState::new(nested_items)));
-                                    return true;
-                                }
-                            }
-                            SchemaType::Any => {
-                                // any type - shouldn't reach here as we dispatch to specific types
-                                return false;
-                            }
-                        }
-                    }
-                    return false;
                 }
             }
         }

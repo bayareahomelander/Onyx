@@ -76,11 +76,6 @@ impl RegexEngine {
         })
     }
 
-    /// get the pattern string
-    pub fn pattern(&self) -> &str {
-        &self.pattern
-    }
-
     /// get the vocabulary size
     pub fn vocab_size(&self) -> usize {
         self.vocabulary.len()

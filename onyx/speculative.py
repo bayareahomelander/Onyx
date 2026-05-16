@@ -7,7 +7,7 @@ that are verified by a larger target model.
 
 """
 
-from typing import Optional, List, Tuple, Union, Callable
+from typing import Optional, Generator, List, Tuple, Union
 import time
 
 import mlx.core as mx
@@ -24,13 +24,6 @@ if onyx.RUST_AVAILABLE:
         from onyx._rust import GrammarConstraint as _GrammarConstraint
     except ImportError:
         pass
-
-
-def sample_argmax(logits: mx.array) -> mx.array:
-    return mx.argmax(logits[:, -1, :], axis=-1)
-
-
-_compiled_sample_argmax = mx.compile(sample_argmax)
 
 
 class SpeculativeEngine:
@@ -179,17 +172,42 @@ class SpeculativeEngine:
                 return layer_cache.offset
         return 0
     
-    def _sample_greedy(self, logits: mx.array) -> mx.array:
-        """greedy sampling"""
-        return mx.argmax(logits, axis=-1)
-    
-    def _sample_from_logits(self, logits: mx.array) -> mx.array:
-        """sample from full model output logits"""
-        if self.use_compile:
-            if logits.ndim == 3:
-                return _compiled_sample_argmax(logits)
+    def _sample_token(
+        self,
+        logits: mx.array,
+        temperature: float = 0.0,
+        top_p: float = 1.0,
+    ) -> mx.array:
+        """sample a token from logits."""
+        if top_p <= 0.0 or top_p > 1.0:
+            raise ValueError("top_p must be in the range (0, 1]")
+
+        if temperature == 0.0:
             return mx.argmax(logits, axis=-1)
-        return mx.argmax(logits[:, -1, :], axis=-1) if logits.ndim == 3 else mx.argmax(logits, axis=-1)
+
+        scaled_logits = logits / temperature
+        if top_p >= 1.0:
+            return mx.random.categorical(scaled_logits)
+
+        probs = mx.softmax(scaled_logits, axis=-1)
+        sorted_indices = mx.argsort(-probs, axis=-1)
+        sorted_probs = mx.take_along_axis(probs, sorted_indices, axis=-1)
+        sorted_logits = mx.take_along_axis(scaled_logits, sorted_indices, axis=-1)
+
+        cumulative_probs = mx.cumsum(sorted_probs, axis=-1)
+        remove_mask = cumulative_probs - sorted_probs > top_p
+        filtered_logits = mx.where(
+            remove_mask,
+            mx.full(sorted_logits.shape, float("-inf")),
+            sorted_logits,
+        )
+
+        sampled_rank = mx.random.categorical(filtered_logits)
+        return mx.take_along_axis(sorted_indices, sampled_rank[:, None], axis=-1).squeeze(-1)
+
+    def _sample_greedy(self, logits: mx.array) -> mx.array:
+        """greedy sampling compatibility wrapper."""
+        return self._sample_token(logits, temperature=0.0)
     
     def _apply_grammar_mask(
         self,
@@ -252,6 +270,8 @@ class SpeculativeEngine:
         regex: Optional[str] = None,
         json_schema: Optional[str] = None,
         draft_grammar_aware: bool = True,
+        temperature: float = 0.0,
+        top_p: float = 1.0,
     ) -> Tuple[str, dict]:
         """
         generate text using speculative decoding with optional grammar constraints and return a tuple of (generated_text, metrics_dict)
@@ -349,7 +369,7 @@ class SpeculativeEngine:
                     f"Pattern: {regex}"
                 )
         
-        first_token = self._sample_greedy(first_token_logits)
+        first_token = self._sample_token(first_token_logits, temperature, top_p)
         mx.eval(first_token)
         
         first_token_time = time.perf_counter()
@@ -401,7 +421,7 @@ class SpeculativeEngine:
                         
                         draft_last_logits = self._apply_grammar_mask(draft_last_logits, valid_tokens)
                     
-                    next_draft = self._sample_greedy(draft_last_logits)
+                    next_draft = self._sample_token(draft_last_logits, temperature, top_p)
                     mx.eval(next_draft)
                     draft_token = next_draft.item()
                     draft_tokens.append(draft_token)
@@ -452,7 +472,7 @@ class SpeculativeEngine:
                         
                         target_pos_logits = self._apply_grammar_mask(target_pos_logits, valid_tokens)
                     
-                    target_pred = self._sample_greedy(target_pos_logits).item()
+                    target_pred = self._sample_token(target_pos_logits, temperature, top_p).item()
                     
                     if draft_token == target_pred:
                         accepted_count += 1
@@ -538,6 +558,8 @@ class SpeculativeEngine:
         stop_tokens: Optional[List[int]] = None,
         regex: Optional[str] = None,
         json_schema: Optional[str] = None,
+        temperature: float = 0.0,
+        top_p: float = 1.0,
     ) -> Tuple[str, dict]:
         """
         generate text using only the target model. standard autoregressive decoding without speculation
@@ -627,7 +649,7 @@ class SpeculativeEngine:
                     f"Pattern: {regex}"
                 )
         
-        next_token = self._sample_greedy(last_logits)
+        next_token = self._sample_token(last_logits, temperature, top_p)
         mx.eval(next_token)
         
         metrics["ttft"] = time.perf_counter() - generation_start
@@ -657,7 +679,7 @@ class SpeculativeEngine:
                     
                     last_logits = self._apply_grammar_mask(last_logits, valid_tokens)
                 
-                next_token = self._sample_greedy(last_logits)
+                next_token = self._sample_token(last_logits, temperature, top_p)
                 mx.eval(next_token)
                 
                 token_id = next_token.item()
@@ -689,6 +711,267 @@ class SpeculativeEngine:
             metrics["mask_calls"] = len(mask_times)
         
         return output_text, metrics
+
+    def stream_generate(
+        self,
+        prompt: str,
+        max_tokens: int = 50,
+        gamma: int = 4,
+        stop_tokens: Optional[List[int]] = None,
+        regex: Optional[str] = None,
+        json_schema: Optional[str] = None,
+        draft_grammar_aware: bool = True,
+        temperature: float = 0.0,
+        top_p: float = 1.0,
+    ) -> Generator[Tuple[str, Optional[dict]], None, None]:
+        if self.draft_model is None or self.target_model is None:
+            self.load_models()
+
+        self._reset_caches()
+
+        if stop_tokens is None:
+            stop_tokens = []
+            if hasattr(self.tokenizer, 'eos_token_id'):
+                eos = self.tokenizer.eos_token_id
+                if isinstance(eos, int):
+                    stop_tokens.append(eos)
+                elif isinstance(eos, list):
+                    stop_tokens.extend(eos)
+
+        prompt_tokens = self.tokenizer.encode(prompt)
+        grammar_active = regex is not None or json_schema is not None
+
+        metrics = {
+            "prompt_tokens": len(prompt_tokens),
+            "generated_tokens": 0,
+            "draft_tokens_proposed": 0,
+            "draft_tokens_accepted": 0,
+            "acceptance_rate": 0.0,
+            "speculative_iterations": 0,
+            "ttft": None,
+            "generation_time": 0.0,
+            "tokens_per_second": 0.0,
+            "cache_mode": self.cache_mode,
+            "jit_compiled": self.use_compile,
+            "grammar_constrained": grammar_active,
+            "draft_grammar_aware": draft_grammar_aware and grammar_active,
+            "mask_time_total": 0.0,
+            "mask_time_avg": 0.0,
+        }
+
+        grammar_constraint = None
+        grammar_state = None
+
+        if grammar_active:
+            if _GrammarConstraint is None:
+                raise RuntimeError("Grammar constraints require the Rust backend")
+
+            grammar_constraint = _GrammarConstraint(self.vocab_bytes)
+
+            compile_start = time.perf_counter()
+            if json_schema is not None:
+                grammar_constraint.compile_json_schema(json_schema)
+            else:
+                grammar_constraint.compile_regex(regex)
+            metrics["grammar_compile_time"] = time.perf_counter() - compile_start
+
+            grammar_state = grammar_constraint.init_state()
+
+        generated_tokens = []
+        generation_start = time.perf_counter()
+        mask_times = []
+
+        input_ids = mx.array([prompt_tokens])
+
+        draft_logits = self.draft_model(input_ids, cache=self.draft_cache)
+        target_logits = self.target_model(input_ids, cache=self.target_cache)
+        mx.eval(draft_logits, target_logits)
+
+        first_token_logits = target_logits[:, -1, :]
+
+        if grammar_constraint is not None:
+            mask_start = time.perf_counter()
+            valid_tokens = grammar_constraint.get_valid_token_ids(grammar_state)
+            mask_times.append(time.perf_counter() - mask_start)
+
+            if valid_tokens:
+                first_token_logits = self._apply_grammar_mask(first_token_logits, valid_tokens)
+            else:
+                raise ValueError(f"no valid tokens at initial state. Pattern: {regex}")
+
+        first_token = self._sample_token(first_token_logits, temperature, top_p)
+        mx.eval(first_token)
+
+        metrics["ttft"] = time.perf_counter() - generation_start
+
+        token_id = first_token.item()
+        generated_tokens.append(token_id)
+
+        grammar_complete = False
+        if grammar_constraint is not None:
+            grammar_state = grammar_constraint.advance_state(grammar_state, token_id)
+            if grammar_constraint.is_match_state(grammar_state):
+                grammar_complete = True
+
+        yield self.tokenizer.decode([token_id]), None
+
+        if token_id not in stop_tokens and not grammar_complete:
+            while len(generated_tokens) < max_tokens:
+                metrics["speculative_iterations"] += 1
+
+                cache_position_before_draft = self._get_cache_size(self.draft_cache)
+                target_cache_position = self._get_cache_size(self.target_cache)
+
+                draft_tokens = []
+                current_token = token_id
+                draft_grammar_state = grammar_state
+
+                if grammar_constraint is not None:
+                    grammar_constraint.save_snapshot()
+
+                draft_input = mx.array([[current_token]])
+                draft_logits = self.draft_model(draft_input, cache=self.draft_cache)
+                mx.eval(draft_logits)
+
+                for _ in range(gamma):
+                    draft_last_logits = draft_logits[:, -1, :]
+
+                    if grammar_constraint is not None and draft_grammar_aware:
+                        mask_start = time.perf_counter()
+                        valid_tokens = grammar_constraint.get_valid_token_ids(draft_grammar_state)
+                        mask_times.append(time.perf_counter() - mask_start)
+
+                        if not valid_tokens:
+                            break
+
+                        draft_last_logits = self._apply_grammar_mask(draft_last_logits, valid_tokens)
+
+                    next_draft = self._sample_token(draft_last_logits, temperature, top_p)
+                    mx.eval(next_draft)
+                    draft_token = next_draft.item()
+                    draft_tokens.append(draft_token)
+
+                    if grammar_constraint is not None and draft_grammar_aware:
+                        draft_grammar_state = grammar_constraint.advance_state(
+                            draft_grammar_state, draft_token
+                        )
+                        if grammar_constraint.is_match_state(draft_grammar_state):
+                            break
+
+                    if draft_token in stop_tokens:
+                        break
+
+                    draft_input = mx.array([[draft_token]])
+                    draft_logits = self.draft_model(draft_input, cache=self.draft_cache)
+                    mx.eval(draft_logits)
+
+                metrics["draft_tokens_proposed"] += len(draft_tokens)
+
+                if not draft_tokens:
+                    break
+
+                verify_sequence = [current_token] + draft_tokens
+                verify_input = mx.array([verify_sequence])
+
+                target_logits = self.target_model(verify_input, cache=self.target_cache)
+                mx.eval(target_logits)
+
+                accepted_count = 0
+                verify_grammar_state = grammar_state
+
+                if grammar_constraint is not None:
+                    grammar_constraint.restore_snapshot()
+
+                for i, draft_token in enumerate(draft_tokens):
+                    target_pos_logits = target_logits[:, i:i+1, :].squeeze(1)
+
+                    if grammar_constraint is not None:
+                        mask_start = time.perf_counter()
+                        valid_tokens = grammar_constraint.get_valid_token_ids(verify_grammar_state)
+                        mask_times.append(time.perf_counter() - mask_start)
+
+                        if not valid_tokens:
+                            break
+
+                        target_pos_logits = self._apply_grammar_mask(target_pos_logits, valid_tokens)
+
+                    target_pred = self._sample_token(target_pos_logits, temperature, top_p).item()
+
+                    if draft_token == target_pred:
+                        accepted_count += 1
+                        generated_tokens.append(draft_token)
+                        yield self.tokenizer.decode([draft_token]), None
+
+                        if grammar_constraint is not None:
+                            verify_grammar_state = grammar_constraint.advance_state(
+                                verify_grammar_state, draft_token
+                            )
+                            if grammar_constraint.is_match_state(verify_grammar_state):
+                                grammar_complete = True
+                                break
+
+                        if draft_token in stop_tokens:
+                            break
+                    else:
+                        generated_tokens.append(target_pred)
+                        yield self.tokenizer.decode([target_pred]), None
+
+                        if grammar_constraint is not None:
+                            verify_grammar_state = grammar_constraint.advance_state(
+                                verify_grammar_state, target_pred
+                            )
+                            if grammar_constraint.is_match_state(verify_grammar_state):
+                                grammar_complete = True
+                        break
+
+                metrics["draft_tokens_accepted"] += accepted_count
+
+                if grammar_constraint is not None:
+                    grammar_state = verify_grammar_state
+
+                tokens_added = min(accepted_count + 1, len(draft_tokens))
+                if generated_tokens and generated_tokens[-1] in stop_tokens:
+                    tokens_added = accepted_count + (1 if accepted_count < len(draft_tokens) else 0)
+
+                valid_draft_length = cache_position_before_draft + 1 + accepted_count
+                self._rollback_cache(self.draft_cache, valid_draft_length)
+
+                valid_target_length = target_cache_position + tokens_added
+                self._rollback_cache(self.target_cache, valid_target_length)
+
+                if generated_tokens:
+                    token_id = generated_tokens[-1]
+
+                    if token_id in stop_tokens or grammar_complete:
+                        break
+
+                if len(generated_tokens) >= max_tokens:
+                    break
+
+        generation_end = time.perf_counter()
+
+        metrics["generated_tokens"] = len(generated_tokens)
+        metrics["generation_time"] = generation_end - generation_start
+
+        if metrics["generated_tokens"] > 0:
+            metrics["tokens_per_second"] = (
+                metrics["generated_tokens"] / metrics["generation_time"]
+            )
+
+        if metrics["draft_tokens_proposed"] > 0:
+            metrics["acceptance_rate"] = (
+                metrics["draft_tokens_accepted"] / metrics["draft_tokens_proposed"]
+            ) * 100
+
+        if mask_times:
+            metrics["mask_time_total"] = sum(mask_times)
+            metrics["mask_time_avg"] = sum(mask_times) / len(mask_times)
+            metrics["mask_calls"] = len(mask_times)
+
+        if self.cache_mode == "paged":
+            metrics["cache_stats"] = self._get_cache_stats()
+
+        yield "", metrics
     
     @property
     def draft_load_time(self) -> Optional[float]:

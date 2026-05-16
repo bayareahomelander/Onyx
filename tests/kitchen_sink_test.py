@@ -2,7 +2,7 @@
 kitchen sink test - grand integration test for all json schema features
 """
 import pytest
-from onyx_rust import GrammarConstraint
+from onyx._rust import GrammarConstraint
 
 
 def test_kitchen_sink_pretty_printed():
@@ -266,6 +266,60 @@ def test_whitespace_variants():
     assert gc.is_match_state(state), "all whitespace variants should be accepted"
 
 
+def test_nested_required_enforcement():
+    """
+    nested object required keys must block closing until all are present
+    """
+    vocab = [
+        b'{', b'}', b'[', b']', b',', b':', b' ',
+        b'"profile"', b'"name"', b'"tags"',
+        b'"John"', b'"tag1"',
+    ]
+
+    gc = GrammarConstraint(vocab)
+    schema = '''{
+        "type": "object",
+        "required": ["profile"],
+        "properties": {
+            "profile": {
+                "type": "object",
+                "required": ["name", "tags"],
+                "properties": {
+                    "name": {"type": "string"},
+                    "tags": {
+                        "type": "array",
+                        "items": {"type": "string"}
+                    }
+                }
+            }
+        }
+    }'''
+
+    gc.compile_json_schema(schema)
+
+    state = gc.init_state()
+    state = gc.advance_state(state, 0)   # {
+    state = gc.advance_state(state, 7)   # "profile"
+    state = gc.advance_state(state, 5)   # :
+    state = gc.advance_state(state, 0)   # {
+    state = gc.advance_state(state, 8)   # "name"
+    state = gc.advance_state(state, 5)   # :
+    state = gc.advance_state(state, 10)  # "John"
+
+    valid = gc.get_valid_token_ids(state)
+    assert 1 not in valid, "nested object must not close before required tags key"
+
+    state = gc.advance_state(state, 4)   # ,
+    state = gc.advance_state(state, 9)   # "tags"
+    state = gc.advance_state(state, 5)   # :
+    state = gc.advance_state(state, 2)   # [
+    state = gc.advance_state(state, 11)  # "tag1"
+    state = gc.advance_state(state, 3)   # ]
+
+    valid = gc.get_valid_token_ids(state)
+    assert 1 in valid, "nested object should close after all required keys are present"
+
+
 if __name__ == "__main__":
     test_whitespace_variants()
     print("whitespace variants: pass")
@@ -275,5 +329,8 @@ if __name__ == "__main__":
     
     test_kitchen_sink_constraint_enforcement()
     print("kitchen sink constraint enforcement: pass")
+
+    test_nested_required_enforcement()
+    print("nested required enforcement: pass")
     
     print("\n=== all kitchen sink tests pass ===")
