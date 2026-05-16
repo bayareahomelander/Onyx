@@ -4,6 +4,7 @@
 //! the structural information needed for constraint enforcement.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use serde_json::Value;
 
 use crate::constraint::ConstraintError;
@@ -69,7 +70,7 @@ pub struct PropertyBlueprint {
     /// for nested objects: keys required by this object's schema
     pub required_keys: HashSet<String>,
     /// for arrays: item schema
-    pub items: Option<Box<PropertyBlueprint>>,
+    pub items: Option<Arc<PropertyBlueprint>>,
     pub required: bool,
     /// for enums: allowed values (serialized json bytes)
     pub enum_values: Option<Vec<Vec<u8>>>,
@@ -83,6 +84,7 @@ pub struct PropertyBlueprint {
     pub min_items: Option<usize>,
     /// for arrays: max item count
     pub max_items: Option<usize>,
+    pub object_blueprint: Option<Arc<SchemaBlueprint>>,
 }
 
 impl PropertyBlueprint {
@@ -120,7 +122,7 @@ impl PropertyBlueprint {
         // parse items for arrays
         let items = if schema_types.contains(&SchemaType::Array) {
             value.get("items").map(|item_schema| {
-                Box::new(PropertyBlueprint::from_value("_item", item_schema))
+                Arc::new(PropertyBlueprint::from_value("_item", item_schema))
             })
         } else {
             None
@@ -146,6 +148,19 @@ impl PropertyBlueprint {
         let min_items = value.get("minItems").and_then(|v| v.as_u64()).map(|n| n as usize);
         let max_items = value.get("maxItems").and_then(|v| v.as_u64()).map(|n| n as usize);
         
+        let object_blueprint = if schema_types.contains(&SchemaType::Object) {
+            let mut allowed_keys: Vec<String> = properties.keys().cloned().collect();
+            allowed_keys.sort();
+            Some(Arc::new(SchemaBlueprint {
+                root_type: SchemaType::Object,
+                properties: properties.clone(),
+                required: required_keys.clone(),
+                allowed_keys,
+            }))
+        } else {
+            None
+        };
+        
         PropertyBlueprint {
             schema_types,
             properties,
@@ -158,6 +173,7 @@ impl PropertyBlueprint {
             max_length,
             min_items,
             max_items,
+            object_blueprint,
         }
     }
     

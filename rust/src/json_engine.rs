@@ -5,6 +5,7 @@
 //! scope on the stack, enabling proper tracking of nested objects and arrays.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use serde_json::Value;
 use regex_automata::dfa::{dense, Automaton};
 use regex_automata::util::primitives::StateID;
@@ -34,7 +35,7 @@ pub struct StringState {
     /// in escape sequence
     in_escape: bool,
     /// compiled dfa for pattern validation
-    pattern_dfa: Option<dense::DFA<Vec<u32>>>,
+    pattern_dfa: Option<Arc<dense::DFA<Vec<u32>>>>,
     /// current dfa state
     dfa_state: Option<StateID>,
     /// chars consumed so far
@@ -77,7 +78,7 @@ impl StringState {
             Ok(compiled) => {
                 StringState {
                     in_escape: false,
-                    pattern_dfa: Some(compiled.dfa),
+                    pattern_dfa: Some(Arc::new(compiled.dfa)),
                     dfa_state: Some(compiled.initial_state),
                     char_count: 0,
                     min_length: None,
@@ -167,7 +168,7 @@ pub struct ArrayState {
     /// current syntax state
     pub syntax_state: ArraySyntaxState,
     /// schema for array items
-    pub item_blueprint: Option<Box<PropertyBlueprint>>,
+    pub item_blueprint: Option<Arc<PropertyBlueprint>>,
     /// items consumed so far
     pub item_count: usize,
     /// min items required
@@ -177,7 +178,7 @@ pub struct ArrayState {
 }
 
 impl ArrayState {
-    pub fn new(item_blueprint: Option<Box<PropertyBlueprint>>) -> Self {
+    pub fn new(item_blueprint: Option<Arc<PropertyBlueprint>>) -> Self {
         ArrayState {
             syntax_state: ArraySyntaxState::Start,
             item_blueprint,
@@ -187,7 +188,7 @@ impl ArrayState {
         }
     }
     
-    pub fn with_constraints(item_blueprint: Option<Box<PropertyBlueprint>>, min: Option<usize>, max: Option<usize>) -> Self {
+    pub fn with_constraints(item_blueprint: Option<Arc<PropertyBlueprint>>, min: Option<usize>, max: Option<usize>) -> Self {
         ArrayState {
             syntax_state: ArraySyntaxState::Start,
             item_blueprint,
@@ -215,7 +216,7 @@ pub enum Scope {
     /// inside a JSON object
     Object {
         /// the blueprint for this object (allowed keys, property types)
-        blueprint: SchemaBlueprint,
+        blueprint: Arc<SchemaBlueprint>,
         /// current syntax state
         syntax_state: ObjectSyntaxState,
         /// buffer for the key being matched
@@ -245,7 +246,7 @@ pub enum Scope {
 pub struct JsonEngine {
     vocab: HashMap<usize, Vec<u8>>,
     vocab_size: usize,
-    root_blueprint: SchemaBlueprint,
+    root_blueprint: Arc<SchemaBlueprint>,
     stack: Vec<Scope>,
     finished: bool,
     dead: bool,
@@ -257,7 +258,7 @@ impl JsonEngine {
         let schema: Value = serde_json::from_str(schema_str)
             .map_err(|e| ConstraintError::CompilationError(format!("Invalid JSON schema: {}", e)))?;
 
-        let root_blueprint = SchemaBlueprint::from_value(&schema)?;
+        let root_blueprint = Arc::new(SchemaBlueprint::from_value(&schema)?);
 
         let vocab_size = vocabulary.len();
         let mut vocab = HashMap::with_capacity(vocab_size);
@@ -304,7 +305,7 @@ impl JsonEngine {
     }
 
     /// helper function: push the appropriate value scope based on schema type
-    fn push_value_scope(stack: &mut Vec<Scope>, item_bp: &Option<Box<PropertyBlueprint>>, byte: u8) -> bool {
+    fn push_value_scope(stack: &mut Vec<Scope>, item_bp: &Option<Arc<PropertyBlueprint>>, byte: u8) -> bool {
         // priority: check for enum values first
         if let Some(bp) = item_bp {
             if let Some(ref enum_vals) = bp.enum_values {
@@ -348,7 +349,7 @@ impl JsonEngine {
         }
         
         // helper function: push a scope for a specific type
-        fn push_scope_for_type(stack: &mut Vec<Scope>, schema_type: &SchemaType, byte: u8, item_bp: &Option<Box<PropertyBlueprint>>) -> bool {
+        fn push_scope_for_type(stack: &mut Vec<Scope>, schema_type: &SchemaType, byte: u8, item_bp: &Option<Arc<PropertyBlueprint>>) -> bool {
             match schema_type {
                 SchemaType::String => {
                     if byte == b'"' {
@@ -394,28 +395,34 @@ impl JsonEngine {
                 }
                 SchemaType::Object => {
                     if byte == b'{' {
-                        let nested_blueprint = if let Some(bp) = item_bp {
-                            SchemaBlueprint {
-                                root_type: SchemaType::Object,
-                                properties: bp.properties.clone(),
-                                required: bp.required_keys.clone(),
-                                allowed_keys: bp.properties.keys().cloned().collect(),
+                        let (nested_blueprint, missing_req) = if let Some(bp) = item_bp {
+                            if let Some(obp) = &bp.object_blueprint {
+                                (Arc::clone(obp), obp.required.clone())
+                            } else {
+                                let empty = Arc::new(SchemaBlueprint {
+                                    root_type: SchemaType::Object,
+                                    properties: std::collections::HashMap::new(),
+                                    required: std::collections::HashSet::new(),
+                                    allowed_keys: Vec::new(),
+                                });
+                                (empty, std::collections::HashSet::new())
                             }
                         } else {
-                            SchemaBlueprint {
+                            let empty = Arc::new(SchemaBlueprint {
                                 root_type: SchemaType::Object,
                                 properties: std::collections::HashMap::new(),
                                 required: std::collections::HashSet::new(),
                                 allowed_keys: Vec::new(),
-                            }
+                            });
+                            (empty, std::collections::HashSet::new())
                         };
                         stack.push(Scope::Object {
-                            blueprint: nested_blueprint.clone(),
+                            blueprint: nested_blueprint,
                             syntax_state: ObjectSyntaxState::ExpectKeyOrEnd,
                             key_buffer: String::new(),
                             used_keys: Vec::new(),
                             in_escape: false,
-                            missing_required_keys: nested_blueprint.required.clone(),
+                            missing_required_keys: missing_req,
                         });
                         return true;
                     }
@@ -453,19 +460,19 @@ impl JsonEngine {
                         return true;
                     }
                     if byte == b'{' {
-                        let nested_blueprint = SchemaBlueprint {
+                        let empty = Arc::new(SchemaBlueprint {
                             root_type: SchemaType::Object,
                             properties: std::collections::HashMap::new(),
                             required: std::collections::HashSet::new(),
                             allowed_keys: Vec::new(),
-                        };
+                        });
                         stack.push(Scope::Object {
-                            blueprint: nested_blueprint.clone(),
+                            blueprint: empty,
                             syntax_state: ObjectSyntaxState::ExpectKeyOrEnd,
                             key_buffer: String::new(),
                             used_keys: Vec::new(),
                             in_escape: false,
-                            missing_required_keys: nested_blueprint.required.clone(),
+                            missing_required_keys: std::collections::HashSet::new(),
                         });
                         return true;
                     }
@@ -526,7 +533,7 @@ impl JsonEngine {
 
     /// static version of byte validation
     fn validate_byte_static(
-        root_blueprint: &SchemaBlueprint,
+        root_blueprint: &Arc<SchemaBlueprint>,
         stack: &mut Vec<Scope>,
         finished: &mut bool,
         byte: u8,
@@ -546,7 +553,7 @@ impl JsonEngine {
                         SchemaType::Object => {
                             if byte == b'{' {
                                 *scope = Scope::Object {
-                                    blueprint: root_blueprint.clone(),
+                                    blueprint: Arc::clone(root_blueprint),
                                     syntax_state: ObjectSyntaxState::ExpectKeyOrEnd,
                                     key_buffer: String::new(),
                                     used_keys: Vec::new(),
@@ -735,19 +742,24 @@ impl JsonEngine {
                                     }
                                     SchemaType::Object => {
                                         if let Some(prop) = blueprint.get_property(&key) {
-                                            let nested_blueprint = SchemaBlueprint {
-                                                root_type: SchemaType::Object,
-                                                properties: prop.properties.clone(),
-                                                required: prop.required_keys.clone(),
-                                                allowed_keys: prop.properties.keys().cloned().collect(),
+                                            let (nested_blueprint, missing_req) = if let Some(obp) = &prop.object_blueprint {
+                                                (Arc::clone(obp), obp.required.clone())
+                                            } else {
+                                                let empty = Arc::new(SchemaBlueprint {
+                                                    root_type: SchemaType::Object,
+                                                    properties: std::collections::HashMap::new(),
+                                                    required: std::collections::HashSet::new(),
+                                                    allowed_keys: Vec::new(),
+                                                });
+                                                (empty, std::collections::HashSet::new())
                                             };
                                             stack.push(Scope::Object {
-                                                blueprint: nested_blueprint.clone(),
+                                                blueprint: nested_blueprint,
                                                 syntax_state: ObjectSyntaxState::ExpectKeyOrEnd,
                                                 key_buffer: String::new(),
                                                 used_keys: Vec::new(),
                                                 in_escape: false,
-                                                missing_required_keys: nested_blueprint.required.clone(),
+                                                missing_required_keys: missing_req,
                                             });
                                         }
                                         return true;
@@ -1164,7 +1176,7 @@ impl ConstraintEngine for JsonEngine {
         Box::new(JsonEngine {
             vocab: self.vocab.clone(),
             vocab_size: self.vocab_size,
-            root_blueprint: self.root_blueprint.clone(),
+            root_blueprint: Arc::clone(&self.root_blueprint),
             stack: self.stack.clone(),
             finished: self.finished,
             dead: self.dead,

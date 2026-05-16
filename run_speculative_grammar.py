@@ -178,7 +178,7 @@ def main():
     print("extended test: longer generation (50 tokens)")
     
     LONG_PROMPT = "Generate digits: "
-    LONG_REGEX = "[0-9]+"
+    LONG_REGEX = "[0-9]{50}"
     LONG_MAX = 50
     
     long_baseline = run_scenario(
