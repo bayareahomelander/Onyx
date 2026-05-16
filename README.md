@@ -15,11 +15,11 @@ Onyx is an inference engine that enforces structured output constraints (JSON Sc
 
 | Configuration | Baseline | Onyx (Aware Draft) | Speedup |
 |---------------|----------|---------------------|---------|
-| 7B Target (memory-bound) | 17.4 tok/s | 18.9 tok/s | **1.09x** |
+| 7B Target (memory-bound) | 17.8 tok/s | 18.5 tok/s | **1.04x** |
 | 1.5B Target (compute-bound) | 73.5 tok/s | 69.2 tok/s | 0.94x |
 
 - **100% Grammar Compliance**: Output always matches the specified schema or pattern
-- **Adaptive Speculation**: Experimental adaptive γ controller matches the best fixed γ setting on a 7B forced-digits benchmark (31.8 tok/s vs 23.3 tok/s baseline, **1.37x**)
+- **Adaptive Speculation**: Experimental adaptive γ controller matches the best fixed γ setting on a 7B forced-digits benchmark (29.2 tok/s vs 21.9 tok/s baseline, **1.34x**)
 - **OpenAI-Compatible API**: Drop-in replacement for existing agent frameworks
 - **Full JSON Schema Support**: Nested objects, typed arrays, regex patterns, enums, unions, and length constraints
 
@@ -328,11 +328,11 @@ The experimental adaptive path compares fixed speculative batch sizes against a 
 
 | Configuration | Throughput | vs Baseline | Acceptance |
 |---------------|------------|-------------|------------|
-| 7B Baseline (`[0-9]{32}`) | 23.3 tok/s | 1.00x | — |
-| Fixed γ=2 | 27.8 tok/s | 1.20x | 93.8% |
-| Fixed γ=4 | 31.8 tok/s | **1.37x** | 88.2% |
-| Fixed γ=8 | 30.0 tok/s | 1.29x | 78.9% |
-| Adaptive γ | 31.8 tok/s | **1.37x** | 88.2% |
+| 7B Baseline (`[0-9]{32}`) | 21.9 tok/s | 1.00x | — |
+| Fixed γ=2 | 25.3 tok/s | 1.16x | 93.8% |
+| Fixed γ=4 | 29.1 tok/s | **1.33x** | 88.2% |
+| Fixed γ=8 | 27.6 tok/s | 1.26x | 78.9% |
+| Adaptive γ | 29.2 tok/s | **1.34x** | 88.2% |
 
 In this run, adaptive γ matched the best fixed setting while adjusting during generation (avg γ=4.2, final γ=8).
 
