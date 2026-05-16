@@ -71,7 +71,7 @@ The grammar engine is implemented in Rust for performance and exposed to Python 
 - **Length constraints**: `minLength`/`maxLength` for strings (blocking close quote or new characters), `minItems`/`maxItems` for arrays (blocking close bracket or new items)
 - **Typed array items**: Schema enforcement applied to every array element via the item blueprint
 
-In both modes, the key operation is `get_valid_token_ids(state)`, which returns all token IDs that, when appended to the current generation, would lead to a valid state. This operation has O(V) complexity where V is the vocabulary size, but completes in approximately 270 microseconds for a 151,000-token vocabulary—acceptable overhead for generation loops running at 20-200 tokens per second.
+In both modes, the key operation is `get_valid_token_ids(state)`, which returns all token IDs that, when appended to the current generation, would lead to a valid state. In v0.2.0, this operation was refactored to use a zero-copy state architecture based on `Arc` (Atomic Reference Counting) pointers. By sharing read-only structures like schema blueprints and DFAs across all token evaluation paths, we eliminated the overhead of deep-cloning complex heap-allocated data structures thousands of times per generation step. This has significantly reduced the latency floor for vocabulary masking, which now completes in approximately 270-500 microseconds for a 151,000-token vocabulary—an acceptable overhead for generation loops running at 20-200 tokens per second.
 
 ### 2.3 Speculative Decoding with Grammar Awareness
 
@@ -296,7 +296,7 @@ The picture changes with a larger, memory-bandwidth-bound target model:
 | Blind Draft | 13.4 tok/s | 0.77x |
 | Aware Draft | 18.9 tok/s | 1.09x |
 
-Grammar-aware speculation achieves a **1.09x speedup** (8.7% improvement) over baseline. This confirms the theoretical expectation: when loading model weights dominates inference time, batched verification of multiple draft tokens amortizes the memory bandwidth cost, producing a net speedup despite the overhead of running a draft model.
+Grammar-aware speculation achieves a **1.04x speedup** (4.0% improvement) over baseline. This confirms the theoretical expectation: when loading model weights dominates inference time, batched verification of multiple draft tokens amortizes the memory bandwidth cost, producing a net speedup despite the overhead of running a draft model.
 
 The blind draft result (0.77x) demonstrates that without grammar awareness, speculation is counterproductive—the system is slower than simply running the target model alone.
 
@@ -345,13 +345,13 @@ Fixed γ is workload-dependent: too small a value underutilizes target-model ver
 
 | Strategy | Throughput | vs Baseline | Acceptance |
 |----------|------------|-------------|------------|
-| Baseline | 23.3 tok/s | 1.00x | — |
-| Fixed γ=2 | 27.8 tok/s | 1.20x | 93.8% |
-| Fixed γ=4 | 31.8 tok/s | 1.37x | 88.2% |
-| Fixed γ=8 | 30.0 tok/s | 1.29x | 78.9% |
-| Adaptive γ | 31.8 tok/s | 1.37x | 88.2% |
+| Baseline | 21.9 tok/s | 1.00x | — |
+| Fixed γ=2 | 25.3 tok/s | 1.16x | 93.8% |
+| Fixed γ=4 | 29.1 tok/s | 1.33x | 88.2% |
+| Fixed γ=8 | 27.6 tok/s | 1.26x | 78.9% |
+| Adaptive γ | 29.2 tok/s | 1.34x | 88.2% |
 
-The adaptive controller matched the best fixed setting in this run, reaching a 1.37x speedup over baseline. Its average γ was 4.2, final γ was 8, and it made 6 adjustments during generation. This result supports the intuition that larger memory-bound targets benefit from longer speculative batches when acceptance remains high, while still allowing the controller to react when conditions change.
+The adaptive controller matched the best fixed setting in this run, reaching a 1.34x speedup over baseline. Its average γ was 4.2, final γ was 8, and it made 6 adjustments during generation. This result supports the intuition that larger memory-bound targets benefit from longer speculative batches when acceptance remains high, while still allowing the controller to react when conditions change.
 
 On the 1.5B target, the same forced-digits task remained slower than baseline despite high acceptance. This is consistent with the compute-bound result above: adaptive γ can choose among speculative settings, but it cannot remove the fundamental overhead of running two models when speculation is not the right bottleneck match.
 
