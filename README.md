@@ -19,7 +19,7 @@ Onyx is an inference engine that enforces structured output constraints (JSON Sc
 
 | Configuration | Baseline | Onyx (Aware Draft) | Speedup |
 |---------------|----------|---------------------|---------|
-| 7B Target (memory-bound) | 17.8 tok/s | 18.5 tok/s | **1.04x** |
+| 8B Target (memory-bound) | 15.6 tok/s | 22.6 tok/s | **1.45x** |
 | 1.5B Target (compute-bound) | 73.5 tok/s | 69.2 tok/s | 0.94x |
 
 - **100% Grammar Compliance**: Output always matches the specified schema or pattern
@@ -308,21 +308,21 @@ curl -X POST http://localhost:8000/v1/chat/completions \
 
 ## Benchmarks
 
-All benchmarks run on Apple Silicon with 4-bit quantized Qwen2.5 models.
+All benchmarks run on Apple Silicon with 4-bit quantized Qwen models.
 
 ### Acceptance Rate (Grammar: `[0-9]{4}`)
 
-| Method | 1.5B Target | 7B Target |
+| Method | 1.5B Target | 8B Target |
 |--------|-------------|-----------|
-| Blind Draft | 75% | 12.5% |
-| **Aware Draft** | **100%** | **25%** |
+| Blind Draft | 75% | 75% |
+| **Aware Draft** | **100%** | **100%** |
 
 ### Throughput
 
 | Configuration | Baseline | Aware Draft | vs Baseline |
 |---------------|----------|-------------|-------------|
 | 1.5B Target | 73.5 tok/s | 69.2 tok/s | 0.94x |
-| 7B Target | 17.4 tok/s | 18.9 tok/s | **1.09x** |
+| 8B Target | 15.6 tok/s | 22.6 tok/s | **1.45x** |
 
 The crossover point where speculation beats baseline occurs when the target model becomes memory-bandwidth-bound (typically 7B+ parameters).
 
