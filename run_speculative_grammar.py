@@ -95,9 +95,9 @@ def main():
     print(f"runs per scenario: {NUM_RUNS}")
     
     print("draft model: qwen2.5-0.5b-instruct-4bit (fast proposer)")
-    print("target model: qwen2.5-7b-instruct-4bit (memory-bound verifier)")
+    print("target model: qwen3-8b-4bit (memory-bound verifier)")
     engine = SpeculativeEngine(
-        target_model_path="mlx-community/Qwen2.5-7B-Instruct-4bit",
+        target_model_path="mlx-community/Qwen3-8B-4bit",
         cache_mode="paged",
         use_compile=True,
     )
