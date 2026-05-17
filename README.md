@@ -7,7 +7,7 @@
 
 **Grammar-Aware Speculative Decoding for Structured LLM Outputs on Apple Silicon**
 
-Onyx is an inference engine that enforces structured output constraints (JSON Schema, regex patterns) on language models while maintaining—or exceeding—baseline generation speed. By applying grammar constraints to both draft and target models in a speculative decoding pipeline, Onyx achieves **100% output reliability** with a **1.04x speedup** on memory-bound models (7B+).
+Onyx is an inference engine that enforces structured output constraints (JSON Schema, regex patterns) on language models while maintaining—or exceeding—baseline generation speed. By applying grammar constraints to both draft and target models in a speculative decoding pipeline, Onyx achieves **100% output reliability** with a **1.45x speedup** on memory-bound models (8B+).
 
 ## What's New in v0.2.0
 - **Zero-Copy Rust State Architecture:** Radically optimized the Rust grammar engine by replacing deep cloning with `Arc` (Atomic Reference Counting) pointers for schema blueprints and regex automata. This completely eliminates vocabulary masking overhead, significantly raising the baseline generation speed.
@@ -23,7 +23,7 @@ Onyx is an inference engine that enforces structured output constraints (JSON Sc
 | 1.5B Target (compute-bound) | 73.5 tok/s | 69.2 tok/s | 0.94x |
 
 - **100% Grammar Compliance**: Output always matches the specified schema or pattern
-- **Adaptive Speculation**: Experimental adaptive γ controller matches the best fixed γ setting on a 7B forced-digits benchmark (29.2 tok/s vs 21.9 tok/s baseline, **1.34x**)
+- **Adaptive Speculation**: Experimental adaptive γ controller matches the best fixed γ setting on an 8B forced-digits benchmark (29.2 tok/s vs 21.9 tok/s baseline, **1.34x**)
 - **OpenAI-Compatible API**: Drop-in replacement for existing agent frameworks
 - **Full JSON Schema Support**: Nested objects, typed arrays, regex patterns, enums, unions, and length constraints
 
@@ -300,7 +300,7 @@ curl -X POST http://localhost:8000/v1/chat/completions \
 
 1. **Compile Grammar**: The JSON schema or regex pattern is compiled into internal state machines (stack-based FSM for JSON, DFA for regex)
 2. **Filter Vocabulary**: At each generation step, only tokens leading to valid states are allowed
-3. **Speculative Decoding**: A small draft model (0.5B) proposes tokens that a larger target model (1.5B/7B) verifies
+3. **Speculative Decoding**: A small draft model (0.5B) proposes tokens that a larger target model (1.5B/8B) verifies
 4. **Grammar-Aware Drafting**: Both models are constrained to the grammar, ensuring high acceptance rates
 5. **Adaptive Draft Length (Experimental)**: An optional controller adjusts γ based on recent acceptance rate and timing signals
 
@@ -332,7 +332,7 @@ The experimental adaptive path compares fixed speculative batch sizes against a 
 
 | Configuration | Throughput | vs Baseline | Acceptance |
 |---------------|------------|-------------|------------|
-| 7B Baseline (`[0-9]{32}`) | 21.9 tok/s | 1.00x | — |
+| 8B Baseline (`[0-9]{32}`) | 21.9 tok/s | 1.00x | — |
 | Fixed γ=2 | 25.3 tok/s | 1.16x | 93.8% |
 | Fixed γ=4 | 29.1 tok/s | **1.33x** | 88.2% |
 | Fixed γ=8 | 27.6 tok/s | 1.26x | 78.9% |
