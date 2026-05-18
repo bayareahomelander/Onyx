@@ -8,6 +8,7 @@ use regex_automata::dfa::{dense, Automaton};
 use regex_automata::util::primitives::StateID;
 use regex_automata::util::start::Config as StartConfig;
 use regex_automata::Anchored;
+use std::sync::Arc;
 
 use crate::constraint::{ConstraintEngine, ConstraintError};
 
@@ -24,13 +25,14 @@ pub fn compile_pattern_dfa(pattern: &str) -> Result<CompiledDfa, String> {
         .configure(
             dense::Config::new()
                 .start_kind(regex_automata::dfa::StartKind::Anchored)
-                .match_kind(regex_automata::MatchKind::LeftmostFirst)
+                .match_kind(regex_automata::MatchKind::LeftmostFirst),
         )
         .build(pattern)
         .map_err(|e| format!("Failed to compile regex: {}", e))?;
 
     let start_config = StartConfig::new().anchored(Anchored::Yes);
-    let initial_state = dfa.start_state(&start_config)
+    let initial_state = dfa
+        .start_state(&start_config)
         .map_err(|e| format!("Failed to get start state: {}", e))?;
 
     Ok(CompiledDfa { dfa, initial_state })
@@ -42,8 +44,8 @@ pub fn compile_pattern_dfa(pattern: &str) -> Result<CompiledDfa, String> {
 /// during token generation. it implements the ConstraintEngine trait
 /// to provide vocabulary filtering based on regex patterns.
 pub struct RegexEngine {
-    vocabulary: Vec<Vec<u8>>,
-    dfa: dense::DFA<Vec<u32>>,
+    vocabulary: Arc<Vec<Vec<u8>>>,
+    dfa: Arc<dense::DFA<Vec<u32>>>,
     current_state: StateID,
     initial_state: StateID,
     pattern: String,
@@ -58,18 +60,21 @@ impl RegexEngine {
             .configure(
                 dense::Config::new()
                     .start_kind(regex_automata::dfa::StartKind::Anchored)
-                    .match_kind(regex_automata::MatchKind::LeftmostFirst)
+                    .match_kind(regex_automata::MatchKind::LeftmostFirst),
             )
             .build(pattern)
-            .map_err(|e| ConstraintError::CompilationError(format!("Failed to compile regex: {}", e)))?;
+            .map_err(|e| {
+                ConstraintError::CompilationError(format!("Failed to compile regex: {}", e))
+            })?;
 
         let start_config = StartConfig::new().anchored(Anchored::Yes);
-        let initial_state = dfa.start_state(&start_config)
-            .map_err(|e| ConstraintError::CompilationError(format!("Failed to get start state: {}", e)))?;
+        let initial_state = dfa.start_state(&start_config).map_err(|e| {
+            ConstraintError::CompilationError(format!("Failed to get start state: {}", e))
+        })?;
 
         Ok(RegexEngine {
-            vocabulary,
-            dfa,
+            vocabulary: Arc::new(vocabulary),
+            dfa: Arc::new(dfa),
             current_state: initial_state,
             initial_state,
             pattern: pattern.to_string(),
@@ -154,8 +159,8 @@ impl ConstraintEngine for RegexEngine {
 
     fn clone_box(&self) -> Box<dyn ConstraintEngine> {
         Box::new(RegexEngine {
-            vocabulary: self.vocabulary.clone(),
-            dfa: self.dfa.clone(),
+            vocabulary: Arc::clone(&self.vocabulary),
+            dfa: Arc::clone(&self.dfa),
             current_state: self.current_state,
             initial_state: self.initial_state,
             pattern: self.pattern.clone(),
@@ -195,7 +200,7 @@ mod tests {
     fn test_regex_engine_advance() {
         let vocab = make_test_vocab();
         let mut engine = RegexEngine::new(vocab, "The year is [0-9]{4}").unwrap();
-        
+
         // advance with "The" (token 0)
         engine.advance(0).unwrap();
         assert!(!engine.is_dead());
@@ -206,9 +211,9 @@ mod tests {
     fn test_regex_engine_valid_tokens() {
         let vocab = make_test_vocab();
         let engine = RegexEngine::new(vocab, "The year is [0-9]{4}").unwrap();
-        
+
         let valid = engine.get_valid_tokens();
-        
+
         // "The" (token 0) should be valid at start
         assert!(valid.contains(&0));
         // "hello" (token 8) should NOT be valid
@@ -219,12 +224,12 @@ mod tests {
     fn test_regex_engine_reset() {
         let vocab = make_test_vocab();
         let mut engine = RegexEngine::new(vocab, "The year is [0-9]{4}").unwrap();
-        
+
         let initial_state = engine.current_state_id();
-        
+
         engine.advance(0).unwrap();
         assert_ne!(engine.current_state_id(), initial_state);
-        
+
         engine.reset();
         assert_eq!(engine.current_state_id(), initial_state);
     }
@@ -233,17 +238,17 @@ mod tests {
     fn test_regex_engine_full_match() {
         let vocab = make_test_vocab();
         let mut engine = RegexEngine::new(vocab, "The year is [0-9]{4}").unwrap();
-        
+
         // generate "The year is 2019"
-        engine.advance(0).unwrap();  // "The"
-        engine.advance(1).unwrap();  // " year"
-        engine.advance(2).unwrap();  // " is"
-        engine.advance(3).unwrap();  // " "
-        engine.advance(4).unwrap();  // "2"
-        engine.advance(5).unwrap();  // "0"
-        engine.advance(6).unwrap();  // "1"
-        engine.advance(7).unwrap();  // "9"
-        
+        engine.advance(0).unwrap(); // "The"
+        engine.advance(1).unwrap(); // " year"
+        engine.advance(2).unwrap(); // " is"
+        engine.advance(3).unwrap(); // " "
+        engine.advance(4).unwrap(); // "2"
+        engine.advance(5).unwrap(); // "0"
+        engine.advance(6).unwrap(); // "1"
+        engine.advance(7).unwrap(); // "9"
+
         assert!(engine.is_finished());
         assert!(!engine.is_dead());
     }

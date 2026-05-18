@@ -4,15 +4,15 @@
 //! constraints during LLM generation. each level of JSON nesting has its own
 //! scope on the stack, enabling proper tracking of nested objects and arrays.
 
-use std::collections::HashMap;
-use std::sync::Arc;
-use serde_json::Value;
 use regex_automata::dfa::{dense, Automaton};
 use regex_automata::util::primitives::StateID;
+use serde_json::Value;
+use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::constraint::{ConstraintEngine, ConstraintError};
-use crate::schema::{SchemaBlueprint, SchemaType, PropertyBlueprint};
 use crate::regex_engine::compile_pattern_dfa;
+use crate::schema::{PropertyBlueprint, SchemaBlueprint, SchemaType};
 
 /// syntax state within an object scope
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -48,7 +48,7 @@ pub struct StringState {
 
 impl Default for StringState {
     fn default() -> Self {
-        StringState { 
+        StringState {
             in_escape: false,
             pattern_dfa: None,
             dfa_state: None,
@@ -71,26 +71,28 @@ impl StringState {
             max_length: None,
         }
     }
-    
+
     /// string state with regex pattern
     pub fn with_pattern(pattern: &str) -> Self {
         match compile_pattern_dfa(pattern) {
-            Ok(compiled) => {
-                StringState {
-                    in_escape: false,
-                    pattern_dfa: Some(Arc::new(compiled.dfa)),
-                    dfa_state: Some(compiled.initial_state),
-                    char_count: 0,
-                    min_length: None,
-                    max_length: None,
-                }
-            }
-            Err(_) => StringState::new_started()
+            Ok(compiled) => StringState {
+                in_escape: false,
+                pattern_dfa: Some(Arc::new(compiled.dfa)),
+                dfa_state: Some(compiled.initial_state),
+                char_count: 0,
+                min_length: None,
+                max_length: None,
+            },
+            Err(_) => StringState::new_started(),
         }
     }
-    
+
     /// string state with pattern and length constraints
-    pub fn with_pattern_and_constraints(pattern: Option<&str>, min_len: Option<usize>, max_len: Option<usize>) -> Self {
+    pub fn with_pattern_and_constraints(
+        pattern: Option<&str>,
+        min_len: Option<usize>,
+        max_len: Option<usize>,
+    ) -> Self {
         let mut state = if let Some(p) = pattern {
             StringState::with_pattern(p)
         } else {
@@ -187,8 +189,12 @@ impl ArrayState {
             max_items: None,
         }
     }
-    
-    pub fn with_constraints(item_blueprint: Option<Arc<PropertyBlueprint>>, min: Option<usize>, max: Option<usize>) -> Self {
+
+    pub fn with_constraints(
+        item_blueprint: Option<Arc<PropertyBlueprint>>,
+        min: Option<usize>,
+        max: Option<usize>,
+    ) -> Self {
         ArrayState {
             syntax_state: ArraySyntaxState::Start,
             item_blueprint,
@@ -244,7 +250,7 @@ pub enum Scope {
 
 /// a JSON schema constraint engine using stack-based scopes
 pub struct JsonEngine {
-    vocab: HashMap<usize, Vec<u8>>,
+    vocab: Arc<HashMap<usize, Vec<u8>>>,
     vocab_size: usize,
     root_blueprint: Arc<SchemaBlueprint>,
     stack: Vec<Scope>,
@@ -255,8 +261,9 @@ pub struct JsonEngine {
 impl JsonEngine {
     /// create a new JsonEngine with the given vocabulary and schema
     pub fn new(vocabulary: Vec<Vec<u8>>, schema_str: &str) -> Result<Self, ConstraintError> {
-        let schema: Value = serde_json::from_str(schema_str)
-            .map_err(|e| ConstraintError::CompilationError(format!("Invalid JSON schema: {}", e)))?;
+        let schema: Value = serde_json::from_str(schema_str).map_err(|e| {
+            ConstraintError::CompilationError(format!("Invalid JSON schema: {}", e))
+        })?;
 
         let root_blueprint = Arc::new(SchemaBlueprint::from_value(&schema)?);
 
@@ -269,7 +276,7 @@ impl JsonEngine {
         let stack = vec![Scope::Root];
 
         Ok(JsonEngine {
-            vocab,
+            vocab: Arc::new(vocab),
             vocab_size,
             root_blueprint,
             stack,
@@ -305,16 +312,21 @@ impl JsonEngine {
     }
 
     /// helper function: push the appropriate value scope based on schema type
-    fn push_value_scope(stack: &mut Vec<Scope>, item_bp: &Option<Arc<PropertyBlueprint>>, byte: u8) -> bool {
+    fn push_value_scope(
+        stack: &mut Vec<Scope>,
+        item_bp: &Option<Arc<PropertyBlueprint>>,
+        byte: u8,
+    ) -> bool {
         // priority: check for enum values first
         if let Some(bp) = item_bp {
             if let Some(ref enum_vals) = bp.enum_values {
                 // filter candidates that start with this byte
-                let matching: Vec<Vec<u8>> = enum_vals.iter()
+                let matching: Vec<Vec<u8>> = enum_vals
+                    .iter()
                     .filter(|v| !v.is_empty() && v[0] == byte)
                     .cloned()
                     .collect();
-                
+
                 if !matching.is_empty() {
                     stack.push(Scope::Enum(EnumState {
                         candidates: matching,
@@ -325,12 +337,13 @@ impl JsonEngine {
                 return false; // byte doesn't match any enum candidate
             }
         }
-        
+
         // get the allowed types
-        let schema_types = item_bp.as_ref()
+        let schema_types = item_bp
+            .as_ref()
             .map(|bp| bp.schema_types.clone())
             .unwrap_or_else(|| vec![SchemaType::Any]);
-        
+
         // helper function: check if a byte matches a type
         fn byte_matches_type(byte: u8, schema_type: &SchemaType) -> bool {
             match schema_type {
@@ -341,15 +354,25 @@ impl JsonEngine {
                 SchemaType::Object => byte == b'{',
                 SchemaType::Array => byte == b'[',
                 SchemaType::Any => {
-                    byte == b'"' || byte.is_ascii_digit() || byte == b'-' ||
-                    byte == b't' || byte == b'f' || byte == b'n' ||
-                    byte == b'{' || byte == b'['
+                    byte == b'"'
+                        || byte.is_ascii_digit()
+                        || byte == b'-'
+                        || byte == b't'
+                        || byte == b'f'
+                        || byte == b'n'
+                        || byte == b'{'
+                        || byte == b'['
                 }
             }
         }
-        
+
         // helper function: push a scope for a specific type
-        fn push_scope_for_type(stack: &mut Vec<Scope>, schema_type: &SchemaType, byte: u8, item_bp: &Option<Arc<PropertyBlueprint>>) -> bool {
+        fn push_scope_for_type(
+            stack: &mut Vec<Scope>,
+            schema_type: &SchemaType,
+            byte: u8,
+            item_bp: &Option<Arc<PropertyBlueprint>>,
+        ) -> bool {
             match schema_type {
                 SchemaType::String => {
                     if byte == b'"' {
@@ -379,11 +402,17 @@ impl JsonEngine {
                 }
                 SchemaType::Boolean => {
                     if byte == b't' {
-                        stack.push(Scope::Boolean(BooleanState { target: "true", position: 1 }));
+                        stack.push(Scope::Boolean(BooleanState {
+                            target: "true",
+                            position: 1,
+                        }));
                         return true;
                     }
                     if byte == b'f' {
-                        stack.push(Scope::Boolean(BooleanState { target: "false", position: 1 }));
+                        stack.push(Scope::Boolean(BooleanState {
+                            target: "false",
+                            position: 1,
+                        }));
                         return true;
                     }
                 }
@@ -448,11 +477,17 @@ impl JsonEngine {
                         return true;
                     }
                     if byte == b't' {
-                        stack.push(Scope::Boolean(BooleanState { target: "true", position: 1 }));
+                        stack.push(Scope::Boolean(BooleanState {
+                            target: "true",
+                            position: 1,
+                        }));
                         return true;
                     }
                     if byte == b'f' {
-                        stack.push(Scope::Boolean(BooleanState { target: "false", position: 1 }));
+                        stack.push(Scope::Boolean(BooleanState {
+                            target: "false",
+                            position: 1,
+                        }));
                         return true;
                     }
                     if byte == b'n' {
@@ -484,14 +519,14 @@ impl JsonEngine {
             }
             false
         }
-        
+
         // find which types match this byte
         for schema_type in &schema_types {
             if byte_matches_type(byte, schema_type) {
                 return push_scope_for_type(stack, schema_type, byte, item_bp);
             }
         }
-        
+
         false
     }
 
@@ -505,7 +540,12 @@ impl JsonEngine {
         let mut temp_finished = self.finished;
 
         for &byte in token_bytes {
-            if !Self::validate_byte_static(&self.root_blueprint, &mut temp_stack, &mut temp_finished, byte) {
+            if !Self::validate_byte_static(
+                &self.root_blueprint,
+                &mut temp_stack,
+                &mut temp_finished,
+                byte,
+            ) {
                 return false;
             }
         }
@@ -524,9 +564,10 @@ impl JsonEngine {
 
         if !valid {
             self.dead = true;
-            return Err(ConstraintError::InvalidState(
-                format!("Invalid byte '{}' (0x{:02x}) in current state", byte as char, byte)
-            ));
+            return Err(ConstraintError::InvalidState(format!(
+                "Invalid byte '{}' (0x{:02x}) in current state",
+                byte as char, byte
+            )));
         }
         Ok(())
     }
@@ -574,7 +615,14 @@ impl JsonEngine {
                     return false;
                 }
 
-                Scope::Object { blueprint, syntax_state, key_buffer, used_keys, in_escape, missing_required_keys } => {
+                Scope::Object {
+                    blueprint,
+                    syntax_state,
+                    key_buffer,
+                    used_keys,
+                    in_escape,
+                    missing_required_keys,
+                } => {
                     match syntax_state {
                         ObjectSyntaxState::ExpectKeyOrEnd => {
                             if Self::is_whitespace(byte) {
@@ -582,7 +630,9 @@ impl JsonEngine {
                             }
                             if byte == b'"' {
                                 // only open a new key if at least one unused key exists
-                                let has_unused_key = blueprint.allowed_keys.iter()
+                                let has_unused_key = blueprint
+                                    .allowed_keys
+                                    .iter()
                                     .any(|k| !used_keys.contains(k));
                                 if has_unused_key {
                                     *syntax_state = ObjectSyntaxState::InKey;
@@ -618,7 +668,9 @@ impl JsonEngine {
                                 return true;
                             }
                             if byte == b'"' {
-                                if blueprint.is_key_allowed(key_buffer) && !used_keys.contains(key_buffer) {
+                                if blueprint.is_key_allowed(key_buffer)
+                                    && !used_keys.contains(key_buffer)
+                                {
                                     *syntax_state = ObjectSyntaxState::ExpectColon;
                                     return true;
                                 }
@@ -626,7 +678,9 @@ impl JsonEngine {
                             }
                             let test_key = format!("{}{}", key_buffer, byte as char);
                             // only accept prefix if it matches an unused key
-                            let prefix_valid = blueprint.allowed_keys.iter()
+                            let prefix_valid = blueprint
+                                .allowed_keys
+                                .iter()
                                 .any(|key| key.starts_with(&test_key) && !used_keys.contains(key));
                             if prefix_valid {
                                 key_buffer.push(byte as char);
@@ -655,16 +709,17 @@ impl JsonEngine {
                             }
 
                             let key = key_buffer.clone();
-                            
+
                             // priority: check for enum values first
                             if let Some(prop) = blueprint.get_property(&key) {
                                 if let Some(ref enum_vals) = prop.enum_values {
                                     // filter candidates that start with this byte
-                                    let matching: Vec<Vec<u8>> = enum_vals.iter()
+                                    let matching: Vec<Vec<u8>> = enum_vals
+                                        .iter()
                                         .filter(|v| !v.is_empty() && v[0] == byte)
                                         .cloned()
                                         .collect();
-                                    
+
                                     if !matching.is_empty() {
                                         *syntax_state = ObjectSyntaxState::ExpectCommaOrEnd;
                                         stack.push(Scope::Enum(EnumState {
@@ -676,47 +731,53 @@ impl JsonEngine {
                                     return false; // byte doesn't match any enum candidate
                                 }
                             }
-                            
+
                             // get allowed types for this property
-                            let schema_types = blueprint.get_property(&key)
+                            let schema_types = blueprint
+                                .get_property(&key)
                                 .map(|p| p.schema_types.clone())
                                 .unwrap_or_else(|| vec![SchemaType::Any]);
-                            
+
                             // helper to check if byte matches a type
                             fn matches_type(byte: u8, t: &SchemaType) -> bool {
                                 match t {
                                     SchemaType::String => byte == b'"',
-                                    SchemaType::Number | SchemaType::Integer => byte.is_ascii_digit() || byte == b'-',
+                                    SchemaType::Number | SchemaType::Integer => {
+                                        byte.is_ascii_digit() || byte == b'-'
+                                    }
                                     SchemaType::Boolean => byte == b't' || byte == b'f',
                                     SchemaType::Null => byte == b'n',
                                     SchemaType::Object => byte == b'{',
                                     SchemaType::Array => byte == b'[',
-                                    SchemaType::Any => matches_type(byte, &SchemaType::String)
-                                        || matches_type(byte, &SchemaType::Number)
-                                        || matches_type(byte, &SchemaType::Boolean)
-                                        || matches_type(byte, &SchemaType::Null)
-                                        || matches_type(byte, &SchemaType::Object)
-                                        || matches_type(byte, &SchemaType::Array),
+                                    SchemaType::Any => {
+                                        matches_type(byte, &SchemaType::String)
+                                            || matches_type(byte, &SchemaType::Number)
+                                            || matches_type(byte, &SchemaType::Boolean)
+                                            || matches_type(byte, &SchemaType::Null)
+                                            || matches_type(byte, &SchemaType::Object)
+                                            || matches_type(byte, &SchemaType::Array)
+                                    }
                                 }
                             }
-                            
+
                             // Find which allowed type matches the byte
                             let matched_type = schema_types.iter().find(|t| matches_type(byte, t));
-                            
+
                             if let Some(prop_type) = matched_type {
                                 *syntax_state = ObjectSyntaxState::ExpectCommaOrEnd;
                                 match prop_type {
                                     SchemaType::String => {
                                         // get pattern and length constraints
-                                        let string_state = if let Some(prop) = blueprint.get_property(&key) {
-                                            StringState::with_pattern_and_constraints(
-                                                prop.pattern.as_deref(),
-                                                prop.min_length,
-                                                prop.max_length,
-                                            )
-                                        } else {
-                                            StringState::new_started()
-                                        };
+                                        let string_state =
+                                            if let Some(prop) = blueprint.get_property(&key) {
+                                                StringState::with_pattern_and_constraints(
+                                                    prop.pattern.as_deref(),
+                                                    prop.min_length,
+                                                    prop.max_length,
+                                                )
+                                            } else {
+                                                StringState::new_started()
+                                            };
                                         stack.push(Scope::String(string_state));
                                         return true;
                                     }
@@ -730,9 +791,15 @@ impl JsonEngine {
                                     }
                                     SchemaType::Boolean => {
                                         if byte == b't' {
-                                            stack.push(Scope::Boolean(BooleanState { target: "true", position: 1 }));
+                                            stack.push(Scope::Boolean(BooleanState {
+                                                target: "true",
+                                                position: 1,
+                                            }));
                                         } else {
-                                            stack.push(Scope::Boolean(BooleanState { target: "false", position: 1 }));
+                                            stack.push(Scope::Boolean(BooleanState {
+                                                target: "false",
+                                                position: 1,
+                                            }));
                                         }
                                         return true;
                                     }
@@ -742,7 +809,9 @@ impl JsonEngine {
                                     }
                                     SchemaType::Object => {
                                         if let Some(prop) = blueprint.get_property(&key) {
-                                            let (nested_blueprint, missing_req) = if let Some(obp) = &prop.object_blueprint {
+                                            let (nested_blueprint, missing_req) = if let Some(obp) =
+                                                &prop.object_blueprint
+                                            {
                                                 (Arc::clone(obp), obp.required.clone())
                                             } else {
                                                 let empty = Arc::new(SchemaBlueprint {
@@ -769,7 +838,9 @@ impl JsonEngine {
                                         let items = prop.as_ref().and_then(|p| p.items.clone());
                                         let min_items = prop.as_ref().and_then(|p| p.min_items);
                                         let max_items = prop.as_ref().and_then(|p| p.max_items);
-                                        let mut arr_state = ArrayState::with_constraints(items, min_items, max_items);
+                                        let mut arr_state = ArrayState::with_constraints(
+                                            items, min_items, max_items,
+                                        );
                                         arr_state.syntax_state = ArraySyntaxState::ExpectValueOrEnd;
                                         stack.push(Scope::Array(arr_state));
                                         return true;
@@ -789,7 +860,9 @@ impl JsonEngine {
                             }
                             if byte == b',' {
                                 // only accept comma if there are unused keys to follow
-                                let has_unused_key = blueprint.allowed_keys.iter()
+                                let has_unused_key = blueprint
+                                    .allowed_keys
+                                    .iter()
                                     .any(|k| !used_keys.contains(k));
                                 if has_unused_key {
                                     *syntax_state = ObjectSyntaxState::ExpectKeyOrEnd;
@@ -819,7 +892,9 @@ impl JsonEngine {
                     if state.in_escape {
                         state.in_escape = false;
                         // feed escaped byte to dfa
-                        if let (Some(dfa), Some(dfa_state)) = (&state.pattern_dfa, &mut state.dfa_state) {
+                        if let (Some(dfa), Some(dfa_state)) =
+                            (&state.pattern_dfa, &mut state.dfa_state)
+                        {
                             let new_state = dfa.next_state(*dfa_state, byte);
                             if dfa.is_dead_state(new_state) {
                                 return false;
@@ -842,7 +917,8 @@ impl JsonEngine {
                             }
                         }
                         // check dfa match state
-                        if let (Some(dfa), Some(dfa_state)) = (&state.pattern_dfa, state.dfa_state) {
+                        if let (Some(dfa), Some(dfa_state)) = (&state.pattern_dfa, state.dfa_state)
+                        {
                             let eoi_state = dfa.next_eoi_state(dfa_state);
                             if !dfa.is_match_state(eoi_state) {
                                 return false;
@@ -859,7 +935,8 @@ impl JsonEngine {
                         }
                     }
                     // validate against dfa
-                    if let (Some(dfa), Some(dfa_state)) = (&state.pattern_dfa, &mut state.dfa_state) {
+                    if let (Some(dfa), Some(dfa_state)) = (&state.pattern_dfa, &mut state.dfa_state)
+                    {
                         let new_state = dfa.next_state(*dfa_state, byte);
                         if dfa.is_dead_state(new_state) {
                             return false;
@@ -889,7 +966,11 @@ impl JsonEngine {
                         state.expect_digit = false;
                         return true;
                     }
-                    if byte == b'.' && !state.has_decimal && !state.has_exponent && !state.is_integer {
+                    if byte == b'.'
+                        && !state.has_decimal
+                        && !state.has_exponent
+                        && !state.is_integer
+                    {
                         state.buffer.push('.');
                         state.has_decimal = true;
                         state.expect_digit = true;
@@ -901,7 +982,9 @@ impl JsonEngine {
                         state.expect_digit = true;
                         return true;
                     }
-                    if (byte == b'+' || byte == b'-') && state.buffer.ends_with(|c| c == 'e' || c == 'E') {
+                    if (byte == b'+' || byte == b'-')
+                        && state.buffer.ends_with(|c| c == 'e' || c == 'E')
+                    {
                         state.buffer.push(byte as char);
                         state.expect_digit = true;
                         return true;
@@ -1018,14 +1101,15 @@ impl JsonEngine {
                 Scope::Enum(state) => {
                     // check if any candidate expects this byte at current cursor
                     let cursor = state.cursor;
-                    
+
                     // check if we have a complete match at current cursor
                     // if so, pop on delimiters
                     let has_complete = state.candidates.iter().any(|c| c.len() == cursor);
-                    
+
                     if has_complete {
                         // allow delimiters that would end this value
-                        if byte == b',' || byte == b'}' || byte == b']' || Self::is_whitespace(byte) {
+                        if byte == b',' || byte == b'}' || byte == b']' || Self::is_whitespace(byte)
+                        {
                             // pop the enum scope
                             stack.pop();
                             // update parent state like we do for other primitives
@@ -1041,7 +1125,11 @@ impl JsonEngine {
                             // now reprocess this byte with the current (parent) scope
                             if let Some(parent) = stack.last_mut() {
                                 match parent {
-                                    Scope::Object { syntax_state, missing_required_keys, .. } => {
+                                    Scope::Object {
+                                        syntax_state,
+                                        missing_required_keys,
+                                        ..
+                                    } => {
                                         if *syntax_state == ObjectSyntaxState::ExpectCommaOrEnd {
                                             if byte == b',' {
                                                 *syntax_state = ObjectSyntaxState::ExpectKeyOrEnd;
@@ -1062,9 +1150,12 @@ impl JsonEngine {
                                         }
                                     }
                                     Scope::Array(arr_state) => {
-                                        if arr_state.syntax_state == ArraySyntaxState::ExpectCommaOrEnd {
+                                        if arr_state.syntax_state
+                                            == ArraySyntaxState::ExpectCommaOrEnd
+                                        {
                                             if byte == b',' {
-                                                arr_state.syntax_state = ArraySyntaxState::ExpectValueOrEnd;
+                                                arr_state.syntax_state =
+                                                    ArraySyntaxState::ExpectValueOrEnd;
                                                 return true;
                                             }
                                             if byte == b']' {
@@ -1088,21 +1179,23 @@ impl JsonEngine {
                             return false;
                         }
                     }
-                    
+
                     // check if byte matches any remaining candidate at current cursor
-                    let new_candidates: Vec<Vec<u8>> = state.candidates.iter()
+                    let new_candidates: Vec<Vec<u8>> = state
+                        .candidates
+                        .iter()
                         .filter(|c| c.len() > cursor && c[cursor] == byte)
                         .cloned()
                         .collect();
-                    
+
                     if new_candidates.is_empty() {
                         return false;
                     }
-                    
+
                     // advance cursor and update candidates
                     state.cursor += 1;
                     state.candidates = new_candidates;
-                    
+
                     // check if we just completed a match
                     let new_cursor = state.cursor;
                     if state.candidates.iter().any(|c| c.len() == new_cursor) {
@@ -1112,7 +1205,7 @@ impl JsonEngine {
                             *finished = true;
                         }
                     }
-                    
+
                     return true;
                 }
             }
@@ -1146,7 +1239,9 @@ impl ConstraintEngine for JsonEngine {
     }
 
     fn advance(&mut self, token_id: usize) -> Result<(), ConstraintError> {
-        let bytes = self.vocab.get(&token_id)
+        let bytes = self
+            .vocab
+            .get(&token_id)
             .ok_or_else(|| ConstraintError::InvalidTokenId {
                 token_id,
                 vocab_size: self.vocab_size,
@@ -1174,7 +1269,7 @@ impl ConstraintEngine for JsonEngine {
 
     fn clone_box(&self) -> Box<dyn ConstraintEngine> {
         Box::new(JsonEngine {
-            vocab: self.vocab.clone(),
+            vocab: Arc::clone(&self.vocab),
             vocab_size: self.vocab_size,
             root_blueprint: Arc::clone(&self.root_blueprint),
             stack: self.stack.clone(),
@@ -1190,28 +1285,28 @@ mod tests {
 
     fn make_typed_vocab() -> Vec<Vec<u8>> {
         vec![
-            b"{".to_vec(), // 0
-            b"}".to_vec(), // 1
-            b"\"".to_vec(), // 2
-            b":".to_vec(), // 3
-            b",".to_vec(), // 4
-            b" ".to_vec(), // 5
-            b"\"name\"".to_vec(), // 6 - valid key (string type)
-            b"\"age\"".to_vec(), // 7 - valid key (number type)
+            b"{".to_vec(),            // 0
+            b"}".to_vec(),            // 1
+            b"\"".to_vec(),           // 2
+            b":".to_vec(),            // 3
+            b",".to_vec(),            // 4
+            b" ".to_vec(),            // 5
+            b"\"name\"".to_vec(),     // 6 - valid key (string type)
+            b"\"age\"".to_vec(),      // 7 - valid key (number type)
             b"\"is_admin\"".to_vec(), // 8 - valid key (boolean type)
-            b"\"John\"".to_vec(), // 9 - string value
-            b"25".to_vec(), // 10 - number value
-            b"true".to_vec(), // 11 - boolean value
-            b"false".to_vec(), // 12 - boolean value
-            b"null".to_vec(), // 13 - null value
-            b"t".to_vec(), // 14 - prefix of true
-            b"f".to_vec(), // 15 - prefix of false
-            b"n".to_vec(), // 16 - prefix of null/name
-            b"1".to_vec(), // 17 - single digit
-            b"0".to_vec(), // 18 - zero
-            b"-".to_vec(), // 19 - minus
-            b".".to_vec(), // 20 - decimal point
-            b"123".to_vec(), // 21 - multi-digit number
+            b"\"John\"".to_vec(),     // 9 - string value
+            b"25".to_vec(),           // 10 - number value
+            b"true".to_vec(),         // 11 - boolean value
+            b"false".to_vec(),        // 12 - boolean value
+            b"null".to_vec(),         // 13 - null value
+            b"t".to_vec(),            // 14 - prefix of true
+            b"f".to_vec(),            // 15 - prefix of false
+            b"n".to_vec(),            // 16 - prefix of null/name
+            b"1".to_vec(),            // 17 - single digit
+            b"0".to_vec(),            // 18 - zero
+            b"-".to_vec(),            // 19 - minus
+            b".".to_vec(),            // 20 - decimal point
+            b"123".to_vec(),          // 21 - multi-digit number
         ]
     }
 
@@ -1224,14 +1319,14 @@ mod tests {
         let vocab = make_typed_vocab();
         let mut engine = JsonEngine::new(vocab, typed_schema()).unwrap();
 
-        engine.advance(0).unwrap();  // '{'
-        engine.advance(6).unwrap();  // '"name"'
-        engine.advance(3).unwrap();  // ':'
+        engine.advance(0).unwrap(); // '{'
+        engine.advance(6).unwrap(); // '"name"'
+        engine.advance(3).unwrap(); // ':'
 
         let valid = engine.get_valid_tokens();
-        
+
         // for string type, must have quotes
-        assert!(valid.contains(&2));  // '"' is valid
+        assert!(valid.contains(&2)); // '"' is valid
         assert!(!valid.contains(&10)); // '25' (unquoted number) is NOT valid
         assert!(!valid.contains(&11)); // 'true' is NOT valid
     }
@@ -1246,7 +1341,7 @@ mod tests {
         engine.advance(3).unwrap(); // ':'
 
         let valid = engine.get_valid_tokens();
-        
+
         // for number type, must NOT have quotes
         assert!(!valid.contains(&2)); // '"' is NOT valid
         assert!(valid.contains(&17)); // '1' is valid
@@ -1260,12 +1355,12 @@ mod tests {
         let vocab = make_typed_vocab();
         let mut engine = JsonEngine::new(vocab, typed_schema()).unwrap();
 
-        engine.advance(0).unwrap();  // '{'
-        engine.advance(8).unwrap();  // '"is_admin"'
-        engine.advance(3).unwrap();  // ':'
+        engine.advance(0).unwrap(); // '{'
+        engine.advance(8).unwrap(); // '"is_admin"'
+        engine.advance(3).unwrap(); // ':'
 
         let valid = engine.get_valid_tokens();
-        
+
         // for boolean type, only true/false
         assert!(valid.contains(&11)); // 'true' is valid
         assert!(valid.contains(&12)); // 'false' is valid
@@ -1331,7 +1426,7 @@ mod tests {
         engine.advance(0).unwrap(); // '{'
         engine.advance(7).unwrap(); // '"age"'
         engine.advance(3).unwrap(); // ':'
-        
+
         // try to use a string for a number field - should fail
         let result = engine.advance(2); // trying to start a string for number field
         assert!(result.is_err());
@@ -1340,13 +1435,13 @@ mod tests {
     #[test]
     fn test_array_of_strings() {
         let vocab = vec![
-            b"{".to_vec(), // 0
-            b"}".to_vec(), // 1
-            b"[".to_vec(), // 2
-            b"]".to_vec(), // 3
+            b"{".to_vec(),        // 0
+            b"}".to_vec(),        // 1
+            b"[".to_vec(),        // 2
+            b"]".to_vec(),        // 3
             b"\"tags\"".to_vec(), // 4
-            b":".to_vec(), // 5
-            b",".to_vec(), // 6
+            b":".to_vec(),        // 5
+            b",".to_vec(),        // 6
             b"\"tag1\"".to_vec(), // 7
             b"\"tag2\"".to_vec(), // 8
         ];
@@ -1370,12 +1465,12 @@ mod tests {
     #[test]
     fn test_empty_array() {
         let vocab = vec![
-            b"{".to_vec(), // 0
-            b"}".to_vec(), // 1
-            b"[".to_vec(), // 2
-            b"]".to_vec(), // 3
+            b"{".to_vec(),        // 0
+            b"}".to_vec(),        // 1
+            b"[".to_vec(),        // 2
+            b"]".to_vec(),        // 3
             b"\"tags\"".to_vec(), // 4
-            b":".to_vec(), // 5
+            b":".to_vec(),        // 5
         ];
         let schema = r#"{"type": "object", "properties": {"tags": {"type": "array", "items": {"type": "string"}}}}"#;
         let mut engine = JsonEngine::new(vocab, schema).unwrap();
@@ -1394,13 +1489,13 @@ mod tests {
     #[test]
     fn test_array_rejects_wrong_item_type() {
         let vocab = vec![
-            b"{".to_vec(), // 0
-            b"}".to_vec(), // 1
-            b"[".to_vec(), // 2
-            b"]".to_vec(), // 3
+            b"{".to_vec(),        // 0
+            b"}".to_vec(),        // 1
+            b"[".to_vec(),        // 2
+            b"]".to_vec(),        // 3
             b"\"tags\"".to_vec(), // 4
-            b":".to_vec(), // 5
-            b"123".to_vec(), // 6 - number, should fail
+            b":".to_vec(),        // 5
+            b"123".to_vec(),      // 6 - number, should fail
         ];
         let schema = r#"{"type": "object", "properties": {"tags": {"type": "array", "items": {"type": "string"}}}}"#;
         let mut engine = JsonEngine::new(vocab, schema).unwrap();
@@ -1409,7 +1504,7 @@ mod tests {
         engine.advance(4).unwrap(); // '"tags"'
         engine.advance(5).unwrap(); // ':'
         engine.advance(2).unwrap(); // '['
-        
+
         // try to add a number to a string array - should fail
         let result = engine.advance(6);
         assert!(result.is_err());
@@ -1418,19 +1513,19 @@ mod tests {
     #[test]
     fn test_required_field_rejects_empty_object() {
         let vocab = vec![
-            b"{".to_vec(), // 0
-            b"}".to_vec(), // 1
+            b"{".to_vec(),     // 0
+            b"}".to_vec(),     // 1
             b"\"a\"".to_vec(), // 2
             b"\"b\"".to_vec(), // 3
-            b":".to_vec(), // 4
-            b"1".to_vec(), // 5
-            b",".to_vec(), // 6
+            b":".to_vec(),     // 4
+            b"1".to_vec(),     // 5
+            b",".to_vec(),     // 6
         ];
         let schema = r#"{"type": "object", "properties": {"a": {"type": "number"}, "b": {"type": "number"}}, "required": ["a"]}"#;
         let mut engine = JsonEngine::new(vocab, schema).unwrap();
 
         engine.advance(0).unwrap(); // '{'
-        
+
         // try to close empty object - should fail because "a" is required
         let result = engine.advance(1); // '}'
         assert!(result.is_err());
@@ -1439,13 +1534,13 @@ mod tests {
     #[test]
     fn test_required_field_rejects_missing_key() {
         let vocab = vec![
-            b"{".to_vec(), // 0
-            b"}".to_vec(), // 1
+            b"{".to_vec(),     // 0
+            b"}".to_vec(),     // 1
             b"\"a\"".to_vec(), // 2
             b"\"b\"".to_vec(), // 3
-            b":".to_vec(), // 4
-            b"1".to_vec(), // 5
-            b",".to_vec(), // 6
+            b":".to_vec(),     // 4
+            b"1".to_vec(),     // 5
+            b",".to_vec(),     // 6
         ];
         let schema = r#"{"type": "object", "properties": {"a": {"type": "number"}, "b": {"type": "number"}}, "required": ["a"]}"#;
         let mut engine = JsonEngine::new(vocab, schema).unwrap();
@@ -1455,7 +1550,7 @@ mod tests {
         engine.advance(3).unwrap(); // '"b"'
         engine.advance(4).unwrap(); // ':'
         engine.advance(5).unwrap(); // '1'
-        
+
         // try to close - should fail because "a" is required
         let result = engine.advance(1); // '}'
         assert!(result.is_err());
@@ -1464,13 +1559,13 @@ mod tests {
     #[test]
     fn test_required_field_accepts_complete_object() {
         let vocab = vec![
-            b"{".to_vec(), // 0
-            b"}".to_vec(), // 1
+            b"{".to_vec(),     // 0
+            b"}".to_vec(),     // 1
             b"\"a\"".to_vec(), // 2
             b"\"b\"".to_vec(), // 3
-            b":".to_vec(), // 4
-            b"1".to_vec(), // 5
-            b",".to_vec(), // 6
+            b":".to_vec(),     // 4
+            b"1".to_vec(),     // 5
+            b",".to_vec(),     // 6
         ];
         let schema = r#"{"type": "object", "properties": {"a": {"type": "number"}, "b": {"type": "number"}}, "required": ["a"]}"#;
         let mut engine = JsonEngine::new(vocab, schema).unwrap();
@@ -1492,11 +1587,11 @@ mod tests {
     #[test]
     fn test_required_field_accepts_only_required() {
         let vocab = vec![
-            b"{".to_vec(), // 0
-            b"}".to_vec(), // 1
+            b"{".to_vec(),     // 0
+            b"}".to_vec(),     // 1
             b"\"a\"".to_vec(), // 2
-            b":".to_vec(), // 3
-            b"1".to_vec(), // 4
+            b":".to_vec(),     // 3
+            b"1".to_vec(),     // 4
         ];
         let schema = r#"{"type": "object", "properties": {"a": {"type": "number"}, "b": {"type": "number"}}, "required": ["a"]}"#;
         let mut engine = JsonEngine::new(vocab, schema).unwrap();
@@ -1515,12 +1610,12 @@ mod tests {
     fn test_enum_accepts_valid_value() {
         // enum values are serialized as JSON, so "red" becomes b'"red"'
         let vocab = vec![
-            b"{".to_vec(), // 0
-            b"}".to_vec(), // 1
+            b"{".to_vec(),         // 0
+            b"}".to_vec(),         // 1
             b"\"color\"".to_vec(), // 2
-            b":".to_vec(), // 3
-            b"\"red\"".to_vec(), // 4
-            b"\"blue\"".to_vec(), // 5
+            b":".to_vec(),         // 3
+            b"\"red\"".to_vec(),   // 4
+            b"\"blue\"".to_vec(),  // 5
             b"\"green\"".to_vec(), // 6
         ];
         let schema = r#"{"type": "object", "properties": {"color": {"enum": ["red", "blue"]}}}"#;
@@ -1539,12 +1634,12 @@ mod tests {
     #[test]
     fn test_enum_accepts_second_value() {
         let vocab = vec![
-            b"{".to_vec(), // 0
-            b"}".to_vec(), // 1
+            b"{".to_vec(),         // 0
+            b"}".to_vec(),         // 1
             b"\"color\"".to_vec(), // 2
-            b":".to_vec(), // 3
-            b"\"red\"".to_vec(), // 4
-            b"\"blue\"".to_vec(), // 5
+            b":".to_vec(),         // 3
+            b"\"red\"".to_vec(),   // 4
+            b"\"blue\"".to_vec(),  // 5
         ];
         let schema = r#"{"type": "object", "properties": {"color": {"enum": ["red", "blue"]}}}"#;
         let mut engine = JsonEngine::new(vocab, schema).unwrap();
@@ -1562,12 +1657,12 @@ mod tests {
     #[test]
     fn test_enum_rejects_invalid_value() {
         let vocab = vec![
-            b"{".to_vec(), // 0
-            b"}".to_vec(), // 1
+            b"{".to_vec(),         // 0
+            b"}".to_vec(),         // 1
             b"\"color\"".to_vec(), // 2
-            b":".to_vec(), // 3
-            b"\"red\"".to_vec(), // 4
-            b"\"blue\"".to_vec(), // 5
+            b":".to_vec(),         // 3
+            b"\"red\"".to_vec(),   // 4
+            b"\"blue\"".to_vec(),  // 5
             b"\"green\"".to_vec(), // 6 - not in enum
         ];
         let schema = r#"{"type": "object", "properties": {"color": {"enum": ["red", "blue"]}}}"#;
@@ -1576,7 +1671,7 @@ mod tests {
         engine.advance(0).unwrap(); // '{'
         engine.advance(2).unwrap(); // '"color"'
         engine.advance(3).unwrap(); // ':'
-        
+
         // try to use "green" - not in enum, should fail
         let result = engine.advance(6);
         assert!(result.is_err());
@@ -1586,14 +1681,15 @@ mod tests {
     fn test_union_type_accepts_string() {
         // union type: ["string", "null"]
         let vocab = vec![
-            b"{".to_vec(), // 0
-            b"}".to_vec(), // 1
+            b"{".to_vec(),               // 0
+            b"}".to_vec(),               // 1
             b"\"description\"".to_vec(), // 2
-            b":".to_vec(), // 3
-            b"\"text\"".to_vec(), // 4 - string value
-            b"null".to_vec(), // 5 - null value
+            b":".to_vec(),               // 3
+            b"\"text\"".to_vec(),        // 4 - string value
+            b"null".to_vec(),            // 5 - null value
         ];
-        let schema = r#"{"type": "object", "properties": {"description": {"type": ["string", "null"]}}}"#;
+        let schema =
+            r#"{"type": "object", "properties": {"description": {"type": ["string", "null"]}}}"#;
         let mut engine = JsonEngine::new(vocab, schema).unwrap();
 
         // {"description":"text"} - string value should succeed
@@ -1610,14 +1706,15 @@ mod tests {
     fn test_union_type_accepts_null() {
         // union type: ["string", "null"]
         let vocab = vec![
-            b"{".to_vec(), // 0
-            b"}".to_vec(), // 1
+            b"{".to_vec(),               // 0
+            b"}".to_vec(),               // 1
             b"\"description\"".to_vec(), // 2
-            b":".to_vec(), // 3
-            b"\"text\"".to_vec(), // 4 - string value
-            b"null".to_vec(), // 5 - null value
+            b":".to_vec(),               // 3
+            b"\"text\"".to_vec(),        // 4 - string value
+            b"null".to_vec(),            // 5 - null value
         ];
-        let schema = r#"{"type": "object", "properties": {"description": {"type": ["string", "null"]}}}"#;
+        let schema =
+            r#"{"type": "object", "properties": {"description": {"type": ["string", "null"]}}}"#;
         let mut engine = JsonEngine::new(vocab, schema).unwrap();
 
         // {"description":null} - null value should succeed
@@ -1633,12 +1730,12 @@ mod tests {
     #[test]
     fn test_integer_blocks_decimal_point() {
         let vocab = vec![
-            b"{".to_vec(), // 0
-            b"}".to_vec(), // 1
+            b"{".to_vec(),      // 0
+            b"}".to_vec(),      // 1
             b"\"id\"".to_vec(), // 2
-            b":".to_vec(), // 3
-            b"10".to_vec(), // 4
-            b".".to_vec(), // 5 - decimal point
+            b":".to_vec(),      // 3
+            b"10".to_vec(),     // 4
+            b".".to_vec(),      // 5 - decimal point
         ];
         let schema = r#"{"type": "object", "properties": {"id": {"type": "integer"}}}"#;
         let mut engine = JsonEngine::new(vocab, schema).unwrap();
@@ -1647,7 +1744,7 @@ mod tests {
         engine.advance(2).unwrap(); // '"id"'
         engine.advance(3).unwrap(); // ':'
         engine.advance(4).unwrap(); // '10'
-        
+
         // decimal point should not be valid for integer
         let valid = engine.get_valid_tokens();
         assert!(!valid.contains(&5)); // '.' should NOT be valid
@@ -1656,13 +1753,13 @@ mod tests {
     #[test]
     fn test_number_allows_decimal_point() {
         let vocab = vec![
-            b"{".to_vec(), // 0
-            b"}".to_vec(), // 1
+            b"{".to_vec(),         // 0
+            b"}".to_vec(),         // 1
             b"\"score\"".to_vec(), // 2
-            b":".to_vec(), // 3
-            b"10".to_vec(), // 4
-            b".".to_vec(), // 5 - decimal point
-            b"5".to_vec(), // 6
+            b":".to_vec(),         // 3
+            b"10".to_vec(),        // 4
+            b".".to_vec(),         // 5 - decimal point
+            b"5".to_vec(),         // 6
         ];
         let schema = r#"{"type": "object", "properties": {"score": {"type": "number"}}}"#;
         let mut engine = JsonEngine::new(vocab, schema).unwrap();

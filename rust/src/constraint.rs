@@ -21,8 +21,15 @@ pub enum ConstraintError {
 impl fmt::Display for ConstraintError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            ConstraintError::InvalidTokenId { token_id, vocab_size } => {
-                write!(f, "Token ID {} out of range (vocab size: {})", token_id, vocab_size)
+            ConstraintError::InvalidTokenId {
+                token_id,
+                vocab_size,
+            } => {
+                write!(
+                    f,
+                    "Token ID {} out of range (vocab size: {})",
+                    token_id, vocab_size
+                )
             }
             ConstraintError::InvalidState(msg) => write!(f, "Invalid state: {}", msg),
             ConstraintError::CompilationError(msg) => write!(f, "Compilation error: {}", msg),

@@ -1,22 +1,22 @@
 //! onyx rust backend
-//! 
+//!
 //! high-performance grammar constraint engine for structured LLM outputs
 //! this module provides the core grammar processing logic that integrates
 //! with the python MLX frontend
 
-use pyo3::prelude::*;
 use pyo3::exceptions::PyValueError;
+use pyo3::prelude::*;
 use regex::Regex;
 
 mod constraint;
-mod regex_engine;
-mod json_engine;
-mod schema;
 mod grammar;
+mod json_engine;
+mod regex_engine;
+mod schema;
 use grammar::GrammarConstraint;
 
 /// a compiled regex validator exposed to Python
-/// 
+///
 /// this struct pre-compiles a regex pattern for efficient repeated validation
 /// it demonstrates the FFI bridge between Python and Rust and will be used
 /// to benchmark the function call overhead
@@ -30,7 +30,7 @@ pub struct RegexValidator {
 #[pymethods]
 impl RegexValidator {
     /// create a new RegexValidator with the given pattern
-    /// 
+    ///
     /// returns a new RegexValidator instance
     /// raises ValueError if the pattern is invalid
 
@@ -38,25 +38,25 @@ impl RegexValidator {
     fn new(pattern: &str) -> PyResult<Self> {
         let compiled = Regex::new(pattern)
             .map_err(|e| PyValueError::new_err(format!("Invalid regex pattern: {}", e)))?;
-        
+
         Ok(RegexValidator {
             pattern: compiled,
             pattern_str: pattern.to_string(),
         })
     }
-    
+
     /// validate that the input text matches the compiled pattern
-    /// 
+    ///
     /// returns true if the text matches the pattern, false otherwise
 
     fn validate(&self, text: &str) -> bool {
         self.pattern.is_match(text)
     }
-    
+
     fn pattern(&self) -> &str {
         &self.pattern_str
     }
-    
+
     fn __repr__(&self) -> String {
         format!("RegexValidator(pattern='{}')", self.pattern_str)
     }
@@ -80,10 +80,10 @@ fn version() -> PyResult<String> {
 fn validate_grammar(input: &str, grammar_type: &str) -> PyResult<bool> {
     match grammar_type {
         "json" => Ok(input.starts_with('{') || input.starts_with('[')),
-        "sql" => Ok(input.to_uppercase().starts_with("SELECT") 
-                   || input.to_uppercase().starts_with("INSERT")
-                   || input.to_uppercase().starts_with("UPDATE")
-                   || input.to_uppercase().starts_with("DELETE")),
+        "sql" => Ok(input.to_uppercase().starts_with("SELECT")
+            || input.to_uppercase().starts_with("INSERT")
+            || input.to_uppercase().starts_with("UPDATE")
+            || input.to_uppercase().starts_with("DELETE")),
         _ => Ok(true),
     }
 }
@@ -106,10 +106,10 @@ fn _rust(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(version, m)?)?;
     m.add_function(wrap_pyfunction!(validate_grammar, m)?)?;
     m.add_function(wrap_pyfunction!(validate_regex_oneshot, m)?)?;
-    
+
     // Add classes
     m.add_class::<RegexValidator>()?;
     m.add_class::<GrammarConstraint>()?;
-    
+
     Ok(())
 }

@@ -129,7 +129,9 @@ class AdaptiveSpeculativeEngine(SpeculativeEngine):
 
         grammar_complete = False
         if grammar_constraint is not None:
+            previous_state = grammar_state
             grammar_state = grammar_constraint.advance_state(grammar_state, token_id)
+            grammar_constraint.release_state(previous_state)
             if grammar_constraint.is_match_state(grammar_state):
                 grammar_complete = True
 
@@ -146,10 +148,8 @@ class AdaptiveSpeculativeEngine(SpeculativeEngine):
                 draft_tokens = []
                 current_token = token_id
                 draft_grammar_state = grammar_state
+                draft_temp_states = []
                 mask_count_before_iteration = len(mask_times)
-
-                if grammar_constraint is not None:
-                    grammar_constraint.save_snapshot()
 
                 draft_start = time.perf_counter()
                 draft_input = mx.array([[current_token]])
@@ -178,6 +178,7 @@ class AdaptiveSpeculativeEngine(SpeculativeEngine):
                         draft_grammar_state = grammar_constraint.advance_state(
                             draft_grammar_state, draft_token
                         )
+                        draft_temp_states.append(draft_grammar_state)
                         if grammar_constraint.is_match_state(draft_grammar_state):
                             break
 
@@ -215,9 +216,7 @@ class AdaptiveSpeculativeEngine(SpeculativeEngine):
 
                 accepted_count = 0
                 verify_grammar_state = grammar_state
-
-                if grammar_constraint is not None:
-                    grammar_constraint.restore_snapshot()
+                verify_temp_states = []
 
                 for i, draft_token in enumerate(draft_tokens):
                     target_pos_logits = target_logits[:, i : i + 1, :].squeeze(1)
@@ -242,6 +241,7 @@ class AdaptiveSpeculativeEngine(SpeculativeEngine):
                             verify_grammar_state = grammar_constraint.advance_state(
                                 verify_grammar_state, draft_token
                             )
+                            verify_temp_states.append(verify_grammar_state)
                             if grammar_constraint.is_match_state(verify_grammar_state):
                                 grammar_complete = True
                                 break
@@ -255,6 +255,7 @@ class AdaptiveSpeculativeEngine(SpeculativeEngine):
                             verify_grammar_state = grammar_constraint.advance_state(
                                 verify_grammar_state, target_pred
                             )
+                            verify_temp_states.append(verify_grammar_state)
                             if grammar_constraint.is_match_state(verify_grammar_state):
                                 grammar_complete = True
                         break
@@ -262,7 +263,13 @@ class AdaptiveSpeculativeEngine(SpeculativeEngine):
                 metrics["draft_tokens_accepted"] += accepted_count
 
                 if grammar_constraint is not None:
+                    release_states = list(draft_temp_states)
+                    release_states.extend(s for s in verify_temp_states if s != verify_grammar_state)
+                    if grammar_state != verify_grammar_state:
+                        release_states.append(grammar_state)
                     grammar_state = verify_grammar_state
+                    if release_states:
+                        grammar_constraint.release_states(release_states)
 
                 tokens_added = min(accepted_count + 1, len(draft_tokens))
                 if generated_tokens and generated_tokens[-1] in stop_tokens:

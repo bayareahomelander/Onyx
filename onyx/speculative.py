@@ -380,7 +380,9 @@ class SpeculativeEngine:
         
         grammar_complete = False
         if grammar_constraint is not None:
+            previous_state = grammar_state
             grammar_state = grammar_constraint.advance_state(grammar_state, token_id)
+            grammar_constraint.release_state(previous_state)
             if grammar_constraint.is_match_state(grammar_state):
                 grammar_complete = True
         
@@ -397,12 +399,7 @@ class SpeculativeEngine:
                 current_token = token_id
                 
                 draft_grammar_state = grammar_state
-                
-                # checkpoint grammar state before draft speculation
-                # the engine uses internal state, so we must save before
-                # drafting and restore before verification
-                if grammar_constraint is not None:
-                    grammar_constraint.save_snapshot()
+                draft_temp_states = []
                 
                 draft_input = mx.array([[current_token]])
                 draft_logits = self.draft_model(draft_input, cache=self.draft_cache)
@@ -430,6 +427,7 @@ class SpeculativeEngine:
                         draft_grammar_state = grammar_constraint.advance_state(
                             draft_grammar_state, draft_token
                         )
+                        draft_temp_states.append(draft_grammar_state)
                         if grammar_constraint.is_match_state(draft_grammar_state):
                             break
                     
@@ -453,11 +451,7 @@ class SpeculativeEngine:
                 
                 accepted_count = 0
                 verify_grammar_state = grammar_state
-                
-                # restore grammar state to pre-draft checkpoint
-                # so verification masks are computed from the correct state
-                if grammar_constraint is not None:
-                    grammar_constraint.restore_snapshot()
+                verify_temp_states = []
                 
                 for i, draft_token in enumerate(draft_tokens):
                     target_pos_logits = target_logits[:, i:i+1, :].squeeze(1)
@@ -482,6 +476,7 @@ class SpeculativeEngine:
                             verify_grammar_state = grammar_constraint.advance_state(
                                 verify_grammar_state, draft_token
                             )
+                            verify_temp_states.append(verify_grammar_state)
                             if grammar_constraint.is_match_state(verify_grammar_state):
                                 grammar_complete = True
                                 break
@@ -495,6 +490,7 @@ class SpeculativeEngine:
                             verify_grammar_state = grammar_constraint.advance_state(
                                 verify_grammar_state, target_pred
                             )
+                            verify_temp_states.append(verify_grammar_state)
                             if grammar_constraint.is_match_state(verify_grammar_state):
                                 grammar_complete = True
                         break
@@ -502,7 +498,13 @@ class SpeculativeEngine:
                 metrics["draft_tokens_accepted"] += accepted_count
                 
                 if grammar_constraint is not None:
+                    release_states = list(draft_temp_states)
+                    release_states.extend(s for s in verify_temp_states if s != verify_grammar_state)
+                    if grammar_state != verify_grammar_state:
+                        release_states.append(grammar_state)
                     grammar_state = verify_grammar_state
+                    if release_states:
+                        grammar_constraint.release_states(release_states)
                 
                 tokens_added = min(accepted_count + 1, len(draft_tokens))
                 if generated_tokens and generated_tokens[-1] in stop_tokens:
@@ -659,7 +661,9 @@ class SpeculativeEngine:
         
         grammar_complete = False
         if grammar_constraint is not None:
+            previous_state = grammar_state
             grammar_state = grammar_constraint.advance_state(grammar_state, token_id)
+            grammar_constraint.release_state(previous_state)
             if grammar_constraint.is_match_state(grammar_state):
                 grammar_complete = True
         
@@ -686,7 +690,9 @@ class SpeculativeEngine:
                 generated_tokens.append(token_id)
                 
                 if grammar_constraint is not None:
+                    previous_state = grammar_state
                     grammar_state = grammar_constraint.advance_state(grammar_state, token_id)
+                    grammar_constraint.release_state(previous_state)
                     if grammar_constraint.is_match_state(grammar_state):
                         break
                 
@@ -809,7 +815,9 @@ class SpeculativeEngine:
 
         grammar_complete = False
         if grammar_constraint is not None:
+            previous_state = grammar_state
             grammar_state = grammar_constraint.advance_state(grammar_state, token_id)
+            grammar_constraint.release_state(previous_state)
             if grammar_constraint.is_match_state(grammar_state):
                 grammar_complete = True
 
@@ -825,9 +833,7 @@ class SpeculativeEngine:
                 draft_tokens = []
                 current_token = token_id
                 draft_grammar_state = grammar_state
-
-                if grammar_constraint is not None:
-                    grammar_constraint.save_snapshot()
+                draft_temp_states = []
 
                 draft_input = mx.array([[current_token]])
                 draft_logits = self.draft_model(draft_input, cache=self.draft_cache)
@@ -855,6 +861,7 @@ class SpeculativeEngine:
                         draft_grammar_state = grammar_constraint.advance_state(
                             draft_grammar_state, draft_token
                         )
+                        draft_temp_states.append(draft_grammar_state)
                         if grammar_constraint.is_match_state(draft_grammar_state):
                             break
 
@@ -878,9 +885,7 @@ class SpeculativeEngine:
 
                 accepted_count = 0
                 verify_grammar_state = grammar_state
-
-                if grammar_constraint is not None:
-                    grammar_constraint.restore_snapshot()
+                verify_temp_states = []
 
                 for i, draft_token in enumerate(draft_tokens):
                     target_pos_logits = target_logits[:, i:i+1, :].squeeze(1)
@@ -906,6 +911,7 @@ class SpeculativeEngine:
                             verify_grammar_state = grammar_constraint.advance_state(
                                 verify_grammar_state, draft_token
                             )
+                            verify_temp_states.append(verify_grammar_state)
                             if grammar_constraint.is_match_state(verify_grammar_state):
                                 grammar_complete = True
                                 break
@@ -920,6 +926,7 @@ class SpeculativeEngine:
                             verify_grammar_state = grammar_constraint.advance_state(
                                 verify_grammar_state, target_pred
                             )
+                            verify_temp_states.append(verify_grammar_state)
                             if grammar_constraint.is_match_state(verify_grammar_state):
                                 grammar_complete = True
                         break
@@ -927,7 +934,13 @@ class SpeculativeEngine:
                 metrics["draft_tokens_accepted"] += accepted_count
 
                 if grammar_constraint is not None:
+                    release_states = list(draft_temp_states)
+                    release_states.extend(s for s in verify_temp_states if s != verify_grammar_state)
+                    if grammar_state != verify_grammar_state:
+                        release_states.append(grammar_state)
                     grammar_state = verify_grammar_state
+                    if release_states:
+                        grammar_constraint.release_states(release_states)
 
                 tokens_added = min(accepted_count + 1, len(draft_tokens))
                 if generated_tokens and generated_tokens[-1] in stop_tokens:

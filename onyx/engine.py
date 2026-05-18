@@ -290,7 +290,9 @@ class OnyxEngine:
         
         grammar_complete = False
         if grammar_constraint is not None:
+            previous_state = grammar_state
             grammar_state = grammar_constraint.advance_state(grammar_state, token_id)
+            grammar_constraint.release_state(previous_state)
             if grammar_constraint.is_match_state(grammar_state):
                 grammar_complete = True
         
@@ -325,7 +327,9 @@ class OnyxEngine:
                 generated_tokens.append(token_id)
                 
                 if grammar_constraint is not None:
+                    previous_state = grammar_state
                     grammar_state = grammar_constraint.advance_state(grammar_state, token_id)
+                    grammar_constraint.release_state(previous_state)
                     if grammar_constraint.is_match_state(grammar_state):
                         break
                 
@@ -431,7 +435,9 @@ class OnyxEngine:
         
         grammar_complete = False
         if grammar_constraint is not None:
+            previous_state = grammar_state
             grammar_state = grammar_constraint.advance_state(grammar_state, token_id)
+            grammar_constraint.release_state(previous_state)
             if grammar_constraint.is_match_state(grammar_state):
                 grammar_complete = True
         
@@ -466,7 +472,9 @@ class OnyxEngine:
                 metrics["generated_tokens"] += 1
                 
                 if grammar_constraint is not None:
+                    previous_state = grammar_state
                     grammar_state = grammar_constraint.advance_state(grammar_state, token_id)
+                    grammar_constraint.release_state(previous_state)
                 
                 token_text = self.tokenizer.decode([token_id])
                 yield token_text, None
