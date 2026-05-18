@@ -27,6 +27,11 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+server = [
+    "fastapi>=0.110",
+    "pydantic>=2",
+    "uvicorn>=0.29",
+]
 dev = [
     "pytest>=7.0",
     "pytest-benchmark>=4.0",

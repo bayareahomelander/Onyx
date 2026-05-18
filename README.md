@@ -3,7 +3,7 @@
 ![Build](https://img.shields.io/badge/build-passing-brightgreen)
 ![License](https://img.shields.io/badge/license-MIT-blue)
 ![Platform](https://img.shields.io/badge/platform-Apple%20Silicon-black)
-![Python](https://img.shields.io/badge/python-3.10%2B-blue)
+![Python](https://img.shields.io/badge/python-3.12%20recommended-blue)
 
 **Grammar-Aware Speculative Decoding for Structured LLM Outputs on Apple Silicon**
 
@@ -34,8 +34,11 @@ Onyx is an inference engine that enforces structured output constraints (JSON Sc
 ### Prerequisites
 
 - macOS with Apple Silicon (M-Series)
-- Python 3.10+
+- Python 3.12 recommended
 - Rust toolchain
+- Metal GPU access for MLX runtime execution
+
+> The project metadata still allows Python 3.10+, but the tested setup path is Python 3.12 on Apple Silicon. If you use `pyenv`, the included `.python-version` selects Python 3.12 automatically. MLX may fail with `No Metal device available` in headless, sandboxed, or virtualized sessions where the GPU is not exposed.
 
 ### Installation
 
@@ -45,17 +48,15 @@ git clone https://github.com/bayareahomelander/Onyx.git
 cd Onyx
 
 # Create virtual environment
-python -m venv .venv
+python3.12 -m venv .venv
 source .venv/bin/activate
 
-# Install dependencies
-pip install -e .
+# Install build, runtime, and API dependencies
+python -m pip install -U pip "maturin>=1.4,<2.0"
+python -m pip install -e ".[server]"
 
 # Build the Rust extension
-maturin develop --release
-
-# Install API dependencies
-pip install fastapi uvicorn
+python -m maturin develop --release
 ```
 
 ### Start the API Server
