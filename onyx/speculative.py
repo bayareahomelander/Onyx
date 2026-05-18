@@ -26,6 +26,22 @@ if onyx.RUST_AVAILABLE:
         pass
 
 
+def _greedy_argmax(logits: mx.array) -> mx.array:
+    return mx.argmax(logits, axis=-1)
+
+
+def _mask_logits_with_indices(logits: mx.array, valid_indices: mx.array) -> mx.array:
+    actual_vocab_size = logits.shape[-1]
+    valid_mask = mx.zeros((actual_vocab_size,), dtype=mx.bool_)
+    valid_mask = valid_mask.at[valid_indices].add(True)
+    mask = mx.where(
+        valid_mask,
+        mx.zeros((actual_vocab_size,)),
+        mx.full((actual_vocab_size,), float("-inf")),
+    )
+    return logits + mask
+
+
 class SpeculativeEngine:
     """
     speculative decoding engine using draft-verify pattern
@@ -66,13 +82,19 @@ class SpeculativeEngine:
             cache_mode: "naive" for mlx_lm KVCache, "paged" for PagedKVCache
             block_size: block size for paged cache (default 16)
             lazy_load: if True, defer model loading until first use
-            use_compile: if True, use JIT compilation for model forward passes
+            use_compile: request MLX JIT compilation for eligible tensor helpers
         """
         self.draft_model_path = draft_model_path or self.DRAFT_MODEL
         self.target_model_path = target_model_path or self.TARGET_MODEL
         self.cache_mode = cache_mode
         self.block_size = block_size
         self.use_compile = use_compile
+        self.compile_requested = bool(use_compile)
+        self.compile_active = False
+        self.compile_reason = "disabled"
+        self._compiled_sample_greedy = None
+        self._compiled_apply_grammar_mask = None
+        self._setup_compile_helpers()
         
         self.draft_model: Optional[nn.Module] = None
         self.target_model: Optional[nn.Module] = None
@@ -117,10 +139,46 @@ class SpeculativeEngine:
         
         self._build_vocab_bytes()
         
-        if self.use_compile:
-            print("  JIT optimization: Using compiled sampling functions")
+        if self.compile_active:
+            print("  JIT optimization: compiled sampling helpers active")
+        elif self.compile_requested:
+            print(f"  JIT optimization: inactive ({self.compile_reason})")
         
         return self._draft_load_time, self._target_load_time
+
+    def _setup_compile_helpers(self) -> None:
+        """Compile pure tensor helpers when MLX exposes a compatible compiler."""
+        if not self.compile_requested:
+            self.compile_active = False
+            self.compile_reason = "disabled"
+            return
+
+        compile_fn = getattr(mx, "compile", None)
+        if compile_fn is None:
+            self.compile_active = False
+            self.compile_reason = "mlx_compile_unavailable"
+            return
+
+        try:
+            self._compiled_sample_greedy = compile_fn(_greedy_argmax)
+            self._compiled_apply_grammar_mask = compile_fn(_mask_logits_with_indices)
+        except Exception as exc:
+            self._compiled_sample_greedy = None
+            self._compiled_apply_grammar_mask = None
+            message = str(exc).replace("\n", " ").strip() or type(exc).__name__
+            self.compile_active = False
+            self.compile_reason = f"compile_setup_failed:{message[:120]}"
+            return
+
+        self.compile_active = True
+        self.compile_reason = "sampling_helpers_compiled"
+
+    def _compile_metrics(self) -> dict:
+        return {
+            "jit_compiled": self.compile_active,
+            "compile_requested": self.compile_requested,
+            "compile_reason": self.compile_reason,
+        }
     
     def _build_vocab_bytes(self) -> None:
         """build the vocabulary byte representation for grammar constraints"""
@@ -183,7 +241,9 @@ class SpeculativeEngine:
             raise ValueError("top_p must be in the range (0, 1]")
 
         if temperature == 0.0:
-            return mx.argmax(logits, axis=-1)
+            if self._compiled_sample_greedy is not None:
+                return self._compiled_sample_greedy(logits)
+            return _greedy_argmax(logits)
 
         scaled_logits = logits / temperature
         if top_p >= 1.0:
@@ -223,13 +283,18 @@ class SpeculativeEngine:
         """
         actual_vocab_size = logits.shape[-1]
         
-        valid_mask = mx.zeros((actual_vocab_size,), dtype=mx.bool_)
-        
         if valid_token_ids:
             valid_ids = [tid for tid in valid_token_ids if tid < actual_vocab_size]
             if valid_ids:
                 valid_indices = mx.array(valid_ids)
+                if self._compiled_apply_grammar_mask is not None:
+                    return self._compiled_apply_grammar_mask(logits, valid_indices)
+                valid_mask = mx.zeros((actual_vocab_size,), dtype=mx.bool_)
                 valid_mask = valid_mask.at[valid_indices].add(True)
+            else:
+                valid_mask = mx.zeros((actual_vocab_size,), dtype=mx.bool_)
+        else:
+            valid_mask = mx.zeros((actual_vocab_size,), dtype=mx.bool_)
         
         mask = mx.where(
             valid_mask, 
@@ -315,12 +380,12 @@ class SpeculativeEngine:
             "generation_time": 0.0,
             "tokens_per_second": 0.0,
             "cache_mode": self.cache_mode,
-            "jit_compiled": self.use_compile,
             "grammar_constrained": grammar_active,
             "draft_grammar_aware": draft_grammar_aware and grammar_active,
             "mask_time_total": 0.0,
             "mask_time_avg": 0.0,
         }
+        metrics.update(self._compile_metrics())
         
         grammar_constraint = None
         grammar_state = None
@@ -605,11 +670,11 @@ class SpeculativeEngine:
             "generation_time": 0.0,
             "tokens_per_second": 0.0,
             "cache_mode": self.cache_mode,
-            "jit_compiled": self.use_compile,
             "grammar_constrained": grammar_active,
             "mask_time_total": 0.0,
             "mask_time_avg": 0.0,
         }
+        metrics.update(self._compile_metrics())
         
         grammar_constraint = None
         grammar_state = None
@@ -758,12 +823,12 @@ class SpeculativeEngine:
             "generation_time": 0.0,
             "tokens_per_second": 0.0,
             "cache_mode": self.cache_mode,
-            "jit_compiled": self.use_compile,
             "grammar_constrained": grammar_active,
             "draft_grammar_aware": draft_grammar_aware and grammar_active,
             "mask_time_total": 0.0,
             "mask_time_avg": 0.0,
         }
+        metrics.update(self._compile_metrics())
 
         grammar_constraint = None
         grammar_state = None

@@ -63,7 +63,6 @@ class AdaptiveSpeculativeEngine(SpeculativeEngine):
             "generation_time": 0.0,
             "tokens_per_second": 0.0,
             "cache_mode": self.cache_mode,
-            "jit_compiled": self.use_compile,
             "grammar_constrained": grammar_active,
             "draft_grammar_aware": draft_grammar_aware and grammar_active,
             "mask_time_total": 0.0,
@@ -78,6 +77,7 @@ class AdaptiveSpeculativeEngine(SpeculativeEngine):
             "verify_time_total": 0.0,
             "controller_time_total": 0.0,
         }
+        metrics.update(self._compile_metrics())
 
         grammar_constraint = None
         grammar_state = None

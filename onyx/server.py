@@ -190,6 +190,19 @@ def resolve_stop_tokens(
     return token_ids or None
 
 
+def build_onyx_metrics(last_metrics: Dict[str, Any], grammar_active: bool) -> Dict[str, Any]:
+    return {
+        "tokens_per_second": last_metrics.get("tokens_per_second", 0),
+        "acceptance_rate": last_metrics.get("acceptance_rate", 0),
+        "ttft_ms": last_metrics.get("ttft", 0) * 1000 if last_metrics.get("ttft") else None,
+        "grammar_constrained": grammar_active,
+        "speculative_iterations": last_metrics.get("speculative_iterations", 0),
+        "jit_compiled": last_metrics.get("jit_compiled", False),
+        "compile_requested": last_metrics.get("compile_requested", False),
+        "compile_reason": last_metrics.get("compile_reason", "disabled"),
+    }
+
+
 def create_streaming_response(
     request: ChatCompletionRequest,
     engine,
@@ -371,13 +384,7 @@ async def create_chat_completion(request: ChatCompletionRequest):
             model=request.model,
             choices=choices,
             usage=usage,
-            onyx_metrics={
-                "tokens_per_second": last_metrics.get("tokens_per_second", 0),
-                "acceptance_rate": last_metrics.get("acceptance_rate", 0),
-                "ttft_ms": last_metrics.get("ttft", 0) * 1000 if last_metrics.get("ttft") else None,
-                "grammar_constrained": grammar_active,
-                "speculative_iterations": last_metrics.get("speculative_iterations", 0),
-            },
+            onyx_metrics=build_onyx_metrics(last_metrics, grammar_active),
         )
         
         return response
