@@ -374,6 +374,28 @@ Health check endpoint.
 
 ## Development
 
+### Experimental CUDA Component
+
+Onyx includes a separate `onyx_cuda` package for CUDA-oriented constrained
+decoding experiments. The first component is a sparse masked-argmax CUDA kernel
+that selects the highest-logit token from a grammar-valid token ID set.
+
+This is not a full CUDA inference backend and does not replace the MLX runtime.
+It is a focused kernel-level experiment for understanding decode-loop bottlenecks
+around grammar masking, sparse token selection, and GPU launch overhead.
+
+```bash
+python -m pip install -e ".[cuda,dev]"
+python -m pytest tests/test_cuda_masked_argmax.py -q
+python benchmark_cuda_masked_argmax.py
+```
+
+On Windows, the benchmark also needs the NVIDIA CUDA Toolkit with `nvcc` on
+`PATH`, compatible Microsoft C++ Build Tools, and a CUDA-enabled PyTorch build.
+The current CUDA experiment is intended for editable-source-tree development.
+
+See [`onyx_cuda/README.md`](onyx_cuda/README.md) for scope and constraints.
+
 ### Verification Scripts
 
 ```bash
