@@ -49,6 +49,44 @@ def test_masked_argmax_from_grammar_state_uses_rust_valid_ids():
 
     assert int(actual.item()) == token_to_id[b"7"]
 
+    valid_id_cache = module.CudaValidIdCache(constraint)
+    cached_actual = module.masked_argmax_from_cached_grammar_state(
+        logits,
+        valid_id_cache,
+        state,
+        check_inputs=False,
+    )
+
+    assert int(cached_actual.item()) == token_to_id[b"7"]
+
+
+def test_cuda_valid_id_cache_reuses_tensor_for_state_and_device():
+    torch = pytest.importorskip("torch")
+    if not torch.cuda.is_available():
+        pytest.skip("PyTorch CUDA is not available")
+
+    from onyx_cuda.grammar_handoff import CudaValidIdCache
+
+    class CountingGrammar:
+        def __init__(self):
+            self.calls = 0
+
+        def get_valid_token_ids(self, state):
+            self.calls += 1
+            return [1, 3, 5]
+
+    grammar = CountingGrammar()
+    cache = CudaValidIdCache(grammar)
+
+    current_device = torch.cuda.current_device()
+
+    first = cache.get(9, torch.device("cuda"))
+    second = cache.get(9, torch.device(f"cuda:{current_device}"))
+
+    assert grammar.calls == 1
+    assert first.data_ptr() == second.data_ptr()
+    assert first.cpu().tolist() == [1, 3, 5]
+
 
 def test_masked_argmax_from_grammar_state_rejects_empty_valid_ids():
     _, _, module = _cuda_grammar_runtime_or_skip()

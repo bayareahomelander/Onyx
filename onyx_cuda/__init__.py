@@ -3,7 +3,11 @@ experimental CUDA helpers for Onyx.
 """
 
 from . import masked_argmax as _masked_argmax
-from .grammar_handoff import masked_argmax_from_grammar_state
+from .grammar_handoff import (
+    CudaValidIdCache,
+    masked_argmax_from_cached_grammar_state,
+    masked_argmax_from_grammar_state,
+)
 
 extension_status = _masked_argmax.extension_status
 masked_argmax_tensor = _masked_argmax.masked_argmax_tensor
@@ -19,7 +23,9 @@ def __getattr__(name: str):
 __all__ = [
     "CUDA_EXTENSION_AVAILABLE",
     "CUDA_EXTENSION_ERROR",
+    "CudaValidIdCache",
     "extension_status",
+    "masked_argmax_from_cached_grammar_state",
     "masked_argmax_from_grammar_state",
     "masked_argmax_tensor",
     "torch_reference_masked_argmax",

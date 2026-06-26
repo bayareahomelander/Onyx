@@ -7,7 +7,11 @@ import time
 from dataclasses import dataclass
 from typing import Callable, Dict, List
 
-from onyx_cuda.grammar_handoff import masked_argmax_from_grammar_state
+from onyx_cuda.grammar_handoff import (
+    CudaValidIdCache,
+    masked_argmax_from_cached_grammar_state,
+    masked_argmax_from_grammar_state,
+)
 from onyx_cuda.masked_argmax import masked_argmax_tensor
 
 REPEATS = 1_000
@@ -141,6 +145,7 @@ def main() -> int:
     logits = _make_logits(torch, case)
 
     valid_ids_cuda = torch.as_tensor(case.valid_token_ids, dtype=torch.long, device="cuda")
+    valid_id_cache = CudaValidIdCache(case.grammar_constraint)
     selected = int(
         masked_argmax_from_grammar_state(
             logits,
@@ -151,6 +156,21 @@ def main() -> int:
     )
     if selected != case.expected_token_id:
         raise AssertionError(f"selected {selected}, expected {case.expected_token_id}")
+
+    cached_selected = int(
+        masked_argmax_from_cached_grammar_state(
+            logits,
+            valid_id_cache,
+            case.grammar_state,
+            check_inputs=False,
+        ).item()
+    )
+    if cached_selected != case.expected_token_id:
+        raise AssertionError(
+            f"cached selected {cached_selected}, expected {case.expected_token_id}"
+        )
+
+    valid_id_cache.get(case.grammar_state, logits.device)
 
     rust_valid_us = _time_cpu_us(
         lambda: case.grammar_constraint.get_valid_token_ids(case.grammar_state)
@@ -172,6 +192,15 @@ def main() -> int:
             check_inputs=False,
         ).item(),
     )
+    cached_handoff_us = _time_synchronized_us(
+        torch,
+        lambda: masked_argmax_from_cached_grammar_state(
+            logits,
+            valid_id_cache,
+            case.grammar_state,
+            check_inputs=False,
+        ).item(),
+    )
 
     print("Onyx CUDA grammar handoff benchmark")
     print(f"device: {torch.cuda.get_device_name()}")
@@ -185,6 +214,7 @@ def main() -> int:
     print(f"{'valid_ids_to_cuda':<24} {upload_us:12.2f}")
     print(f"{'cuda_masked_argmax':<24} {cuda_select_us:12.2f}")
     print(f"{'end_to_end_handoff':<24} {handoff_us:12.2f}")
+    print(f"{'cached_handoff':<24} {cached_handoff_us:12.2f}")
 
     return 0
 

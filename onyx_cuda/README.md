@@ -14,6 +14,12 @@ used after the Rust grammar engine computes valid token IDs.
 bridge helper that asks a grammar constraint for valid token IDs, transfers that
 set to CUDA, and runs the masked-argmax kernel.
 
+`onyx_cuda.grammar_handoff.CudaValidIdCache` caches per-state valid-token tensors
+on CUDA devices so repeated visits to the same grammar state skip repeated
+host-to-device valid-ID uploads. a cache is valid for one compiled grammar state
+space; clear or recreate it after recompiling or otherwise changing the grammar
+constraint.
+
 Scope:
 
 - greedy selection only
