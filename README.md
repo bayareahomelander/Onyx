@@ -387,8 +387,10 @@ around grammar masking, sparse token selection, and GPU launch overhead.
 ```bash
 python -m pip install -e ".[cuda,dev]"
 python -m pytest tests/test_cuda_masked_argmax.py -q
+python -m pytest tests/test_cuda_decode_loop.py -q
 python benchmark_cuda_masked_argmax.py
 python benchmark_cuda_grammar_handoff.py
+python benchmark_cuda_decode_loop.py
 ```
 
 On Windows, the benchmark also needs the NVIDIA CUDA Toolkit with `nvcc` on

@@ -83,9 +83,43 @@ def test_cuda_valid_id_cache_reuses_tensor_for_state_and_device():
     first = cache.get(9, torch.device("cuda"))
     second = cache.get(9, torch.device(f"cuda:{current_device}"))
 
-    assert grammar.calls == 1
+    assert grammar.calls == 2
     assert first.data_ptr() == second.data_ptr()
     assert first.cpu().tolist() == [1, 3, 5]
+    assert cache.num_entries == 1
+
+    cache.discard(9)
+    assert cache.num_entries == 0
+
+    third = cache.get(9, torch.device("cuda"))
+    assert grammar.calls == 3
+    assert third.cpu().tolist() == [1, 3, 5]
+
+    cache.clear()
+    assert cache.num_entries == 0
+
+
+def test_cuda_valid_id_cache_refreshes_reused_handle_after_grammar_reset():
+    torch, GrammarConstraint, module = _cuda_grammar_runtime_or_skip()
+
+    vocab = [b"a", b"b", b"c"]
+    constraint = GrammarConstraint(vocab)
+    constraint.compile_regex("(ab|bc)")
+    cache = module.CudaValidIdCache(constraint)
+
+    initial = constraint.init_state()
+    after_a = constraint.advance_state(initial, 0)
+    first_valid = cache.get(after_a, torch.device("cuda"))
+    assert first_valid.cpu().tolist() == [1]
+
+    constraint.reset()
+    reset_initial = constraint.init_state()
+    after_b = constraint.advance_state(reset_initial, 1)
+    assert after_b == after_a
+
+    refreshed_valid = cache.get(after_b, torch.device("cuda"))
+    assert refreshed_valid.cpu().tolist() == [2]
+    assert cache.num_entries == 1
 
 
 def test_masked_argmax_from_grammar_state_rejects_empty_valid_ids():

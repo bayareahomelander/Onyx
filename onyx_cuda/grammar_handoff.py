@@ -19,18 +19,31 @@ def _require_torch():
 class CudaValidIdCache:
     """cache grammar-valid token id tensors on CUDA devices.
 
-    cached tensors are valid for one compiled grammar state space. clear or
-    recreate the cache after recompiling or otherwise changing the grammar
-    constraint.
+    Every lookup re-reads the grammar-valid IDs and compares them with the
+    cached fingerprint. This preserves correctness when opaque state handles
+    are reused after a grammar reset while still avoiding repeated CUDA uploads
+    when the valid-ID set is unchanged.
     """
 
     def __init__(self, grammar_constraint: Any):
         self.grammar_constraint = grammar_constraint
-        self._cache: Dict[Tuple[int, str], Any] = {}
+        self._cache: Dict[Tuple[int, str], Tuple[Tuple[int, ...], Any]] = {}
 
     def clear(self) -> None:
         """clear all cached CUDA tensors."""
         self._cache.clear()
+
+    def discard(self, state: int) -> None:
+        """drop cached tensors for one opaque grammar state on all devices."""
+        state = int(state)
+        stale_keys = [key for key in self._cache if key[0] == state]
+        for key in stale_keys:
+            del self._cache[key]
+
+    @property
+    def num_entries(self) -> int:
+        """return the number of cached state/device tensors."""
+        return len(self._cache)
 
     def get(self, state: int, device):
         """return a CUDA tensor of valid token ids for the grammar state."""
@@ -41,17 +54,17 @@ class CudaValidIdCache:
         if device.index is None:
             device = torch.device("cuda", torch.cuda.current_device())
 
-        key = (int(state), str(device))
-        cached = self._cache.get(key)
-        if cached is not None:
-            return cached
-
-        valid_token_ids = self.grammar_constraint.get_valid_token_ids(state)
+        valid_token_ids = tuple(self.grammar_constraint.get_valid_token_ids(state))
         if not valid_token_ids:
             raise ValueError("grammar state produced no valid token ids")
 
+        key = (int(state), str(device))
+        cached = self._cache.get(key)
+        if cached is not None and cached[0] == valid_token_ids:
+            return cached[1]
+
         valid_ids = torch.as_tensor(valid_token_ids, dtype=torch.long, device=device).contiguous()
-        self._cache[key] = valid_ids
+        self._cache[key] = (valid_token_ids, valid_ids)
         return valid_ids
 
 

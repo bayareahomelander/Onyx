@@ -3,6 +3,11 @@ experimental CUDA helpers for Onyx.
 """
 
 from . import masked_argmax as _masked_argmax
+from .decode_loop import (
+    CudaGrammarDecodeResult,
+    CudaGrammarDecodeTimings,
+    decode_greedy_from_logits,
+)
 from .grammar_handoff import (
     CudaValidIdCache,
     masked_argmax_from_cached_grammar_state,
@@ -23,7 +28,10 @@ def __getattr__(name: str):
 __all__ = [
     "CUDA_EXTENSION_AVAILABLE",
     "CUDA_EXTENSION_ERROR",
+    "CudaGrammarDecodeResult",
+    "CudaGrammarDecodeTimings",
     "CudaValidIdCache",
+    "decode_greedy_from_logits",
     "extension_status",
     "masked_argmax_from_cached_grammar_state",
     "masked_argmax_from_grammar_state",
