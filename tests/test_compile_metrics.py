@@ -72,6 +72,9 @@ def configure_numpy_decode_runtime(module):
     module.mx.array = np.array
     module.mx.argmax = lambda logits, axis=-1: np.argmax(logits, axis=axis)
     module.mx.eval = lambda *_args: None
+    module.mx.random = types.SimpleNamespace(
+        categorical=lambda logits: np.argmax(logits, axis=-1),
+    )
 
 
 def test_compile_requested_without_mx_compile_reports_inactive(monkeypatch):
@@ -157,6 +160,15 @@ def test_speculative_generation_honors_hard_token_limit(monkeypatch):
     assert baseline_output == "xxxxx"
     assert baseline_metrics["generated_tokens"] == 5
     assert baseline_metrics["finish_reason"] == "length"
+
+    sampled_output, sampled_metrics = engine.generate_baseline(
+        "prompt",
+        max_tokens=2,
+        temperature=0.5,
+    )
+
+    assert sampled_output == "xx"
+    assert sampled_metrics["finish_reason"] == "length"
 
     streamed = list(engine.stream_generate("prompt", max_tokens=5, gamma=4))
     streamed_text = "".join(text for text, metrics in streamed if metrics is None)
@@ -252,6 +264,30 @@ def test_speculative_generation_rejects_invalid_gamma_before_model_loading(monke
 
     with pytest.raises(ValueError, match="gamma must be a positive integer"):
         next(engine.stream_generate("prompt", gamma=0))
+
+
+@pytest.mark.parametrize(
+    "sampling_kwargs",
+    [
+        {"temperature": 0.1, "top_p": 1.0},
+        {"temperature": 0.0, "top_p": 0.9},
+    ],
+)
+def test_speculative_generation_rejects_non_greedy_sampling_before_model_loading(
+    monkeypatch,
+    sampling_kwargs,
+):
+    speculative = import_speculative_with_fake_mlx(monkeypatch)
+    engine = speculative.SpeculativeEngine(lazy_load=True, use_compile=False)
+
+    with pytest.raises(ValueError, match="supports greedy sampling only"):
+        engine.generate("prompt", **sampling_kwargs)
+
+    with pytest.raises(ValueError, match="supports greedy sampling only"):
+        next(engine.stream_generate("prompt", **sampling_kwargs))
+
+    assert engine.draft_model is None
+    assert engine.target_model is None
 
 
 def test_api_metrics_do_not_report_jit_active_for_request_only(monkeypatch):

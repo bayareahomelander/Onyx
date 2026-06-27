@@ -354,6 +354,8 @@ OpenAI-compatible chat completion endpoint.
 | `model` | string | Model identifier (default: `onyx-speculative`) |
 | `messages` | array | Chat messages |
 | `max_tokens` | integer | Maximum tokens to generate |
+| `temperature` | number | Must be `0`; speculative generation is currently greedy-only |
+| `top_p` | number | Must be `1`; speculative generation is currently greedy-only |
 | `stream` | boolean | Enable streaming response |
 | `stop` | array<string> | Stop strings. Multi-token stop strings are tokenized as full sequences and removed from returned text. |
 | `regex` | string | **(Onyx extension)** Regex pattern to constrain output |
@@ -361,6 +363,8 @@ OpenAI-compatible chat completion endpoint.
 | `compact_json` | boolean | **(Onyx extension)** Strip whitespace from JSON output (default: `true`) |
 
 > Prototype note: stop strings are matched after tokenizer encoding. Streaming responses also buffer a small text suffix so stop strings split across token chunks are not emitted.
+
+> Sampling contract: the speculative API models reject non-greedy settings with HTTP 400. Target-only `SpeculativeEngine.generate_baseline()` remains available for sampling experiments.
 
 ### `GET /v1/models`
 

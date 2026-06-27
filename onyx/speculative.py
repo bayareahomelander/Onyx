@@ -85,6 +85,14 @@ def _draft_token_budget(max_tokens: int, generated_count: int, gamma: int) -> in
     return min(gamma, max_tokens - generated_count)
 
 
+def _validate_speculative_sampling(temperature: float, top_p: float) -> None:
+    if temperature != 0.0 or top_p != 1.0:
+        raise ValueError(
+            "speculative decoding currently supports greedy sampling only; "
+            "use temperature=0 and top_p=1"
+        )
+
+
 class SpeculativeEngine:
     """
     speculative decoding engine using draft-verify pattern
@@ -393,9 +401,12 @@ class SpeculativeEngine:
             json_schema: Optional json schema string to constrain generation
             draft_grammar_aware: If True and grammar is provided, the draft model also uses grammar constraints;
                                  if False, draft is unconstrained for comparison benchmarks.
+            temperature: Must be 0. Speculative decoding is currently greedy-only.
+            top_p: Must be 1. Speculative decoding is currently greedy-only.
         """
         _validate_positive_integer("max_tokens", max_tokens)
         _validate_positive_integer("gamma", gamma)
+        _validate_speculative_sampling(temperature, top_p)
 
         if self.draft_model is None or self.target_model is None:
             self.load_models()
@@ -879,6 +890,7 @@ class SpeculativeEngine:
     ) -> Generator[Tuple[str, Optional[dict]], None, None]:
         _validate_positive_integer("max_tokens", max_tokens)
         _validate_positive_integer("gamma", gamma)
+        _validate_speculative_sampling(temperature, top_p)
 
         if self.draft_model is None or self.target_model is None:
             self.load_models()

@@ -171,6 +171,8 @@ def test_chat_completion_passes_templated_prompt_to_engine(server_with_fake_deps
     response = asyncio.run(server.create_chat_completion(request))
 
     assert engine.generate_kwargs["prompt"] == "api templated prompt"
+    assert engine.generate_kwargs["temperature"] == 0.0
+    assert engine.generate_kwargs["top_p"] == 1.0
     assert response.choices[0].finish_reason == "length"
 
 
@@ -290,6 +292,54 @@ def test_streaming_response_uses_engine_finish_reason(server_with_fake_deps, mon
         stop=None,
     )
 
-    chunks = list(server.create_streaming_response(request, FakeEngine()))
+    chunks = list(
+        server.create_streaming_response(
+            request,
+            FakeEngine(),
+            temperature=0.0,
+            top_p=1.0,
+        )
+    )
 
     assert any('"finish_reason": "length"' in chunk for chunk in chunks)
+
+
+def test_resolve_speculative_sampling_uses_greedy_defaults(server_with_fake_deps):
+    server = server_with_fake_deps
+
+    assert server.resolve_speculative_sampling(None, None) == (0.0, 1.0)
+
+
+@pytest.mark.parametrize(
+    ("temperature", "top_p", "stream"),
+    [
+        (0.1, 1.0, False),
+        (0.0, 0.9, True),
+    ],
+)
+def test_chat_completion_rejects_non_greedy_speculative_sampling(
+    server_with_fake_deps,
+    temperature,
+    top_p,
+    stream,
+):
+    server = server_with_fake_deps
+    request = server.ChatCompletionRequest(
+        model="onyx-speculative",
+        messages=[server.ChatMessage(role="user", content="Hello")],
+        max_tokens=5,
+        temperature=temperature,
+        stream=stream,
+        regex=None,
+        json_schema=None,
+        compact_json=True,
+        top_p=top_p,
+        n=1,
+        stop=None,
+    )
+
+    with pytest.raises(server.HTTPException) as exc_info:
+        asyncio.run(server.create_chat_completion(request))
+
+    assert exc_info.value.status_code == 400
+    assert "supports greedy sampling only" in exc_info.value.detail

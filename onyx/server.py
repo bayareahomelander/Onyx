@@ -29,7 +29,8 @@ class ChatCompletionRequest(BaseModel):
     )
     temperature: Optional[float] = Field(
         default=0.0,
-        description="Sampling temperature (0 = greedy, higher = more random)"
+        ge=0.0,
+        description="Sampling temperature. Speculative models currently require 0."
     )
     stream: Optional[bool] = Field(
         default=False,
@@ -47,7 +48,12 @@ class ChatCompletionRequest(BaseModel):
         default=True,
         description="When json_schema is active, compact the output to remove whitespace (Onyx extension)"
     )
-    top_p: Optional[float] = Field(default=1.0, description="Nucleus sampling parameter")
+    top_p: Optional[float] = Field(
+        default=1.0,
+        gt=0.0,
+        le=1.0,
+        description="Nucleus sampling parameter. Speculative models currently require 1.",
+    )
     n: Optional[int] = Field(default=1, description="Number of completions to generate")
     stop: Optional[List[str]] = Field(default=None, description="Stop sequences")
 
@@ -264,9 +270,29 @@ def build_onyx_metrics(last_metrics: Dict[str, Any], grammar_active: bool) -> Di
     }
 
 
+def resolve_speculative_sampling(
+    temperature: Optional[float],
+    top_p: Optional[float],
+) -> tuple[float, float]:
+    resolved_temperature = 0.0 if temperature is None else temperature
+    resolved_top_p = 1.0 if top_p is None else top_p
+    if resolved_temperature != 0.0 or resolved_top_p != 1.0:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Speculative decoding currently supports greedy sampling only; "
+                "use temperature=0 and top_p=1"
+            ),
+        )
+    return resolved_temperature, resolved_top_p
+
+
 def create_streaming_response(
     request: ChatCompletionRequest,
     engine,
+    *,
+    temperature: float,
+    top_p: float,
 ) -> Generator[str, None, None]:
     completion_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
     created = int(time.time())
@@ -302,8 +328,8 @@ def create_streaming_response(
             regex=request.regex,
             json_schema=json_schema_str,
             draft_grammar_aware=True,
-            temperature=request.temperature or 0.0,
-            top_p=request.top_p or 1.0,
+            temperature=temperature,
+            top_p=top_p,
             stop_tokens=stop_tokens,
         ):
             if metrics is not None:
@@ -408,13 +434,19 @@ async def list_models():
 
 @app.post("/v1/chat/completions")
 async def create_chat_completion(request: ChatCompletionRequest):
+    temperature, top_p = resolve_speculative_sampling(request.temperature, request.top_p)
     engine = get_engine(request.model)
     if request.stream and request.n and request.n != 1:
         raise HTTPException(status_code=400, detail="stream=true supports only n=1")
     
     if request.stream:
         return StreamingResponse(
-            create_streaming_response(request, engine),
+            create_streaming_response(
+                request,
+                engine,
+                temperature=temperature,
+                top_p=top_p,
+            ),
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache",
@@ -442,8 +474,8 @@ async def create_chat_completion(request: ChatCompletionRequest):
                 regex=request.regex,
                 json_schema=json_schema_str,
                 draft_grammar_aware=True,
-                temperature=request.temperature or 0.0,
-                top_p=request.top_p or 1.0,
+                temperature=temperature,
+                top_p=top_p,
                 stop_tokens=stop_tokens,
             )
             last_metrics = metrics
