@@ -1,5 +1,6 @@
 import asyncio
 import importlib
+import json
 import sys
 import types
 
@@ -146,6 +147,7 @@ def test_chat_completion_passes_templated_prompt_to_engine(server_with_fake_deps
                     "tokens_per_second": 1.0,
                     "acceptance_rate": 100.0,
                     "speculative_iterations": 1,
+                    "finish_reason": "length",
                 },
             )
 
@@ -158,7 +160,7 @@ def test_chat_completion_passes_templated_prompt_to_engine(server_with_fake_deps
         max_tokens=5,
         temperature=0.0,
         stream=False,
-        regex=None,
+        regex="[a-z]+",
         json_schema=None,
         compact_json=True,
         top_p=1.0,
@@ -166,9 +168,10 @@ def test_chat_completion_passes_templated_prompt_to_engine(server_with_fake_deps
         stop=None,
     )
 
-    asyncio.run(server.create_chat_completion(request))
+    response = asyncio.run(server.create_chat_completion(request))
 
     assert engine.generate_kwargs["prompt"] == "api templated prompt"
+    assert response.choices[0].finish_reason == "length"
 
 
 def test_resolve_stop_tokens_preserves_sequences(server_with_fake_deps):
@@ -226,6 +229,7 @@ def test_chat_completion_passes_stop_sequences_and_truncates_output(server_with_
                     "tokens_per_second": 1.0,
                     "acceptance_rate": 100.0,
                     "speculative_iterations": 1,
+                    "finish_reason": "stop",
                 },
             )
 
@@ -250,3 +254,42 @@ def test_chat_completion_passes_stop_sequences_and_truncates_output(server_with_
 
     assert engine.generate_kwargs["stop_tokens"] == [[10, 11]]
     assert response.choices[0].message.content == "answer"
+
+
+def test_streaming_response_uses_engine_finish_reason(server_with_fake_deps, monkeypatch):
+    server = server_with_fake_deps
+
+    class Tokenizer:
+        def encode(self, text):
+            return []
+
+    class FakeEngine:
+        tokenizer = Tokenizer()
+
+        def stream_generate(self, **_kwargs):
+            yield "answer", None
+            yield "", {"finish_reason": "length"}
+
+    monkeypatch.setattr(
+        server.ChatCompletionChunk,
+        "model_dump_json",
+        lambda self: json.dumps({"finish_reason": self.choices[0].finish_reason}),
+    )
+
+    request = server.ChatCompletionRequest(
+        model="onyx-speculative",
+        messages=[server.ChatMessage(role="user", content="Hello")],
+        max_tokens=1,
+        temperature=0.0,
+        stream=True,
+        regex=None,
+        json_schema=None,
+        compact_json=True,
+        top_p=1.0,
+        n=1,
+        stop=None,
+    )
+
+    chunks = list(server.create_streaming_response(request, FakeEngine()))
+
+    assert any('"finish_reason": "length"' in chunk for chunk in chunks)

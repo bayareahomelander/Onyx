@@ -2,6 +2,7 @@ import importlib
 import sys
 import types
 
+import numpy as np
 import pytest
 
 
@@ -10,6 +11,8 @@ def clean_imported_modules():
     yield
     sys.modules.pop("onyx.speculative", None)
     sys.modules.pop("onyx.server", None)
+    sys.modules.pop("onyx.adaptive", None)
+    sys.modules.pop("onyx.engine", None)
 
 
 def import_speculative_with_fake_mlx(monkeypatch, compile_fn=None):
@@ -45,6 +48,30 @@ def import_speculative_with_fake_mlx(monkeypatch, compile_fn=None):
     import onyx.speculative
 
     return importlib.reload(onyx.speculative)
+
+
+class GreedyFakeModel:
+    def __call__(self, input_ids, cache):
+        logits = np.zeros((1, input_ids.shape[1], 2), dtype=np.float32)
+        logits[..., 1] = 1.0
+        return logits
+
+
+class GreedyFakeTokenizer:
+    vocab_size = 2
+    eos_token_id = None
+
+    def encode(self, _text):
+        return [0]
+
+    def decode(self, token_ids):
+        return "x" * len(token_ids)
+
+
+def configure_numpy_decode_runtime(module):
+    module.mx.array = np.array
+    module.mx.argmax = lambda logits, axis=-1: np.argmax(logits, axis=axis)
+    module.mx.eval = lambda *_args: None
 
 
 def test_compile_requested_without_mx_compile_reports_inactive(monkeypatch):
@@ -97,6 +124,134 @@ def test_fake_mx_compile_marks_helper_compilation_active(monkeypatch):
     assert engine.compile_reason == "sampling_helpers_compiled"
     assert compiled == ["_greedy_argmax", "_mask_logits_with_indices"]
     assert engine._compile_metrics()["jit_compiled"] is True
+
+
+def test_draft_token_budget_never_exceeds_remaining_limit(monkeypatch):
+    speculative = import_speculative_with_fake_mlx(monkeypatch)
+
+    assert speculative._draft_token_budget(max_tokens=5, generated_count=4, gamma=4) == 1
+    assert speculative._draft_token_budget(max_tokens=8, generated_count=2, gamma=4) == 4
+
+
+def test_speculative_generation_honors_hard_token_limit(monkeypatch):
+    speculative = import_speculative_with_fake_mlx(monkeypatch)
+    configure_numpy_decode_runtime(speculative)
+
+    engine = speculative.SpeculativeEngine(
+        cache_mode="naive",
+        lazy_load=True,
+        use_compile=False,
+    )
+    engine.draft_model = GreedyFakeModel()
+    engine.target_model = GreedyFakeModel()
+    engine.tokenizer = GreedyFakeTokenizer()
+
+    output, metrics = engine.generate("prompt", max_tokens=5, gamma=4)
+
+    assert output == "xxxxx"
+    assert metrics["generated_tokens"] == 5
+    assert metrics["finish_reason"] == "length"
+
+    baseline_output, baseline_metrics = engine.generate_baseline("prompt", max_tokens=5)
+
+    assert baseline_output == "xxxxx"
+    assert baseline_metrics["generated_tokens"] == 5
+    assert baseline_metrics["finish_reason"] == "length"
+
+    streamed = list(engine.stream_generate("prompt", max_tokens=5, gamma=4))
+    streamed_text = "".join(text for text, metrics in streamed if metrics is None)
+    final_metrics = streamed[-1][1]
+
+    assert streamed_text == "xxxxx"
+    assert final_metrics["generated_tokens"] == 5
+    assert final_metrics["finish_reason"] == "length"
+
+    stopped_output, stopped_metrics = engine.generate(
+        "prompt",
+        max_tokens=5,
+        gamma=4,
+        stop_tokens=[1],
+    )
+
+    assert stopped_output == ""
+    assert stopped_metrics["generated_tokens"] == 0
+    assert stopped_metrics["finish_reason"] == "stop"
+
+
+def test_adaptive_generation_honors_hard_token_limit(monkeypatch):
+    speculative = import_speculative_with_fake_mlx(monkeypatch)
+    configure_numpy_decode_runtime(speculative)
+    sys.modules.pop("onyx.adaptive", None)
+    adaptive = importlib.import_module("onyx.adaptive")
+
+    engine = adaptive.AdaptiveSpeculativeEngine(
+        cache_mode="naive",
+        lazy_load=True,
+        use_compile=False,
+    )
+    engine.draft_model = GreedyFakeModel()
+    engine.target_model = GreedyFakeModel()
+    engine.tokenizer = GreedyFakeTokenizer()
+
+    output, metrics = engine.generate_adaptive("prompt", max_tokens=5)
+
+    assert output == "xxxxx"
+    assert metrics["generated_tokens"] == 5
+    assert metrics["finish_reason"] == "length"
+
+
+def test_single_model_engine_reports_length_and_rejects_invalid_limit(monkeypatch):
+    import_speculative_with_fake_mlx(monkeypatch)
+    sys.modules.pop("onyx.engine", None)
+    engine_module = importlib.import_module("onyx.engine")
+    configure_numpy_decode_runtime(engine_module)
+
+    class FakeCacheManager:
+        def reset(self):
+            pass
+
+        def as_list(self):
+            return []
+
+    engine = engine_module.OnyxEngine(lazy_load=True)
+    engine.model = GreedyFakeModel()
+    engine.tokenizer = GreedyFakeTokenizer()
+    engine.cache_manager = FakeCacheManager()
+
+    output, metrics = engine.generate("prompt", max_tokens=5)
+
+    assert output == "xxxxx"
+    assert metrics["generated_tokens"] == 5
+    assert metrics["finish_reason"] == "length"
+
+    with pytest.raises(ValueError, match="max_tokens must be a positive integer"):
+        engine.generate("prompt", max_tokens=0)
+
+
+@pytest.mark.parametrize("max_tokens", [0, -1, True, 1.5])
+def test_generation_rejects_invalid_max_tokens_before_model_loading(monkeypatch, max_tokens):
+    speculative = import_speculative_with_fake_mlx(monkeypatch)
+    engine = speculative.SpeculativeEngine(lazy_load=True, use_compile=False)
+
+    with pytest.raises(ValueError, match="max_tokens must be a positive integer"):
+        engine.generate("prompt", max_tokens=max_tokens)
+
+    with pytest.raises(ValueError, match="max_tokens must be a positive integer"):
+        engine.generate_baseline("prompt", max_tokens=max_tokens)
+
+    with pytest.raises(ValueError, match="max_tokens must be a positive integer"):
+        next(engine.stream_generate("prompt", max_tokens=max_tokens))
+
+
+def test_speculative_generation_rejects_invalid_gamma_before_model_loading(monkeypatch):
+    speculative = import_speculative_with_fake_mlx(monkeypatch)
+    engine = speculative.SpeculativeEngine(lazy_load=True, use_compile=False)
+
+    with pytest.raises(ValueError, match="gamma must be a positive integer"):
+        engine.generate("prompt", gamma=0)
+
+    with pytest.raises(ValueError, match="gamma must be a positive integer"):
+        next(engine.stream_generate("prompt", gamma=0))
 
 
 def test_api_metrics_do_not_report_jit_active_for_request_only(monkeypatch):

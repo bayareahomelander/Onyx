@@ -17,6 +17,11 @@ if onyx.RUST_AVAILABLE:
         pass
 
 
+def _validate_positive_integer(name: str, value: int) -> None:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError(f"{name} must be a positive integer")
+
+
 class BaseKVCache(ABC):
     
     @abstractmethod
@@ -207,6 +212,8 @@ class OnyxEngine:
         stop_tokens: Optional[List[int]] = None,
         regex: Optional[str] = None,
     ) -> Tuple[str, dict]:
+        _validate_positive_integer("max_tokens", max_tokens)
+
         if self.model is None:
             self.load_model()
         
@@ -296,12 +303,15 @@ class OnyxEngine:
             if grammar_constraint.is_match_state(grammar_state):
                 grammar_complete = True
         
-        should_continue = token_id not in stop_tokens
-        
+        finish_reason = None
         if grammar_complete:
-            should_continue = False
+            finish_reason = "grammar_complete"
+        elif token_id in stop_tokens:
+            finish_reason = "stop"
+        elif len(generated_tokens) >= max_tokens:
+            finish_reason = "length"
         
-        if should_continue:
+        if finish_reason is None:
             for _ in range(max_tokens - 1):
                 input_ids = mx.array([[token_id]])
                 
@@ -331,9 +341,15 @@ class OnyxEngine:
                     grammar_state = grammar_constraint.advance_state(grammar_state, token_id)
                     grammar_constraint.release_state(previous_state)
                     if grammar_constraint.is_match_state(grammar_state):
+                        finish_reason = "grammar_complete"
                         break
                 
                 if token_id in stop_tokens:
+                    finish_reason = "stop"
+                    break
+
+                if len(generated_tokens) >= max_tokens:
+                    finish_reason = "length"
                     break
         
         generation_end = time.perf_counter()
@@ -341,6 +357,7 @@ class OnyxEngine:
         output_text = self.tokenizer.decode(generated_tokens)
         
         metrics["generated_tokens"] = len(generated_tokens)
+        metrics["finish_reason"] = finish_reason or "stop"
         metrics["generation_time"] = generation_end - generation_start
         if metrics["generated_tokens"] > 0:
             metrics["tokens_per_second"] = (
@@ -362,6 +379,8 @@ class OnyxEngine:
         stop_tokens: Optional[List[int]] = None,
         regex: Optional[str] = None,
     ) -> Generator[Tuple[str, Optional[dict]], None, None]:
+        _validate_positive_integer("max_tokens", max_tokens)
+
         if self.model is None:
             self.load_model()
         
@@ -444,11 +463,15 @@ class OnyxEngine:
         token_text = self.tokenizer.decode([token_id])
         yield token_text, None
         
-        should_continue = token_id not in stop_tokens
+        finish_reason = None
         if grammar_complete:
-            should_continue = False
+            finish_reason = "grammar_complete"
+        elif token_id in stop_tokens:
+            finish_reason = "stop"
+        elif metrics["generated_tokens"] >= max_tokens:
+            finish_reason = "length"
         
-        if should_continue:
+        if finish_reason is None:
             for _ in range(max_tokens - 1):
                 input_ids = mx.array([[token_id]])
                 logits = self.model(input_ids, cache=cache_list)
@@ -480,11 +503,17 @@ class OnyxEngine:
                 yield token_text, None
                 
                 if grammar_constraint is not None and grammar_constraint.is_match_state(grammar_state):
+                    finish_reason = "grammar_complete"
                     break
                 if token_id in stop_tokens:
+                    finish_reason = "stop"
+                    break
+                if metrics["generated_tokens"] >= max_tokens:
+                    finish_reason = "length"
                     break
         
         generation_end = time.perf_counter()
+        metrics["finish_reason"] = finish_reason or "stop"
         metrics["generation_time"] = generation_end - generation_start
         if metrics["generated_tokens"] > 0:
             metrics["tokens_per_second"] = (

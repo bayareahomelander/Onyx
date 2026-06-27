@@ -24,6 +24,7 @@ class ChatCompletionRequest(BaseModel):
     )
     max_tokens: Optional[int] = Field(
         default=256,
+        gt=0,
         description="Maximum number of tokens to generate"
     )
     temperature: Optional[float] = Field(
@@ -292,10 +293,11 @@ def create_streaming_response(
         stop_tokens = resolve_stop_tokens(request.stop, engine.tokenizer)
         pending_text = ""
         stopped_by_stop = False
+        finish_reason = "stop"
         
         for token_text, metrics in engine.stream_generate(
             prompt=prompt,
-            max_tokens=request.max_tokens or 256,
+            max_tokens=request.max_tokens if request.max_tokens is not None else 256,
             gamma=4,
             regex=request.regex,
             json_schema=json_schema_str,
@@ -305,6 +307,7 @@ def create_streaming_response(
             stop_tokens=stop_tokens,
         ):
             if metrics is not None:
+                finish_reason = metrics.get("finish_reason", "stop")
                 if pending_text and not stopped_by_stop:
                     chunk = ChatCompletionChunk(
                         id=completion_id,
@@ -352,7 +355,7 @@ def create_streaming_response(
                 ChatCompletionChunkChoice(
                     index=0,
                     delta=ChatCompletionChunkDelta(),
-                    finish_reason="stop",
+                    finish_reason=finish_reason,
                 )
             ],
         )
@@ -434,7 +437,7 @@ async def create_chat_completion(request: ChatCompletionRequest):
         for index in range(request.n or 1):
             output, metrics = engine.generate(
                 prompt=prompt,
-                max_tokens=request.max_tokens or 256,
+                max_tokens=request.max_tokens if request.max_tokens is not None else 256,
                 gamma=4,
                 regex=request.regex,
                 json_schema=json_schema_str,
@@ -457,7 +460,7 @@ async def create_chat_completion(request: ChatCompletionRequest):
                 ChatCompletionChoice(
                     index=index,
                     message=ChatMessage(role="assistant", content=output),
-                    finish_reason="grammar_complete" if grammar_active else "stop",
+                    finish_reason=metrics.get("finish_reason", "stop"),
                 )
             )
 

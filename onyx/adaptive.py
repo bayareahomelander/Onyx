@@ -13,7 +13,12 @@ import time
 import mlx.core as mx
 
 from onyx.adaptive_controller import AdaptiveGammaConfig, AdaptiveGammaController
-from onyx.speculative import SpeculativeEngine, _GrammarConstraint
+from onyx.speculative import (
+    SpeculativeEngine,
+    _GrammarConstraint,
+    _draft_token_budget,
+    _validate_positive_integer,
+)
 
 
 class AdaptiveSpeculativeEngine(SpeculativeEngine):
@@ -34,6 +39,8 @@ class AdaptiveSpeculativeEngine(SpeculativeEngine):
         draft_grammar_aware: bool = True,
         controller_config: Optional[AdaptiveGammaConfig] = None,
     ) -> Tuple[str, dict]:
+        _validate_positive_integer("max_tokens", max_tokens)
+
         if self.draft_model is None or self.target_model is None:
             self.load_models()
 
@@ -135,7 +142,15 @@ class AdaptiveSpeculativeEngine(SpeculativeEngine):
             if grammar_constraint.is_match_state(grammar_state):
                 grammar_complete = True
 
-        if token_id not in stop_tokens and not grammar_complete:
+        finish_reason = None
+        if grammar_complete:
+            finish_reason = "grammar_complete"
+        elif token_id in stop_tokens:
+            finish_reason = "stop"
+        elif len(generated_tokens) >= max_tokens:
+            finish_reason = "length"
+
+        if finish_reason is None:
             while len(generated_tokens) < max_tokens:
                 metrics["speculative_iterations"] += 1
 
@@ -156,7 +171,8 @@ class AdaptiveSpeculativeEngine(SpeculativeEngine):
                 draft_logits = self.draft_model(draft_input, cache=self.draft_cache)
                 mx.eval(draft_logits)
 
-                for _ in range(gamma):
+                draft_budget = _draft_token_budget(max_tokens, len(generated_tokens), gamma)
+                for _ in range(draft_budget):
                     draft_last_logits = draft_logits[:, -1, :]
 
                     if grammar_constraint is not None and draft_grammar_aware:
@@ -203,6 +219,7 @@ class AdaptiveSpeculativeEngine(SpeculativeEngine):
                         mask_time=0.0,
                     )
                     metrics["controller_time_total"] += time.perf_counter() - controller_start
+                    finish_reason = "stop"
                     break
 
                 verify_sequence = [current_token] + draft_tokens
@@ -297,16 +314,22 @@ class AdaptiveSpeculativeEngine(SpeculativeEngine):
                 if generated_tokens:
                     token_id = generated_tokens[-1]
 
-                    if token_id in stop_tokens or grammar_complete:
+                    if grammar_complete:
+                        finish_reason = "grammar_complete"
+                        break
+                    if token_id in stop_tokens:
+                        finish_reason = "stop"
                         break
 
                 if len(generated_tokens) >= max_tokens:
+                    finish_reason = "length"
                     break
 
         generation_end = time.perf_counter()
         output_text = self.tokenizer.decode(generated_tokens)
 
         metrics["generated_tokens"] = len(generated_tokens)
+        metrics["finish_reason"] = finish_reason or "stop"
         metrics["generation_time"] = generation_end - generation_start
 
         if metrics["generated_tokens"] > 0:

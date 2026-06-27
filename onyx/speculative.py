@@ -75,6 +75,16 @@ def _trim_stop_suffix(tokens: List[int], stop_sequences: List[List[int]]) -> Lis
     return tokens[:-len(matched)]
 
 
+def _validate_positive_integer(name: str, value: int) -> None:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError(f"{name} must be a positive integer")
+
+
+def _draft_token_budget(max_tokens: int, generated_count: int, gamma: int) -> int:
+    """Return the draft budget without allowing generation past max_tokens."""
+    return min(gamma, max_tokens - generated_count)
+
+
 class SpeculativeEngine:
     """
     speculative decoding engine using draft-verify pattern
@@ -384,6 +394,9 @@ class SpeculativeEngine:
             draft_grammar_aware: If True and grammar is provided, the draft model also uses grammar constraints;
                                  if False, draft is unconstrained for comparison benchmarks.
         """
+        _validate_positive_integer("max_tokens", max_tokens)
+        _validate_positive_integer("gamma", gamma)
+
         if self.draft_model is None or self.target_model is None:
             self.load_models()
         
@@ -485,9 +498,15 @@ class SpeculativeEngine:
             if grammar_constraint.is_match_state(grammar_state):
                 grammar_complete = True
         
-        if _has_stop_suffix(generated_tokens, stop_sequences) or grammar_complete:
-            pass
-        else:
+        finish_reason = None
+        if grammar_complete:
+            finish_reason = "grammar_complete"
+        elif _has_stop_suffix(generated_tokens, stop_sequences):
+            finish_reason = "stop"
+        elif len(generated_tokens) >= max_tokens:
+            finish_reason = "length"
+
+        if finish_reason is None:
             while len(generated_tokens) < max_tokens:
                 metrics["speculative_iterations"] += 1
                 
@@ -504,7 +523,8 @@ class SpeculativeEngine:
                 draft_logits = self.draft_model(draft_input, cache=self.draft_cache)
                 mx.eval(draft_logits)
                 
-                for _ in range(gamma):
+                draft_budget = _draft_token_budget(max_tokens, len(generated_tokens), gamma)
+                for _ in range(draft_budget):
                     draft_last_logits = draft_logits[:, -1, :]
                     
                     if grammar_constraint is not None and draft_grammar_aware:
@@ -540,6 +560,7 @@ class SpeculativeEngine:
                 metrics["draft_tokens_proposed"] += len(draft_tokens)
                 
                 if not draft_tokens:
+                    finish_reason = "stop"
                     break
                 
                 verify_sequence = [current_token] + draft_tokens
@@ -618,10 +639,15 @@ class SpeculativeEngine:
                 if generated_tokens:
                     token_id = generated_tokens[-1]
                     
-                    if _has_stop_suffix(generated_tokens, stop_sequences) or grammar_complete:
+                    if grammar_complete:
+                        finish_reason = "grammar_complete"
+                        break
+                    if _has_stop_suffix(generated_tokens, stop_sequences):
+                        finish_reason = "stop"
                         break
                 
                 if len(generated_tokens) >= max_tokens:
+                    finish_reason = "length"
                     break
         
         generation_end = time.perf_counter()
@@ -630,6 +656,7 @@ class SpeculativeEngine:
         output_text = self.tokenizer.decode(output_tokens) if output_tokens else ""
         
         metrics["generated_tokens"] = len(output_tokens)
+        metrics["finish_reason"] = finish_reason or "stop"
         metrics["generation_time"] = generation_end - generation_start
         
         if metrics["generated_tokens"] > 0:
@@ -676,6 +703,8 @@ class SpeculativeEngine:
             
         returns a tuple of (generated_text, metrics_dict)
         """
+        _validate_positive_integer("max_tokens", max_tokens)
+
         if self.target_model is None:
             self.load_models()
         
@@ -768,7 +797,15 @@ class SpeculativeEngine:
             if grammar_constraint.is_match_state(grammar_state):
                 grammar_complete = True
         
-        if not _has_stop_suffix(generated_tokens, stop_sequences) and not grammar_complete:
+        finish_reason = None
+        if grammar_complete:
+            finish_reason = "grammar_complete"
+        elif _has_stop_suffix(generated_tokens, stop_sequences):
+            finish_reason = "stop"
+        elif len(generated_tokens) >= max_tokens:
+            finish_reason = "length"
+
+        if finish_reason is None:
             for _ in range(max_tokens - 1):
                 input_ids = mx.array([[token_id]])
                 logits = self.target_model(input_ids, cache=self.target_cache)
@@ -780,6 +817,7 @@ class SpeculativeEngine:
                     mask_times.append(time.perf_counter() - mask_start)
                     
                     if not valid_tokens:
+                        finish_reason = "stop"
                         break
                     
                     last_logits = self._apply_grammar_mask(last_logits, valid_tokens)
@@ -795,9 +833,15 @@ class SpeculativeEngine:
                     grammar_state = grammar_constraint.advance_state(grammar_state, token_id)
                     grammar_constraint.release_state(previous_state)
                     if grammar_constraint.is_match_state(grammar_state):
+                        finish_reason = "grammar_complete"
                         break
                 
                 if _has_stop_suffix(generated_tokens, stop_sequences):
+                    finish_reason = "stop"
+                    break
+
+                if len(generated_tokens) >= max_tokens:
+                    finish_reason = "length"
                     break
         
         generation_end = time.perf_counter()
@@ -806,6 +850,7 @@ class SpeculativeEngine:
         output_text = self.tokenizer.decode(output_tokens) if output_tokens else ""
         
         metrics["generated_tokens"] = len(output_tokens)
+        metrics["finish_reason"] = finish_reason or "stop"
         metrics["generation_time"] = generation_end - generation_start
         
         if metrics["generated_tokens"] > 0:
@@ -832,6 +877,9 @@ class SpeculativeEngine:
         temperature: float = 0.0,
         top_p: float = 1.0,
     ) -> Generator[Tuple[str, Optional[dict]], None, None]:
+        _validate_positive_integer("max_tokens", max_tokens)
+        _validate_positive_integer("gamma", gamma)
+
         if self.draft_model is None or self.target_model is None:
             self.load_models()
 
@@ -926,7 +974,15 @@ class SpeculativeEngine:
 
         yield self.tokenizer.decode([token_id]), None
 
-        if not _has_stop_suffix(generated_tokens, stop_sequences) and not grammar_complete:
+        finish_reason = None
+        if grammar_complete:
+            finish_reason = "grammar_complete"
+        elif _has_stop_suffix(generated_tokens, stop_sequences):
+            finish_reason = "stop"
+        elif len(generated_tokens) >= max_tokens:
+            finish_reason = "length"
+
+        if finish_reason is None:
             while len(generated_tokens) < max_tokens:
                 metrics["speculative_iterations"] += 1
 
@@ -942,7 +998,8 @@ class SpeculativeEngine:
                 draft_logits = self.draft_model(draft_input, cache=self.draft_cache)
                 mx.eval(draft_logits)
 
-                for _ in range(gamma):
+                draft_budget = _draft_token_budget(max_tokens, len(generated_tokens), gamma)
+                for _ in range(draft_budget):
                     draft_last_logits = draft_logits[:, -1, :]
 
                     if grammar_constraint is not None and draft_grammar_aware:
@@ -978,6 +1035,7 @@ class SpeculativeEngine:
                 metrics["draft_tokens_proposed"] += len(draft_tokens)
 
                 if not draft_tokens:
+                    finish_reason = "stop"
                     break
 
                 verify_sequence = [current_token] + draft_tokens
@@ -1058,16 +1116,22 @@ class SpeculativeEngine:
                 if generated_tokens:
                     token_id = generated_tokens[-1]
 
-                    if _has_stop_suffix(generated_tokens, stop_sequences) or grammar_complete:
+                    if grammar_complete:
+                        finish_reason = "grammar_complete"
+                        break
+                    if _has_stop_suffix(generated_tokens, stop_sequences):
+                        finish_reason = "stop"
                         break
 
                 if len(generated_tokens) >= max_tokens:
+                    finish_reason = "length"
                     break
 
         generation_end = time.perf_counter()
 
         output_tokens = _trim_stop_suffix(generated_tokens, stop_sequences)
         metrics["generated_tokens"] = len(output_tokens)
+        metrics["finish_reason"] = finish_reason or "stop"
         metrics["generation_time"] = generation_end - generation_start
 
         if metrics["generated_tokens"] > 0:
