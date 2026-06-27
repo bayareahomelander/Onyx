@@ -2,7 +2,7 @@
 
 ## Abstract
 
-Large language models frequently fail to produce syntactically valid structured outputs, creating reliability challenges for agentic applications that depend on parseable JSON, SQL, or domain-specific formats. We present a method that combines grammar-constrained decoding with speculative execution to address both reliability and latency concerns. Our approach applies grammar constraints—both DFA-based regex enforcement and a stack-based JSON Schema engine—to both draft and target models in a speculative decoding pipeline, ensuring that proposed tokens are grammatically valid before verification. The JSON Schema engine supports nested objects, typed arrays, union types, enum restrictions, regex patterns on string fields, and length constraints, enabling structure-aware generation beyond regular languages. Experiments on Apple Silicon hardware demonstrate that this "grammar-aware" speculation achieves 100% output compliance while providing measurable speedups on memory-bandwidth-bound models. With an 8B parameter target model, we observe a 1.09x throughput improvement over single-model constrained generation. We also report that smaller compute-bound models (1.5B) do not benefit from speculation, achieving 0.94x of baseline performance—an expected result given the different bottleneck characteristics. These findings suggest that grammar-aware speculative decoding offers a practical path toward reliable structured generation at scale, though its benefits are contingent on model size and hardware constraints.
+Large language models frequently fail to produce syntactically valid structured outputs, creating reliability challenges for applications that depend on parseable JSON or domain-specific formats. We present a prototype that combines grammar-constrained decoding with speculative execution. Our approach applies constraints—DFA-based regex enforcement and a stack-based JSON Schema subset—to both draft and target models before verification. The supported JSON subset includes nested objects, typed arrays, union types, enum restrictions, regex patterns on string fields, and length constraints. Recorded Apple Silicon experiments reported compliant output for the evaluated cases and workload-dependent performance: an 8B year-pattern run reached 18.9 tok/s versus a 17.4 tok/s constrained baseline (1.09x), while the 1.5B run reached 0.94x of baseline. These measurements describe the tested hardware, models, patterns, and benchmark scripts; they are not universal performance or compliance guarantees.
 
 ---
 
@@ -71,7 +71,7 @@ The grammar engine is implemented in Rust for performance and exposed to Python 
 - **Length constraints**: `minLength`/`maxLength` for strings (blocking close quote or new characters), `minItems`/`maxItems` for arrays (blocking close bracket or new items)
 - **Typed array items**: Schema enforcement applied to every array element via the item blueprint
 
-In both modes, the key operation is `get_valid_token_ids(state)`, which returns all token IDs that, when appended to the current generation, would lead to a valid state. In v0.2.0, this operation was refactored to use a zero-copy state architecture based on `Arc` (Atomic Reference Counting) pointers. By sharing read-only structures like schema blueprints and DFAs across all token evaluation paths, we eliminated the overhead of deep-cloning complex heap-allocated data structures thousands of times per generation step. This has significantly reduced the latency floor for vocabulary masking, which now completes in approximately 270-500 microseconds for a 151,000-token vocabulary—an acceptable overhead for generation loops running at 20-200 tokens per second.
+In both modes, the key operation is `get_valid_token_ids(state)`, which returns token IDs that can continue from the current state. In v0.2.0, state cloning was refactored to share read-only schema blueprints and DFAs through `Arc` (Atomic Reference Counting) pointers instead of deep-cloning those structures. The recorded benchmark measured approximately 270-500 microseconds per full-vocabulary mask for a 151,000-token vocabulary; this figure is specific to that benchmark environment.
 
 ### 2.3 Speculative Decoding with Grammar Awareness
 
@@ -164,7 +164,7 @@ The critical insight is that grammar state is maintained separately from model s
 
 ### 2.4 Paged KV Cache
 
-To support efficient rollback, we implemented a paged KV cache that stores key-value tensors in fixed-size blocks (default 16 tokens). Rollback operations simply update a length counter and discard block pointers—O(1) complexity with no memory copies. This is important for speculative decoding where rollbacks occur frequently.
+To support rollback, we implemented a paged KV cache that stores key-value tensors in fixed-size blocks (default 16 tokens). Rollback scans page-table metadata to find the retained boundary, updates counters, and drops trailing block references without copying retained KV tensor contents. Cache reads still concatenate active blocks into contiguous tensors, so the implementation should not be described as O(1) overall.
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
@@ -205,8 +205,8 @@ To support efficient rollback, we implemented a paged KV cache that stores key-v
 │   │  NULL   │     valid_length = 4  ◄── Just update counter!                │
 │   └─────────┘                                                               │
 │                                                                             │
-│   Complexity: O(1) - update counter, discard block pointer                  │
-│   No memory copies required                                                 │
+│   Complexity: scan retained block metadata, discard trailing references     │
+│   Retained KV tensor contents are not copied during rollback                │
 │                                                                             │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
@@ -270,7 +270,7 @@ The email pattern result is particularly striking: blind drafting achieved 0% ac
 
 Grammar-aware drafting recovers acceptance rates by constraining the draft to the same valid token space as the target. For the year pattern, this achieves 100% acceptance; for the more complex email pattern, acceptance improves to 18.2%.
 
-### 4.2 Throughput on Compute-Bound Models (1.5B Target)
+### 4.2 Throughput on the 1.5B Target
 
 With the 1.5B target model, we observed that grammar-aware speculation does not provide a speedup over baseline:
 
@@ -282,11 +282,11 @@ With the 1.5B target model, we observed that grammar-aware speculation does not 
 | Blind Draft | 57.2 tok/s | 0.78x |
 | Aware Draft | 69.2 tok/s | 0.94x |
 
-The aware draft achieves 94% of baseline performance—a 6% overhead. This result is expected: the 1.5B model is compute-bound rather than memory-bound on our hardware. Speculative decoding's theoretical advantage comes from amortizing memory bandwidth costs across multiple tokens via batched verification. When compute dominates, this advantage does not materialize, and the overhead of running two models produces a net slowdown.
+The aware draft achieves 94% of baseline performance—a 6% overhead. This is consistent with the hypothesis that speculation overhead dominates for this model and workload, but the benchmark did not directly measure the hardware bottleneck.
 
-### 4.3 Throughput on Memory-Bound Models (8B Target)
+### 4.3 Throughput on the 8B Target
 
-The picture changes with a larger, memory-bandwidth-bound target model:
+The recorded result changes with the larger target model:
 
 **Table 3: Throughput Results (8B Target, Year Pattern)**
 
@@ -296,7 +296,7 @@ The picture changes with a larger, memory-bandwidth-bound target model:
 | Blind Draft | 13.4 tok/s | 0.77x |
 | Aware Draft | 18.9 tok/s | 1.09x |
 
-Grammar-aware speculation achieves a **1.04x speedup** (4.0% improvement) over baseline. This confirms the theoretical expectation: when loading model weights dominates inference time, batched verification of multiple draft tokens amortizes the memory bandwidth cost, producing a net speedup despite the overhead of running a draft model.
+Grammar-aware speculation achieves a **1.09x speedup** (approximately 8.6% improvement) over baseline in this run. The result is consistent with the hypothesis that batched verification can help when model-weight loading dominates, but one run does not establish that explanation universally.
 
 The blind draft result (0.77x) demonstrates that without grammar awareness, speculation is counterproductive—the system is slower than simply running the target model alone.
 
@@ -309,33 +309,9 @@ The blind draft result (0.77x) demonstrates that without grammar awareness, spec
 | 1.5B | 73.5 tok/s | 69.2 tok/s | 0.94x |
 | 8B | 17.4 tok/s | 18.9 tok/s | 1.09x |
 
-The crossover point where speculation becomes beneficial occurs somewhere between 1.5B and 8B parameters on our hardware. At 1.5B, the model is fast enough that speculation overhead dominates. At 8B, memory bandwidth dominates, and speculation provides savings.
+The two measurements show a slowdown at 1.5B and a modest speedup at 8B on the tested system. They do not locate a general crossover point or establish that parameter count alone predicts whether speculation helps.
 
-```
-                     Speedup Factor vs Model Size
-                     
-    Speedup │
-            │
-       1.2x │                              ●  (8B+)
-            │                             ╱
-       1.1x │─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─  ─ ─ ─●─ ─ ─ ─ ─ ─ ─ ─
-            │                           ╱   SPEEDUP ZONE
-       1.0x │───────────────────────────●───────────────────────
-            │                         ╱ ▲
-       0.9x │                  ●     ╱  │ Crossover Point
-            │                    ╲  ╱   │ (~3-5B parameters)
-       0.8x │               ●     ╲╱
-            │                ╲
-       0.7x │                 ╲
-            │                  OVERHEAD ZONE
-            └────────────────────────────────────────────────────►
-                   1.5B                    8B       Model Size
-                   
-                 Compute-bound          Memory-bound
-                 (overhead dominates)   (speculation wins)
-```
-
-This suggests that grammar-aware speculative decoding is most applicable to production scenarios using larger models (8B+), which are common for tasks requiring higher output quality.
+Additional model sizes and repeated runs would be required before estimating a crossover region.
 
 ### 4.5 Adaptive Gamma on Longer Constrained Outputs
 
@@ -361,7 +337,7 @@ On the 1.5B target, the same forced-digits task remained slower than baseline de
 
 ### 5.1 Model Size Dependency
 
-The speedup benefits of grammar-aware speculation are contingent on the target model being memory-bandwidth-bound. For smaller models where inference is compute-bound, the approach introduces overhead without corresponding benefit. Practitioners should evaluate their specific model and hardware configuration before adopting this technique.
+The measured benefit is workload- and hardware-dependent. The 1.5B run was slower than baseline while the 8B run was modestly faster, but these two points do not isolate the bottleneck or predict other configurations.
 
 ### 5.2 Grammar Complexity
 
@@ -393,7 +369,7 @@ This work builds on speculative decoding as introduced by Leviathan et al. [1], 
 
 The grammar constraint engine follows the DFA-based vocabulary filtering approach described by Willard and Louf [2], who showed that compiling grammar specifications into deterministic finite automata enables efficient token filtering during generation. We apply this technique to both draft and target models in a speculative pipeline, addressing the "blind draft" problem where unconstrained draft models propose invalid tokens.
 
-The paged KV cache design draws from PagedAttention as introduced by Kwon et al. [4], which demonstrated that block-based memory management enables efficient memory utilization and supports operations like preemption and sharing. We adapt this concept to enable O(1) rollback operations critical for speculative decoding, where rejected draft tokens must be efficiently discarded.
+The paged KV cache design draws from PagedAttention as introduced by Kwon et al. [4], which demonstrated that block-based memory management enables efficient memory utilization and supports operations like preemption and sharing. This prototype adapts block-based storage so rollback can discard trailing references without copying retained KV tensor contents; its metadata work scales with the retained page-table prefix.
 
 All experiments use Apple's MLX framework [3], which provides efficient array operations optimized for Apple Silicon's unified memory architecture.
 
@@ -403,15 +379,15 @@ All experiments use Apple's MLX framework [3], which provides efficient array op
 
 We presented grammar-aware speculative decoding, a technique that integrates grammar constraints into both draft and target models in a speculative decoding pipeline. Our experiments demonstrate that this approach:
 
-1. **Solves the reliability problem**: Constrained generation produces outputs that are guaranteed to match the specified grammar or schema
+1. **Improves evaluated output compliance**: Supported constraints filter invalid continuations, and completed grammar states matched the evaluated patterns and schema subset
 2. **Addresses the blind draft problem**: Applying grammar constraints to the draft model improves acceptance rates from as low as 0% (blind) to 18-100% (aware)
-3. **Provides speedups on memory-bound models**: With an 8B target model, we observed a 1.09x throughput improvement over single-model constrained generation
-4. **Extends beyond regular languages**: The stack-based JSON Schema engine supports nested objects, typed arrays, union types, enum restrictions, regex patterns, and length constraints—enabling structure-aware generation for real-world schemas
-5. **Adapts speculative batch size experimentally**: On an 8B forced-digits benchmark, an adaptive γ controller matched the best fixed γ setting at 1.37x baseline throughput while adjusting γ during generation
+3. **Produced a modest speedup in one 8B run**: The year-pattern benchmark measured 1.09x versus single-model constrained generation
+4. **Supports a structured JSON subset**: The stack-based engine handles nested objects, typed arrays, union types, enum restrictions, regex patterns, and length constraints
+5. **Adapts speculative batch size experimentally**: On the recorded 8B forced-digits benchmark, an adaptive γ controller reached 1.34x baseline throughput while adjusting γ during generation
 
-The approach does not provide speedups for smaller, compute-bound models (0.94x for 1.5B), which is consistent with the theoretical basis of speculative decoding. The technique is most applicable to production deployments using larger models where memory bandwidth is the limiting factor.
+The recorded 1.5B run was slower than baseline (0.94x). More hardware, model sizes, patterns, and repeated trials are needed before generalizing when the technique will help.
 
-These results suggest a practical path toward reliable structured generation in agentic AI systems. By combining grammar constraints with speculative execution, it is possible to achieve both the reliability required for downstream parsing and the low latency required for interactive applications—though the throughput benefits are contingent on appropriate model sizing and hardware configuration.
+These prototype results motivate further evaluation of grammar-aware speculation, but they do not establish production reliability or general performance gains.
 
 ---
 
@@ -438,9 +414,9 @@ These results suggest a practical path toward reliable structured generation in 
 - Aware Draft: 18.9 tok/s (25% acceptance)
 
 **8B Target (Forced Digits Pattern, `[0-9]{32}`)**
-- Baseline: 23.3 tok/s
-- Fixed γ=4: 31.8 tok/s (88.2% acceptance, 1.37x)
-- Adaptive γ: 31.8 tok/s (88.2% acceptance, 1.37x; avg γ=4.2, final γ=8)
+- Baseline: 21.9 tok/s
+- Fixed γ=4: 29.1 tok/s (88.2% acceptance, 1.33x)
+- Adaptive γ: 29.2 tok/s (88.2% acceptance, 1.34x; avg γ=4.2, final γ=8)
 
 **Email Pattern (1.5B Target)**
 - Baseline: 80.7 tok/s

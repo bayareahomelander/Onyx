@@ -8,6 +8,41 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::constraint::ConstraintError;
+use crate::regex_engine::compile_pattern_dfa;
+
+/// Validate regex patterns in the JSON Schema subset supported by JsonEngine.
+pub fn validate_schema_patterns(schema: &Value) -> Result<(), ConstraintError> {
+    fn validate_node(value: &Value, path: &str) -> Result<(), ConstraintError> {
+        if let Some(pattern_value) = value.get("pattern") {
+            let pattern = pattern_value.as_str().ok_or_else(|| {
+                ConstraintError::CompilationError(format!(
+                    "Invalid pattern at {}.pattern: expected a string",
+                    path
+                ))
+            })?;
+            compile_pattern_dfa(pattern).map_err(|error| {
+                ConstraintError::CompilationError(format!(
+                    "Invalid regex pattern at {}.pattern: {}",
+                    path, error
+                ))
+            })?;
+        }
+
+        if let Some(properties) = value.get("properties").and_then(Value::as_object) {
+            for (name, property) in properties {
+                validate_node(property, &format!("{}.properties.{}", path, name))?;
+            }
+        }
+
+        if let Some(items) = value.get("items") {
+            validate_node(items, &format!("{}.items", path))?;
+        }
+
+        Ok(())
+    }
+
+    validate_node(schema, "$")
+}
 
 /// the type of a JSON schema node
 #[derive(Debug, Clone, PartialEq)]
@@ -347,5 +382,36 @@ mod tests {
         assert!(person_prop.schema_types.contains(&SchemaType::Object));
         assert!(person_prop.properties.contains_key("name"));
         assert!(person_prop.properties.contains_key("age"));
+    }
+
+    #[test]
+    fn test_validate_schema_patterns_rejects_invalid_patterns() {
+        let invalid_regex = json!({
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "pattern": "["}
+            }
+        });
+        let non_string_pattern = json!({"type": "string", "pattern": 42});
+        let invalid_array_item_pattern = json!({
+            "type": "array",
+            "items": {"type": "string", "pattern": "["}
+        });
+
+        assert!(matches!(
+            validate_schema_patterns(&invalid_regex),
+            Err(ConstraintError::CompilationError(message))
+                if message.contains("$.properties.name.pattern")
+        ));
+        assert!(matches!(
+            validate_schema_patterns(&non_string_pattern),
+            Err(ConstraintError::CompilationError(message))
+                if message.contains("expected a string")
+        ));
+        assert!(matches!(
+            validate_schema_patterns(&invalid_array_item_pattern),
+            Err(ConstraintError::CompilationError(message))
+                if message.contains("$.items.pattern")
+        ));
     }
 }

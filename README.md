@@ -1,17 +1,15 @@
 # Onyx
 
-![Build](https://img.shields.io/badge/build-passing-brightgreen)
-![License](https://img.shields.io/badge/license-MIT-blue)
 ![Platform](https://img.shields.io/badge/platform-Apple%20Silicon-black)
 ![Python](https://img.shields.io/badge/python-3.12%20recommended-blue)
 
 **Grammar-Aware Speculative Decoding for Structured LLM Outputs on Apple Silicon**
 
-Onyx is an inference engine that enforces structured output constraints (JSON Schema, regex patterns) on language models while maintaining—or exceeding—baseline generation speed. By applying grammar constraints to both draft and target models in a speculative decoding pipeline, Onyx achieves **100% output reliability** with a **1.45x speedup** on memory-bound models (8B+).
+Onyx is a prototype inference engine for grammar-constrained structured output on Apple Silicon. In the recorded 8B year-pattern benchmark, grammar-aware speculation ran at 18.9 tok/s versus a 17.4 tok/s constrained baseline (**1.09x**); results are workload- and hardware-specific.
 
 ## What's New in v0.2.0
-- **Zero-Copy Rust State Architecture:** Radically optimized the Rust grammar engine by replacing deep cloning with `Arc` (Atomic Reference Counting) pointers for schema blueprints and regex automata. This completely eliminates vocabulary masking overhead, significantly raising the baseline generation speed.
-- **Enhanced Benchmark Accuracy:** Fixed strictness in benchmark regex scripts to guarantee forced long-generation tracking.
+- **Shared Rust State Architecture:** Replaced deep cloning with `Arc` (Atomic Reference Counting) pointers for immutable schema blueprints and regex automata, reducing state-cloning overhead during vocabulary masking.
+- **Enhanced Benchmark Accuracy:** Tightened benchmark regex scripts so forced long-generation runs are measured consistently.
 
 ---
 
@@ -19,13 +17,13 @@ Onyx is an inference engine that enforces structured output constraints (JSON Sc
 
 | Configuration | Baseline | Onyx (Aware Draft) | Speedup |
 |---------------|----------|---------------------|---------|
-| 8B Target (memory-bound) | 15.6 tok/s | 22.6 tok/s | **1.45x** |
-| 1.5B Target (compute-bound) | 73.5 tok/s | 69.2 tok/s | 0.94x |
+| 8B Target (year pattern) | 17.4 tok/s | 18.9 tok/s | **1.09x** |
+| 1.5B Target (year pattern) | 73.5 tok/s | 69.2 tok/s | 0.94x |
 
-- **100% Grammar Compliance**: Output always matches the specified schema or pattern
+- **Evaluated Grammar Compliance**: Recorded benchmark cases completed with grammar-compliant output; callers must check for `finish_reason="grammar_complete"`
 - **Adaptive Speculation**: Experimental adaptive γ controller matches the best fixed γ setting on an 8B forced-digits benchmark (29.2 tok/s vs 21.9 tok/s baseline, **1.34x**)
-- **OpenAI-Compatible API**: Drop-in replacement for existing agent frameworks
-- **Full JSON Schema Support**: Nested objects, typed arrays, regex patterns, enums, unions, and length constraints
+- **OpenAI-Shaped API**: Prototype chat-completions and model-list endpoints for local demonstrations
+- **JSON Schema Subset**: Nested objects, typed arrays, regex patterns, enums, unions, and length constraints
 
 ---
 
@@ -90,7 +88,9 @@ curl -X POST http://localhost:8000/v1/chat/completions \
 
 ## JSON Schema Constraints
 
-Onyx includes a structure-aware JSON generation engine built in Rust. It enforces schemas at the token level during generation, guaranteeing that every output is valid JSON matching the specified schema.
+Onyx includes a structure-aware JSON generation engine built in Rust. It enforces the supported schema subset at token level. Output should be treated as schema-complete only when generation returns `finish_reason="grammar_complete"`; length-limited output can be incomplete.
+
+Unsupported keywords—including `$ref`, `additionalProperties`, `oneOf`, `anyOf`, `allOf`, and conditional schemas—are not enforced. Invalid regex values in supported `pattern` fields are rejected during schema compilation.
 
 ### Supported Schema Features
 
@@ -220,7 +220,7 @@ This schema enforces: integer-only IDs, capitalized names via regex, nullable ag
 
 ## Regex Constraints
 
-Enforce regex patterns directly during generation. The output is guaranteed to match.
+Enforce regex patterns directly during generation. A result matches the pattern when generation finishes with `finish_reason="grammar_complete"`; `finish_reason="length"` indicates an incomplete result.
 
 ```python
 from onyx.speculative import SpeculativeEngine
@@ -238,9 +238,9 @@ print(output)  # e.g., "support@example.com"
 
 ---
 
-## OpenAI-Compatible API
+## OpenAI-Shaped API
 
-Use Onyx with any framework that supports the OpenAI API:
+The local prototype accepts the subset of the OpenAI chat-completions shape documented below:
 
 ```python
 import openai
@@ -292,7 +292,7 @@ curl -X POST http://localhost:8000/v1/chat/completions \
 │  │  • JSON Schema Engine (stack-based state machine)      │ │
 │  │  • DFA Compilation (regex-automata)                    │ │
 │  │  • Vocabulary Filtering (O(V) per token)               │ │
-│  │  • State Traversal (~270µs per mask)                   │ │
+│  │  • Full-vocabulary state traversal                    │ │
 │  └────────────────────────────────────────────────────────┘ │
 └─────────────────────────────────────────────────────────────┘
 ```
@@ -302,7 +302,7 @@ curl -X POST http://localhost:8000/v1/chat/completions \
 1. **Compile Grammar**: The JSON schema or regex pattern is compiled into internal state machines (stack-based FSM for JSON, DFA for regex)
 2. **Filter Vocabulary**: At each generation step, only tokens leading to valid states are allowed
 3. **Speculative Decoding**: A small draft model (0.5B) proposes tokens that a larger target model (1.5B/8B) verifies
-4. **Grammar-Aware Drafting**: Both models are constrained to the grammar, ensuring high acceptance rates
+4. **Grammar-Aware Drafting**: Both models are constrained to the grammar, which can improve draft acceptance
 5. **Adaptive Draft Length (Experimental)**: An optional controller adjusts γ based on recent acceptance rate and timing signals
 
 ---
@@ -311,21 +311,21 @@ curl -X POST http://localhost:8000/v1/chat/completions \
 
 All benchmarks run on Apple Silicon with 4-bit quantized Qwen models.
 
-### Acceptance Rate (Grammar: `[0-9]{4}`)
+### Acceptance Rate (1.5B Target)
 
-| Method | 1.5B Target | 8B Target |
-|--------|-------------|-----------|
-| Blind Draft | 75% | 75% |
-| **Aware Draft** | **100%** | **100%** |
+| Pattern | Blind Draft | Aware Draft |
+|---------|-------------|-------------|
+| Year `[0-9]{4}` | 75.0% | 100.0% |
+| Email `[a-z]+@[a-z]+\.com` | 0.0% | 18.2% |
 
 ### Throughput
 
 | Configuration | Baseline | Aware Draft | vs Baseline |
 |---------------|----------|-------------|-------------|
 | 1.5B Target | 73.5 tok/s | 69.2 tok/s | 0.94x |
-| 8B Target | 15.6 tok/s | 22.6 tok/s | **1.45x** |
+| 8B Target | 17.4 tok/s | 18.9 tok/s | **1.09x** |
 
-The crossover point where speculation beats baseline occurs when the target model becomes memory-bandwidth-bound (typically 8B+ parameters).
+These two recorded runs show a slowdown at 1.5B and a modest speedup at 8B. They do not establish a universal crossover model size.
 
 ### Adaptive Gamma Benchmark
 
@@ -347,7 +347,7 @@ In this run, adaptive γ matched the best fixed setting while adjusting during g
 
 ### `POST /v1/chat/completions`
 
-OpenAI-compatible chat completion endpoint.
+OpenAI-shaped chat completion endpoint for the supported prototype fields below.
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
@@ -452,7 +452,7 @@ If you use Onyx in your research, please cite:
 
 ## License
 
-MIT License. See [LICENSE](LICENSE) for details.
+The package metadata declares the project under the MIT License.
 
 ---
 

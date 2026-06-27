@@ -109,7 +109,7 @@ class SpeculativeEngine:
     
     supports two cache modes:
     - "naive": uses mlx_lm's default KVCache (array slicing for rollback)
-    - "paged": uses PagedKVCache with O(1) zero-copy rollback
+    - "paged": uses block-structured rollback without copying retained KV tensors
     """
     
     DRAFT_MODEL = "mlx-community/Qwen2.5-0.5B-Instruct-4bit"
@@ -261,12 +261,12 @@ class SpeculativeEngine:
         """
         rollback cache to a valid length.
         
-        for PagedKVCache: O(1) operation via rollback_to()
+        for PagedKVCache: scans block metadata via rollback_to()
         for NaiveKVCache: adjusts offset
         """
         for layer_cache in cache:
             if isinstance(layer_cache, PagedKVCache):
-                # O(1) rollback - just update counters and discard block pointers
+                # Roll back metadata and discard trailing block references.
                 layer_cache.rollback_to(valid_length)
             elif hasattr(layer_cache, 'offset'):
                 layer_cache.offset = valid_length

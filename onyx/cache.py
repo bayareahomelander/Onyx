@@ -2,10 +2,11 @@
 onyx paged kv cache
 
 memory-efficient kv cache implementation using fixed-size blocks (pages)
-to support zero-copy rollbacks for speculative decoding.
+to roll back speculative tokens without copying retained kv tensor contents.
 
-the key innovation is that rollback is o(1) - just update counters and
-discard block pointers, no memory copies required.
+rollback scans page-table metadata to find the retained boundary, updates
+counters, and drops trailing block references. cache reads still concatenate
+active blocks into contiguous tensors.
 """
 
 from typing import Optional, List, Tuple
@@ -48,7 +49,7 @@ class CacheBlock:
 
 class PagedKVCache:
     """
-    paged kv cache with o(1) rollback support.
+    paged kv cache with block-metadata rollback support.
     
     instead of storing all kv states in one monolithic tensor that requires
     copying on rollback, this implementation uses fixed-size blocks (pages).
@@ -56,8 +57,8 @@ class PagedKVCache:
     key features:
     - fixed block size (default 16 tokens per block)
     - page table maintains list of allocated blocks
-    - rollback is o(1): update valid_length counter and discard block pointers
-    - no memory copies on rollback
+    - rollback scans retained block metadata and discards trailing block pointers
+    - retained kv tensor contents are not copied during rollback
     
     this is critical for speculative decoding where we frequently need to
     roll back rejected draft tokens.
@@ -196,8 +197,9 @@ class PagedKVCache:
         """
         roll back the cache by discarding the last num_tokens.
         
-        this is o(1) operation - just update counters and potentially
-        discard block pointers. no memory copies!
+        this scans page-table metadata up to the retained boundary, then updates
+        counters and discards trailing block references. retained kv tensor
+        contents are not copied.
         
         args:
             num_tokens: number of tokens to remove from the end
@@ -288,7 +290,7 @@ def make_paged_cache(model, block_size: int = 16) -> List[PagedKVCache]:
     """
     create a list of pagedkvcache objects for each layer of the model.
     
-    this is a drop-in replacement for mlx_lm's make_prompt_cache.
+    the returned cache objects implement the model-cache interface used by this prototype.
     
     args:
         model: the language model

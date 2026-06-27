@@ -1,5 +1,4 @@
 import statistics
-import time
 from datetime import datetime
 from typing import Dict, List, Optional, Any
 
@@ -195,13 +194,25 @@ class Evaluator:
         ]
         
         if cache_mode == "paged":
-            lines.append(f"PagedKVCache performed {total_rollbacks} O(1) rollback operations during generation.")
-            lines.append("Rollback complexity: O(1) - counter update and block pointer discard, no memory copies.")
+            lines.append(
+                f"PagedKVCache performed {total_rollbacks} block-metadata rollback operations "
+                "during generation."
+            )
+            lines.append(
+                "Rollback scans retained block metadata and drops trailing references "
+                "without copying retained KV tensor contents."
+            )
         
         if speedup > 1.0:
-            lines.append("This confirms that memory bandwidth savings from speculative decoding outweigh the compute cost of running two models.")
+            lines.append(
+                "Speculative throughput exceeded baseline in this recorded run; "
+                "the benchmark does not isolate the cause."
+            )
         else:
-            lines.append("Speculative decoding did not achieve a speedup in this configuration. This may be due to low acceptance rate or insufficient model size difference.")
+            lines.append(
+                "Speculative decoding did not exceed baseline in this recorded run; "
+                "the benchmark does not isolate the cause."
+            )
         
         lines.append("")
         with open("metrics_log.txt", "a") as f:

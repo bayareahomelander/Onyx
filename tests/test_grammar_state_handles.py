@@ -1,3 +1,5 @@
+import pytest
+
 from onyx._rust import GrammarConstraint
 
 
@@ -55,3 +57,10 @@ def test_unknown_state_handle_raises_value_error():
         assert "Unknown grammar state handle" in str(exc)
     else:
         raise AssertionError("unknown state handle did not raise")
+
+
+def test_json_schema_rejects_invalid_regex_pattern():
+    constraint = GrammarConstraint([b'"', b"A"])
+
+    with pytest.raises(ValueError, match="Invalid regex pattern"):
+        constraint.compile_json_schema('{"type":"string","pattern":"["}')

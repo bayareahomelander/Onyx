@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use crate::constraint::{ConstraintEngine, ConstraintError};
 use crate::regex_engine::compile_pattern_dfa;
-use crate::schema::{PropertyBlueprint, SchemaBlueprint, SchemaType};
+use crate::schema::{validate_schema_patterns, PropertyBlueprint, SchemaBlueprint, SchemaType};
 
 /// syntax state within an object scope
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -265,6 +265,7 @@ impl JsonEngine {
         let schema: Value = serde_json::from_str(schema_str).map_err(|e| {
             ConstraintError::CompilationError(format!("Invalid JSON schema: {}", e))
         })?;
+        validate_schema_patterns(&schema)?;
 
         let root_blueprint = Arc::new(SchemaBlueprint::from_value(&schema)?);
         let root_value_blueprint = Arc::new(PropertyBlueprint::from_value("_root", &schema));
@@ -1819,8 +1820,7 @@ mod tests {
             b",".to_vec(),     // 3
             b"\"b\"".to_vec(), // 4
         ];
-        let schema =
-            r#"{"type":"array","minItems":2,"maxItems":2,"items":{"type":"string"}}"#;
+        let schema = r#"{"type":"array","minItems":2,"maxItems":2,"items":{"type":"string"}}"#;
         let mut engine = JsonEngine::new(vocab, schema).unwrap();
 
         engine.advance(0).unwrap(); // '['

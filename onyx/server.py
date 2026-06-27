@@ -159,7 +159,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Onyx API",
-    description="OpenAI-compatible API for grammar-aware speculative decoding",
+    description="OpenAI-shaped prototype API for grammar-aware speculative decoding",
     version="0.2.0",
     lifespan=lifespan,
 )
