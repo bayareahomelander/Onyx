@@ -29,11 +29,186 @@ pub enum ObjectSyntaxState {
     ExpectCommaOrEnd,
 }
 
-/// state for parsing a json string value
+#[derive(Debug, Clone, Copy)]
+enum StringEscapeState {
+    None,
+    AfterBackslash,
+    Unicode { value: u16, digits: u8 },
+    ExpectLowSurrogateBackslash { high: u16 },
+    ExpectLowSurrogateU { high: u16 },
+    LowSurrogate { high: u16, value: u16, digits: u8 },
+}
+
 #[derive(Debug, Clone)]
+pub(crate) struct JsonStringDecoder {
+    escape_state: StringEscapeState,
+    utf8_pending: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum StringByteEvent {
+    Pending,
+    Character(char),
+    End,
+}
+
+impl Default for JsonStringDecoder {
+    fn default() -> Self {
+        Self {
+            escape_state: StringEscapeState::None,
+            utf8_pending: Vec::new(),
+        }
+    }
+}
+
+impl JsonStringDecoder {
+    fn is_at_character_boundary(&self) -> bool {
+        matches!(self.escape_state, StringEscapeState::None) && self.utf8_pending.is_empty()
+    }
+
+    fn hex_value(byte: u8) -> Option<u16> {
+        match byte {
+            b'0'..=b'9' => Some((byte - b'0') as u16),
+            b'a'..=b'f' => Some((byte - b'a' + 10) as u16),
+            b'A'..=b'F' => Some((byte - b'A' + 10) as u16),
+            _ => None,
+        }
+    }
+
+    fn consume_utf8_byte(&mut self, byte: u8) -> Result<StringByteEvent, ()> {
+        self.utf8_pending.push(byte);
+        match std::str::from_utf8(&self.utf8_pending) {
+            Ok(text) => {
+                let mut chars = text.chars();
+                let value = chars.next().ok_or(())?;
+                if chars.next().is_some() {
+                    return Err(());
+                }
+                self.utf8_pending.clear();
+                Ok(StringByteEvent::Character(value))
+            }
+            Err(error) if error.error_len().is_none() => Ok(StringByteEvent::Pending),
+            Err(_) => Err(()),
+        }
+    }
+
+    fn finish_unicode_escape(&mut self, value: u16) -> Result<StringByteEvent, ()> {
+        if (0xD800..=0xDBFF).contains(&value) {
+            self.escape_state = StringEscapeState::ExpectLowSurrogateBackslash { high: value };
+            return Ok(StringByteEvent::Pending);
+        }
+        if (0xDC00..=0xDFFF).contains(&value) {
+            return Err(());
+        }
+
+        self.escape_state = StringEscapeState::None;
+        char::from_u32(value as u32)
+            .map(StringByteEvent::Character)
+            .ok_or(())
+    }
+
+    fn consume(&mut self, byte: u8) -> Result<StringByteEvent, ()> {
+        match self.escape_state {
+            StringEscapeState::None => {
+                if !self.utf8_pending.is_empty() {
+                    return self.consume_utf8_byte(byte);
+                }
+                match byte {
+                    b'"' => Ok(StringByteEvent::End),
+                    b'\\' => {
+                        self.escape_state = StringEscapeState::AfterBackslash;
+                        Ok(StringByteEvent::Pending)
+                    }
+                    0x00..=0x1F => Err(()),
+                    0x20..=0x7F => Ok(StringByteEvent::Character(byte as char)),
+                    _ => self.consume_utf8_byte(byte),
+                }
+            }
+            StringEscapeState::AfterBackslash => {
+                self.escape_state = StringEscapeState::None;
+                match byte {
+                    b'"' => Ok(StringByteEvent::Character('"')),
+                    b'\\' => Ok(StringByteEvent::Character('\\')),
+                    b'/' => Ok(StringByteEvent::Character('/')),
+                    b'b' => Ok(StringByteEvent::Character('\u{0008}')),
+                    b'f' => Ok(StringByteEvent::Character('\u{000C}')),
+                    b'n' => Ok(StringByteEvent::Character('\n')),
+                    b'r' => Ok(StringByteEvent::Character('\r')),
+                    b't' => Ok(StringByteEvent::Character('\t')),
+                    b'u' => {
+                        self.escape_state = StringEscapeState::Unicode {
+                            value: 0,
+                            digits: 0,
+                        };
+                        Ok(StringByteEvent::Pending)
+                    }
+                    _ => Err(()),
+                }
+            }
+            StringEscapeState::Unicode { value, digits } => {
+                let digit = Self::hex_value(byte).ok_or(())?;
+                let value = (value << 4) | digit;
+                let digits = digits + 1;
+                if digits == 4 {
+                    self.finish_unicode_escape(value)
+                } else {
+                    self.escape_state = StringEscapeState::Unicode { value, digits };
+                    Ok(StringByteEvent::Pending)
+                }
+            }
+            StringEscapeState::ExpectLowSurrogateBackslash { high } => {
+                if byte != b'\\' {
+                    return Err(());
+                }
+                self.escape_state = StringEscapeState::ExpectLowSurrogateU { high };
+                Ok(StringByteEvent::Pending)
+            }
+            StringEscapeState::ExpectLowSurrogateU { high } => {
+                if byte != b'u' {
+                    return Err(());
+                }
+                self.escape_state = StringEscapeState::LowSurrogate {
+                    high,
+                    value: 0,
+                    digits: 0,
+                };
+                Ok(StringByteEvent::Pending)
+            }
+            StringEscapeState::LowSurrogate {
+                high,
+                value,
+                digits,
+            } => {
+                let digit = Self::hex_value(byte).ok_or(())?;
+                let value = (value << 4) | digit;
+                let digits = digits + 1;
+                if digits != 4 {
+                    self.escape_state = StringEscapeState::LowSurrogate {
+                        high,
+                        value,
+                        digits,
+                    };
+                    return Ok(StringByteEvent::Pending);
+                }
+                if !(0xDC00..=0xDFFF).contains(&value) {
+                    return Err(());
+                }
+
+                let scalar = 0x10000 + (((high as u32) - 0xD800) << 10) + ((value as u32) - 0xDC00);
+                self.escape_state = StringEscapeState::None;
+                char::from_u32(scalar)
+                    .map(StringByteEvent::Character)
+                    .ok_or(())
+            }
+        }
+    }
+}
+
+/// state for parsing a json string value
+#[derive(Debug, Clone, Default)]
 pub struct StringState {
-    /// in escape sequence
-    in_escape: bool,
+    /// incremental JSON string decoder
+    decoder: JsonStringDecoder,
     /// compiled dfa for pattern validation
     pattern_dfa: Option<Arc<dense::DFA<Vec<u32>>>>,
     /// current dfa state
@@ -46,24 +221,11 @@ pub struct StringState {
     max_length: Option<usize>,
 }
 
-impl Default for StringState {
-    fn default() -> Self {
-        StringState {
-            in_escape: false,
-            pattern_dfa: None,
-            dfa_state: None,
-            char_count: 0,
-            min_length: None,
-            max_length: None,
-        }
-    }
-}
-
 impl StringState {
     /// new string state with opening quote seen
     pub fn new_started() -> Self {
         StringState {
-            in_escape: false,
+            decoder: JsonStringDecoder::default(),
             pattern_dfa: None,
             dfa_state: None,
             char_count: 0,
@@ -76,7 +238,7 @@ impl StringState {
     pub fn with_pattern(pattern: &str) -> Self {
         match compile_pattern_dfa(pattern) {
             Ok(compiled) => StringState {
-                in_escape: false,
+                decoder: JsonStringDecoder::default(),
                 pattern_dfa: Some(Arc::new(compiled.dfa)),
                 dfa_state: Some(compiled.initial_state),
                 char_count: 0,
@@ -102,32 +264,94 @@ impl StringState {
         state.max_length = max_len;
         state
     }
+
+    fn consume_character(&mut self, value: char) -> bool {
+        if let Some(max) = self.max_length {
+            if self.char_count >= max {
+                return false;
+            }
+        }
+
+        if let (Some(dfa), Some(dfa_state)) = (&self.pattern_dfa, &mut self.dfa_state) {
+            let mut encoded = [0_u8; 4];
+            for &byte in value.encode_utf8(&mut encoded).as_bytes() {
+                let new_state = dfa.next_state(*dfa_state, byte);
+                if dfa.is_dead_state(new_state) {
+                    return false;
+                }
+                *dfa_state = new_state;
+            }
+        }
+
+        self.char_count += 1;
+        true
+    }
 }
 
 /// state for parsing a JSON number value
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum NumberPhase {
+    AfterMinus,
+    Zero,
+    Integer,
+    DecimalPoint,
+    Fraction,
+    ExponentMarker,
+    ExponentSign,
+    ExponentDigits,
+}
+
 #[derive(Debug, Clone)]
 pub struct NumberState {
-    /// buffer of digits seen so far
-    buffer: String,
-    /// whether we've seen a decimal point
-    has_decimal: bool,
-    /// whether we've seen an exponent (e/E)
-    has_exponent: bool,
-    /// whether we're expecting more digits after - or .
-    expect_digit: bool,
+    phase: NumberPhase,
     /// whether this is an integer (blocks decimal point and exponent)
     is_integer: bool,
 }
 
-impl Default for NumberState {
-    fn default() -> Self {
-        NumberState {
-            buffer: String::new(),
-            has_decimal: false,
-            has_exponent: false,
-            expect_digit: false,
-            is_integer: false,
-        }
+impl NumberState {
+    fn from_first_byte(byte: u8, is_integer: bool) -> Option<Self> {
+        let phase = match byte {
+            b'-' => NumberPhase::AfterMinus,
+            b'0' => NumberPhase::Zero,
+            b'1'..=b'9' => NumberPhase::Integer,
+            _ => return None,
+        };
+        Some(Self { phase, is_integer })
+    }
+
+    fn advance(&mut self, byte: u8) -> bool {
+        self.phase = match (self.phase, byte) {
+            (NumberPhase::AfterMinus, b'0') => NumberPhase::Zero,
+            (NumberPhase::AfterMinus, b'1'..=b'9') => NumberPhase::Integer,
+            (NumberPhase::Integer, b'0'..=b'9') => NumberPhase::Integer,
+            (NumberPhase::Zero | NumberPhase::Integer, b'.') if !self.is_integer => {
+                NumberPhase::DecimalPoint
+            }
+            (NumberPhase::DecimalPoint, b'0'..=b'9') => NumberPhase::Fraction,
+            (NumberPhase::Fraction, b'0'..=b'9') => NumberPhase::Fraction,
+            (NumberPhase::Zero | NumberPhase::Integer | NumberPhase::Fraction, b'e' | b'E')
+                if !self.is_integer =>
+            {
+                NumberPhase::ExponentMarker
+            }
+            (NumberPhase::ExponentMarker, b'+' | b'-') => NumberPhase::ExponentSign,
+            (NumberPhase::ExponentMarker | NumberPhase::ExponentSign, b'0'..=b'9') => {
+                NumberPhase::ExponentDigits
+            }
+            (NumberPhase::ExponentDigits, b'0'..=b'9') => NumberPhase::ExponentDigits,
+            _ => return false,
+        };
+        true
+    }
+
+    fn is_complete(&self) -> bool {
+        matches!(
+            self.phase,
+            NumberPhase::Zero
+                | NumberPhase::Integer
+                | NumberPhase::Fraction
+                | NumberPhase::ExponentDigits
+        )
     }
 }
 
@@ -229,8 +453,8 @@ pub enum Scope {
         key_buffer: String,
         /// keys that have been used (for detecting duplicates)
         used_keys: Vec<String>,
-        /// whether we're in an escape sequence (for key parsing)
-        in_escape: bool,
+        /// incremental decoder for the current key string
+        key_decoder: JsonStringDecoder,
         /// required keys that haven't been provided yet
         missing_required_keys: std::collections::HashSet<String>,
     },
@@ -302,7 +526,7 @@ impl JsonEngine {
 
     #[inline]
     fn number_is_complete(state: &NumberState) -> bool {
-        state.buffer.chars().any(|c| c.is_ascii_digit()) && !state.expect_digit
+        state.is_complete()
     }
 
     /// helper to update parent scope state after a value is complete
@@ -401,12 +625,12 @@ impl JsonEngine {
                 }
                 SchemaType::Number | SchemaType::Integer => {
                     if byte.is_ascii_digit() || byte == b'-' {
-                        let mut ns = NumberState::default();
-                        ns.buffer.push(byte as char);
-                        ns.expect_digit = byte == b'-';
-                        ns.is_integer = *schema_type == SchemaType::Integer;
-                        stack.push(Scope::Number(ns));
-                        return true;
+                        if let Some(state) =
+                            NumberState::from_first_byte(byte, *schema_type == SchemaType::Integer)
+                        {
+                            stack.push(Scope::Number(state));
+                            return true;
+                        }
                     }
                 }
                 SchemaType::Boolean => {
@@ -459,7 +683,7 @@ impl JsonEngine {
                             syntax_state: ObjectSyntaxState::ExpectKeyOrEnd,
                             key_buffer: String::new(),
                             used_keys: Vec::new(),
-                            in_escape: false,
+                            key_decoder: JsonStringDecoder::default(),
                             missing_required_keys: missing_req,
                         });
                         return true;
@@ -484,11 +708,10 @@ impl JsonEngine {
                         return true;
                     }
                     if byte.is_ascii_digit() || byte == b'-' {
-                        let mut ns = NumberState::default();
-                        ns.buffer.push(byte as char);
-                        ns.expect_digit = byte == b'-';
-                        stack.push(Scope::Number(ns));
-                        return true;
+                        if let Some(state) = NumberState::from_first_byte(byte, false) {
+                            stack.push(Scope::Number(state));
+                            return true;
+                        }
                     }
                     if byte == b't' {
                         stack.push(Scope::Boolean(BooleanState {
@@ -520,7 +743,7 @@ impl JsonEngine {
                             syntax_state: ObjectSyntaxState::ExpectKeyOrEnd,
                             key_buffer: String::new(),
                             used_keys: Vec::new(),
-                            in_escape: false,
+                            key_decoder: JsonStringDecoder::default(),
                             missing_required_keys: std::collections::HashSet::new(),
                         });
                         return true;
@@ -616,7 +839,7 @@ impl JsonEngine {
                             syntax_state: ObjectSyntaxState::ExpectKeyOrEnd,
                             key_buffer: String::new(),
                             used_keys: Vec::new(),
-                            in_escape: false,
+                            key_decoder: JsonStringDecoder::default(),
                             missing_required_keys: root_blueprint.required.clone(),
                         };
                         return true;
@@ -641,7 +864,7 @@ impl JsonEngine {
                     syntax_state,
                     key_buffer,
                     used_keys,
-                    in_escape,
+                    key_decoder,
                     missing_required_keys,
                 } => {
                     match syntax_state {
@@ -658,6 +881,7 @@ impl JsonEngine {
                                 if has_unused_key {
                                     *syntax_state = ObjectSyntaxState::InKey;
                                     key_buffer.clear();
+                                    *key_decoder = JsonStringDecoder::default();
                                     return true;
                                 }
                                 return false;
@@ -678,17 +902,9 @@ impl JsonEngine {
                             return false;
                         }
 
-                        ObjectSyntaxState::InKey => {
-                            if *in_escape {
-                                *in_escape = false;
-                                key_buffer.push(byte as char);
-                                return true;
-                            }
-                            if byte == b'\\' {
-                                *in_escape = true;
-                                return true;
-                            }
-                            if byte == b'"' {
+                        ObjectSyntaxState::InKey => match key_decoder.consume(byte) {
+                            Ok(StringByteEvent::Pending) => return true,
+                            Ok(StringByteEvent::End) => {
                                 if blueprint.is_key_allowed(key_buffer)
                                     && !used_keys.contains(key_buffer)
                                 {
@@ -697,18 +913,20 @@ impl JsonEngine {
                                 }
                                 return false;
                             }
-                            let test_key = format!("{}{}", key_buffer, byte as char);
-                            // only accept prefix if it matches an unused key
-                            let prefix_valid = blueprint
-                                .allowed_keys
-                                .iter()
-                                .any(|key| key.starts_with(&test_key) && !used_keys.contains(key));
-                            if prefix_valid {
-                                key_buffer.push(byte as char);
-                                return true;
+                            Ok(StringByteEvent::Character(value)) => {
+                                let mut test_key = key_buffer.clone();
+                                test_key.push(value);
+                                let prefix_valid = blueprint.allowed_keys.iter().any(|key| {
+                                    key.starts_with(&test_key) && !used_keys.contains(key)
+                                });
+                                if prefix_valid {
+                                    key_buffer.push(value);
+                                    return true;
+                                }
+                                return false;
                             }
-                            return false;
-                        }
+                            Err(()) => return false,
+                        },
 
                         ObjectSyntaxState::ExpectColon => {
                             if Self::is_whitespace(byte) {
@@ -803,12 +1021,14 @@ impl JsonEngine {
                                         return true;
                                     }
                                     SchemaType::Number | SchemaType::Integer => {
-                                        let mut ns = NumberState::default();
-                                        ns.buffer.push(byte as char);
-                                        ns.expect_digit = byte == b'-';
-                                        ns.is_integer = *prop_type == SchemaType::Integer;
-                                        stack.push(Scope::Number(ns));
-                                        return true;
+                                        if let Some(state) = NumberState::from_first_byte(
+                                            byte,
+                                            *prop_type == SchemaType::Integer,
+                                        ) {
+                                            stack.push(Scope::Number(state));
+                                            return true;
+                                        }
+                                        return false;
                                     }
                                     SchemaType::Boolean => {
                                         if byte == b't' {
@@ -848,7 +1068,7 @@ impl JsonEngine {
                                                 syntax_state: ObjectSyntaxState::ExpectKeyOrEnd,
                                                 key_buffer: String::new(),
                                                 used_keys: Vec::new(),
-                                                in_escape: false,
+                                                key_decoder: JsonStringDecoder::default(),
                                                 missing_required_keys: missing_req,
                                             });
                                         }
@@ -910,66 +1130,40 @@ impl JsonEngine {
                 }
 
                 Scope::String(state) => {
-                    if state.in_escape {
-                        state.in_escape = false;
-                        // feed escaped byte to dfa
-                        if let (Some(dfa), Some(dfa_state)) =
-                            (&state.pattern_dfa, &mut state.dfa_state)
-                        {
-                            let new_state = dfa.next_state(*dfa_state, byte);
-                            if dfa.is_dead_state(new_state) {
-                                return false;
-                            }
-                            *dfa_state = new_state;
-                        }
-                        // count escaped char
-                        state.char_count += 1;
-                        return true;
-                    }
-                    if byte == b'\\' {
-                        state.in_escape = true;
-                        return true;
-                    }
-                    if byte == b'"' {
-                        // check minlength
-                        if let Some(min) = state.min_length {
-                            if state.char_count < min {
-                                return false;
-                            }
-                        }
-                        // check dfa match state
-                        if let (Some(dfa), Some(dfa_state)) = (&state.pattern_dfa, state.dfa_state)
-                        {
-                            let eoi_state = dfa.next_eoi_state(dfa_state);
-                            if !dfa.is_match_state(eoi_state) {
-                                return false;
-                            }
-                        }
-                        // string complete
-                        stack.pop();
-                        if stack.is_empty() {
-                            *finished = true;
-                        }
-                        return true;
-                    }
-                    // check maxlength before accepting char
-                    if let Some(max) = state.max_length {
-                        if state.char_count >= max {
-                            return false;
-                        }
-                    }
-                    // validate against dfa
-                    if let (Some(dfa), Some(dfa_state)) = (&state.pattern_dfa, &mut state.dfa_state)
+                    if state.decoder.is_at_character_boundary()
+                        && state.max_length == Some(state.char_count)
+                        && byte != b'"'
                     {
-                        let new_state = dfa.next_state(*dfa_state, byte);
-                        if dfa.is_dead_state(new_state) {
-                            return false;
-                        }
-                        *dfa_state = new_state;
+                        return false;
                     }
-                    // count this char
-                    state.char_count += 1;
-                    return true;
+
+                    match state.decoder.consume(byte) {
+                        Ok(StringByteEvent::Pending) => return true,
+                        Ok(StringByteEvent::Character(value)) => {
+                            return state.consume_character(value);
+                        }
+                        Ok(StringByteEvent::End) => {
+                            if let Some(min) = state.min_length {
+                                if state.char_count < min {
+                                    return false;
+                                }
+                            }
+                            if let (Some(dfa), Some(dfa_state)) =
+                                (&state.pattern_dfa, state.dfa_state)
+                            {
+                                let eoi_state = dfa.next_eoi_state(dfa_state);
+                                if !dfa.is_match_state(eoi_state) {
+                                    return false;
+                                }
+                            }
+                            stack.pop();
+                            if stack.is_empty() {
+                                *finished = true;
+                            }
+                            return true;
+                        }
+                        Err(()) => return false,
+                    }
                 }
 
                 Scope::Number(state) => {
@@ -984,36 +1178,7 @@ impl JsonEngine {
                         return false;
                     }
 
-                    // Handle number characters
-                    if byte.is_ascii_digit() {
-                        state.buffer.push(byte as char);
-                        state.expect_digit = false;
-                        return true;
-                    }
-                    if byte == b'.'
-                        && !state.has_decimal
-                        && !state.has_exponent
-                        && !state.is_integer
-                    {
-                        state.buffer.push('.');
-                        state.has_decimal = true;
-                        state.expect_digit = true;
-                        return true;
-                    }
-                    if (byte == b'e' || byte == b'E') && !state.has_exponent && !state.is_integer {
-                        state.buffer.push(byte as char);
-                        state.has_exponent = true;
-                        state.expect_digit = true;
-                        return true;
-                    }
-                    if (byte == b'+' || byte == b'-')
-                        && state.buffer.ends_with(|c| c == 'e' || c == 'E')
-                    {
-                        state.buffer.push(byte as char);
-                        state.expect_digit = true;
-                        return true;
-                    }
-                    return false;
+                    return state.advance(byte);
                 }
 
                 Scope::Boolean(state) => {
@@ -1887,5 +2052,206 @@ mod tests {
         assert!(valid_null.contains(&1));
         null_engine.advance(1).unwrap();
         assert!(null_engine.is_finished());
+    }
+
+    #[test]
+    fn test_string_rejects_invalid_escapes_and_raw_control_characters() {
+        let vocab = vec![
+            br#""\q""#.to_vec(),
+            b"\"line\nbreak\"".to_vec(),
+            br#""line\nbreak""#.to_vec(),
+            br#""\u12G4""#.to_vec(),
+            br#""\uD800""#.to_vec(),
+        ];
+        let engine = JsonEngine::new(vocab, r#"{"type":"string"}"#).unwrap();
+
+        let valid = engine.get_valid_tokens();
+        assert!(!valid.contains(&0), "unknown escapes must be rejected");
+        assert!(
+            !valid.contains(&1),
+            "raw control characters must be rejected"
+        );
+        assert!(
+            valid.contains(&2),
+            "standard escaped control characters are valid"
+        );
+        assert!(
+            !valid.contains(&3),
+            "unicode escapes require four hex digits"
+        );
+        assert!(
+            !valid.contains(&4),
+            "a high surrogate requires a low surrogate"
+        );
+    }
+
+    #[test]
+    fn test_string_lengths_count_unicode_scalars() {
+        let vocab = vec![
+            vec![b'"', 0xC3, 0xA9, b'"'],
+            br#""\u00E9""#.to_vec(),
+            br#""\uD83D\uDE00""#.to_vec(),
+            vec![b'"', 0xC3, 0xA9, 0xC3, 0xA9, b'"'],
+        ];
+        let engine = JsonEngine::new(vocab, r#"{"type":"string","maxLength":1}"#).unwrap();
+
+        let valid = engine.get_valid_tokens();
+        assert!(
+            valid.contains(&0),
+            "one raw Unicode scalar should have length one"
+        );
+        assert!(valid.contains(&1), "one BMP escape should have length one");
+        assert!(
+            valid.contains(&2),
+            "one surrogate pair should have length one"
+        );
+        assert!(
+            !valid.contains(&3),
+            "two Unicode scalars must exceed maxLength one"
+        );
+    }
+
+    #[test]
+    fn test_unicode_decoding_across_token_boundaries() {
+        let vocab = vec![
+            b"\"".to_vec(),
+            vec![0xC3],
+            vec![0xA9],
+            br#"\uD83D"#.to_vec(),
+            br#"\uDE00"#.to_vec(),
+        ];
+        let schema = r#"{"type":"string","minLength":1,"maxLength":1}"#;
+
+        let mut raw_engine = JsonEngine::new(vocab.clone(), schema).unwrap();
+        for token_id in [0, 1, 2, 0] {
+            assert!(raw_engine.get_valid_tokens().contains(&token_id));
+            raw_engine.advance(token_id).unwrap();
+        }
+        assert!(raw_engine.is_finished());
+
+        let mut escaped_engine = JsonEngine::new(vocab, schema).unwrap();
+        for token_id in [0, 3, 4, 0] {
+            assert!(escaped_engine.get_valid_tokens().contains(&token_id));
+            escaped_engine.advance(token_id).unwrap();
+        }
+        assert!(escaped_engine.is_finished());
+    }
+
+    #[test]
+    fn test_max_length_blocks_incomplete_character_prefixes() {
+        let vocab = vec![b"\"".to_vec(), b"\\".to_vec(), vec![0xC3]];
+        let mut engine = JsonEngine::new(vocab, r#"{"type":"string","maxLength":0}"#).unwrap();
+
+        engine.advance(0).unwrap();
+        let valid = engine.get_valid_tokens();
+        assert!(valid.contains(&0), "an empty string may close immediately");
+        assert!(
+            !valid.contains(&1),
+            "an escape cannot start beyond maxLength"
+        );
+        assert!(
+            !valid.contains(&2),
+            "a split UTF-8 character cannot start beyond maxLength"
+        );
+    }
+
+    #[test]
+    fn test_patterns_apply_to_decoded_string_content() {
+        let vocab = vec![br#""\u00E9""#.to_vec(), br#""e""#.to_vec()];
+        let engine = JsonEngine::new(
+            vocab,
+            r#"{"type":"string","pattern":"^é$","minLength":1,"maxLength":1}"#,
+        )
+        .unwrap();
+
+        let valid = engine.get_valid_tokens();
+        assert!(valid.contains(&0));
+        assert!(!valid.contains(&1));
+    }
+
+    #[test]
+    fn test_number_lexer_enforces_json_number_syntax() {
+        let vocab = vec![
+            b"0".to_vec(),
+            b"10".to_vec(),
+            b"-0".to_vec(),
+            b"1.25".to_vec(),
+            b"1e2".to_vec(),
+            b"01".to_vec(),
+            b"-01".to_vec(),
+            b"1.".to_vec(),
+            b"1.e2".to_vec(),
+            b"-e2".to_vec(),
+            b"1e+".to_vec(),
+        ];
+        let schema = r#"{"type":"number"}"#;
+        let engine = JsonEngine::new(vocab.clone(), schema).unwrap();
+
+        let valid = engine.get_valid_tokens();
+        for token_id in 0..=4 {
+            assert!(
+                valid.contains(&token_id),
+                "valid number token {token_id} was rejected"
+            );
+        }
+        for token_id in [5, 6, 8, 9] {
+            assert!(
+                !valid.contains(&token_id),
+                "invalid number token {token_id} was accepted"
+            );
+        }
+
+        for token_id in [7, 10] {
+            assert!(
+                valid.contains(&token_id),
+                "incomplete number prefix {token_id} should remain extendable"
+            );
+            let mut prefix_engine = JsonEngine::new(vocab.clone(), schema).unwrap();
+            prefix_engine.advance(token_id).unwrap();
+            assert!(
+                !prefix_engine.is_finished(),
+                "incomplete number prefix {token_id} must not be a completed match"
+            );
+        }
+
+        let split_vocab = vec![b"0".to_vec(), b"1".to_vec()];
+        let mut split_engine = JsonEngine::new(split_vocab, schema).unwrap();
+        split_engine.advance(0).unwrap();
+        assert!(split_engine.is_finished());
+        assert!(
+            !split_engine.get_valid_tokens().contains(&1),
+            "a second integer digit cannot follow a leading zero"
+        );
+    }
+
+    #[test]
+    fn test_object_keys_use_json_string_decoding() {
+        let vocab = vec![
+            b"{".to_vec(),
+            b"}".to_vec(),
+            b":".to_vec(),
+            br#""line\nbreak""#.to_vec(),
+            b"\"line\nbreak\"".to_vec(),
+            b"null".to_vec(),
+        ];
+        let schema = r#"{"type":"object","properties":{"line\nbreak":{"type":"null"}}}"#;
+        let mut engine = JsonEngine::new(vocab, schema).unwrap();
+
+        engine.advance(0).unwrap();
+        let valid_keys = engine.get_valid_tokens();
+        assert!(
+            valid_keys.contains(&3),
+            "escaped key should match decoded schema key"
+        );
+        assert!(
+            !valid_keys.contains(&4),
+            "raw newline in an object key is invalid JSON"
+        );
+
+        engine.advance(3).unwrap();
+        engine.advance(2).unwrap();
+        engine.advance(5).unwrap();
+        engine.advance(1).unwrap();
+        assert!(engine.is_finished());
     }
 }

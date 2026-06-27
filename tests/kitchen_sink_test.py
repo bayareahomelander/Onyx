@@ -1,7 +1,6 @@
 """
 kitchen sink test - grand integration test for all json schema features
 """
-import pytest
 from onyx._rust import GrammarConstraint
 
 
