@@ -394,7 +394,9 @@ python -m pip install -e ".[cuda,dev]"
 python -m pytest tests/test_cuda_masked_argmax.py -q
 python -m pytest tests/test_cuda_decode_loop.py -q
 python -m pytest tests/test_cuda_tokenizer_probe.py -q
+python -m pytest tests/test_cuda_real_logits_handoff.py -q
 python probe_cuda_tokenizer.py
+python probe_cuda_real_logits.py --local-files-only
 python benchmark_cuda_masked_argmax.py
 python benchmark_cuda_grammar_handoff.py
 python benchmark_cuda_decode_loop.py
@@ -404,8 +406,10 @@ On Windows, the benchmark also needs the NVIDIA CUDA Toolkit with `nvcc` on
 `PATH`, compatible Microsoft C++ Build Tools, and a CUDA-enabled PyTorch build.
 The current CUDA experiment is intended for editable-source-tree development.
 The tokenizer probe loads only the `Qwen/Qwen2.5-0.5B-Instruct` tokenizer and
-configuration metadata. It validates token-ID/byte/logits-width alignment before
-the project attempts a real model forward pass.
+configuration metadata. The real-logits probe then loads the same pinned model
+with Quanto INT4 weights, runs one CUDA forward pass, verifies the observed
+logits width, and selects one grammar-valid token. It is intentionally not yet a
+multi-token generation loop.
 
 See [`onyx_cuda/README.md`](onyx_cuda/README.md) for scope and constraints.
 

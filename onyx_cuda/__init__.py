@@ -13,6 +13,11 @@ from .grammar_handoff import (
     masked_argmax_from_cached_grammar_state,
     masked_argmax_from_grammar_state,
 )
+from .real_logits_handoff import (
+    RealLogitsHandoffReport,
+    format_real_logits_report,
+    run_real_logits_handoff,
+)
 
 extension_status = _masked_argmax.extension_status
 masked_argmax_tensor = _masked_argmax.masked_argmax_tensor
@@ -31,10 +36,13 @@ __all__ = [
     "CudaGrammarDecodeResult",
     "CudaGrammarDecodeTimings",
     "CudaValidIdCache",
+    "RealLogitsHandoffReport",
     "decode_greedy_from_logits",
     "extension_status",
+    "format_real_logits_report",
     "masked_argmax_from_cached_grammar_state",
     "masked_argmax_from_grammar_state",
     "masked_argmax_tensor",
+    "run_real_logits_handoff",
     "torch_reference_masked_argmax",
 ]

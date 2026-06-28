@@ -41,9 +41,49 @@ The report records the requested revision and the exact resolved Hugging Face
 snapshot; tokenizer files are loaded from that resolved snapshot rather than a
 potentially moving branch.
 
-The base Qwen checkpoint is used only to establish tokenizer/configuration
-compatibility. The quantized runtime and checkpoint for actual Windows inference
-remain a later decision, after this ID boundary is proven.
+The metadata probe establishes tokenizer/configuration compatibility. The
+one-step real-logits probe below reuses that pinned checkpoint and applies INT4
+weight quantization on load with Optimum Quanto.
+
+## One-Step Real-Model Logits Handoff
+
+`probe_cuda_real_logits.py` is the first CUDA component that loads model weights
+and runs inference. It intentionally performs one prompt forward pass rather than
+building a generation loop:
+
+1. load the tokenizer/configuration from the pinned, compatibility-tested Qwen
+   snapshot;
+2. load `Qwen/Qwen2.5-0.5B-Instruct` on CUDA with Quanto INT4 weights;
+3. run one prompt forward pass with `use_cache=False`;
+4. assert that the observed logits width is exactly `151936`;
+5. pass the final-position logits through the Rust grammar and custom CUDA
+   selector;
+6. verify that the invalid raw argmax is excluded, advance the grammar state,
+   and release all model, tensor, and grammar-state ownership;
+7. report timings plus host/CUDA memory snapshots.
+
+Run it from an activated virtual environment inside an x64 MSVC developer shell:
+
+```powershell
+python -m pip install -e ".[cuda,dev]"
+python -m maturin develop --release
+python probe_cuda_real_logits.py --local-files-only
+```
+
+Omit `--local-files-only` to allow the pinned snapshot to be downloaded when it
+is not already cached. Write the complete resource and timing report when useful:
+
+```powershell
+python probe_cuda_real_logits.py --local-files-only `
+  --json-output .benchmarks/real_logits_handoff.json
+```
+
+The default probe is a correctness challenge, not a throughput benchmark. Its
+prompt produces an unconstrained raw argmax that is invalid for `[0-9]`; passing
+requires the CUDA selector to choose a valid digit and the Rust grammar to match
+after that one token. It does not allocate a KV cache, generate a sequence, or
+claim model tokens-per-second. Custom model IDs are intentionally outside this
+probe's fixed, tokenizer-validated contract.
 
 ## Current Components
 
