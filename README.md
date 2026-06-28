@@ -389,9 +389,12 @@ It is a focused kernel-level experiment for understanding decode-loop bottleneck
 around grammar masking, sparse token selection, and GPU launch overhead.
 
 ```bash
+python -m pip install -U "maturin>=1.4,<2.0"
 python -m pip install -e ".[cuda,dev]"
 python -m pytest tests/test_cuda_masked_argmax.py -q
 python -m pytest tests/test_cuda_decode_loop.py -q
+python -m pytest tests/test_cuda_tokenizer_probe.py -q
+python probe_cuda_tokenizer.py
 python benchmark_cuda_masked_argmax.py
 python benchmark_cuda_grammar_handoff.py
 python benchmark_cuda_decode_loop.py
@@ -400,6 +403,9 @@ python benchmark_cuda_decode_loop.py
 On Windows, the benchmark also needs the NVIDIA CUDA Toolkit with `nvcc` on
 `PATH`, compatible Microsoft C++ Build Tools, and a CUDA-enabled PyTorch build.
 The current CUDA experiment is intended for editable-source-tree development.
+The tokenizer probe loads only the `Qwen/Qwen2.5-0.5B-Instruct` tokenizer and
+configuration metadata. It validates token-ID/byte/logits-width alignment before
+the project attempts a real model forward pass.
 
 See [`onyx_cuda/README.md`](onyx_cuda/README.md) for scope and constraints.
 

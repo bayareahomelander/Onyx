@@ -35,6 +35,8 @@ server = [
 cuda = [
     "torch>=2.1",
     "ninja>=1.11",
+    "transformers>=4.37,<5",
+    "psutil>=5.9",
 ]
 dev = [
     "pytest>=7.0",

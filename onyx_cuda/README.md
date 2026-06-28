@@ -3,6 +3,48 @@
 This package contains optional CUDA components for constrained-decoding
 experiments.
 
+## Tokenizer/Vocabulary Compatibility Probe
+
+The first model-facing Windows deliverable is a metadata-only compatibility
+probe for `Qwen/Qwen2.5-0.5B-Instruct`. It downloads or reads only the tokenizer
+and model configuration; it does not load model weights, run a forward pass, or
+initialize a generation loop.
+
+The probe verifies that:
+
+- tokenizer IDs fit within the model configuration's expected logits width;
+- special, missing, and padded IDs remain reserved at their exact indices;
+- byte-level BPE tokens reconstruct representative ASCII, JSON, Unicode, and
+  emoji input exactly;
+- tokenizer-produced IDs are valid along matching Rust regex grammar paths;
+- host RSS and any active CUDA allocation are reported before and after cleanup.
+
+Run it after installing the CUDA dependencies and building the Rust extension:
+
+```powershell
+python -m pip install -U "maturin>=1.4,<2.0"
+python -m pip install -e ".[cuda,dev]"
+python -m maturin develop --release
+python probe_cuda_tokenizer.py
+```
+
+Write the complete report when a machine-readable artifact is useful:
+
+```powershell
+python probe_cuda_tokenizer.py --json-output .benchmarks/tokenizer_probe.json
+```
+
+Use `--local-files-only` to prohibit network access. A compatible result exits
+with status `0`, an identified compatibility failure exits with status `1`, and
+a missing dependency or load failure exits with status `2`.
+The report records the requested revision and the exact resolved Hugging Face
+snapshot; tokenizer files are loaded from that resolved snapshot rather than a
+potentially moving branch.
+
+The base Qwen checkpoint is used only to establish tokenizer/configuration
+compatibility. The quantized runtime and checkpoint for actual Windows inference
+remain a later decision, after this ID boundary is proven.
+
 ## Current Components
 
 ### Sparse Masked Argmax
