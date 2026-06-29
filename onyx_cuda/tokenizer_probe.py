@@ -13,6 +13,8 @@ import re
 from dataclasses import asdict, dataclass, field
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
+from onyx.tokenizer_compat import build_grammar_vocabulary, byte_level_token_for_bytes
+
 DEFAULT_MODEL_ID = "Qwen/Qwen2.5-0.5B-Instruct"
 DEFAULT_TEXT_SAMPLES = (
     "ONY-2026",
@@ -83,40 +85,6 @@ class TokenizerProbeReport:
         return result
 
 
-def _gpt2_byte_encoder() -> Dict[int, str]:
-    """Return the reversible byte-to-Unicode map used by byte-level BPE."""
-    byte_values = list(range(ord("!"), ord("~") + 1))
-    byte_values += list(range(ord("¡"), ord("¬") + 1))
-    byte_values += list(range(ord("®"), ord("ÿ") + 1))
-    unicode_values = list(byte_values)
-
-    extra_index = 0
-    for byte in range(256):
-        if byte not in byte_values:
-            byte_values.append(byte)
-            unicode_values.append(256 + extra_index)
-            extra_index += 1
-
-    return dict(zip(byte_values, (chr(value) for value in unicode_values)))
-
-
-_BYTE_ENCODER = _gpt2_byte_encoder()
-_BYTE_DECODER = {value: key for key, value in _BYTE_ENCODER.items()}
-
-
-def byte_level_token_for_bytes(value: bytes) -> str:
-    """Encode bytes into the token-string alphabet used by byte-level BPE."""
-    return "".join(_BYTE_ENCODER[byte] for byte in value)
-
-
-def _decode_byte_level_token(token: str) -> bytes:
-    try:
-        return bytes(_BYTE_DECODER[character] for character in token)
-    except KeyError as exc:
-        codepoint = f"U+{ord(exc.args[0]):04X}"
-        raise ValueError(f"token contains non-byte-level character {codepoint}") from exc
-
-
 def _backend_metadata(tokenizer: Any) -> Tuple[Optional[str], Optional[str], Optional[str]]:
     backend = getattr(tokenizer, "backend_tokenizer", None)
     if backend is None or not hasattr(backend, "to_str"):
@@ -141,92 +109,6 @@ def _backend_metadata(tokenizer: Any) -> Tuple[Optional[str], Optional[str], Opt
         error = f"unsupported tokenizer decoder {decoder_type!r}; expected ByteLevel"
 
     return model_type, decoder_type, error
-
-
-def _added_token_metadata(tokenizer: Any) -> Dict[int, Any]:
-    decoder = getattr(tokenizer, "added_tokens_decoder", {})
-    return {int(token_id): token for token_id, token in dict(decoder).items()}
-
-
-def build_grammar_vocabulary(
-    tokenizer: Any,
-    logits_width: int,
-) -> Tuple[List[bytes], Dict[str, Any], List[str]]:
-    """Build an ID-aligned byte vocabulary for ``GrammarConstraint``.
-
-    Empty byte strings intentionally reserve special, missing, and padded IDs so
-    the list index always remains identical to the future logits index.
-    """
-    if isinstance(logits_width, bool) or not isinstance(logits_width, int) or logits_width < 1:
-        raise ValueError("logits_width must be a positive integer")
-
-    raw_vocab = tokenizer.get_vocab()
-    if not isinstance(raw_vocab, dict) or not raw_vocab:
-        raise ValueError("tokenizer.get_vocab() must return a non-empty mapping")
-
-    vocabulary = [b""] * logits_width
-    errors: List[str] = []
-    seen_ids: Dict[int, str] = {}
-    special_ids = {int(token_id) for token_id in getattr(tokenizer, "all_special_ids", [])}
-    added_tokens = _added_token_metadata(tokenizer)
-    regular_added_ids = {
-        token_id
-        for token_id, token in added_tokens.items()
-        if token_id not in special_ids and not bool(getattr(token, "special", False))
-    }
-
-    mapped_ids = set()
-    for token, raw_token_id in raw_vocab.items():
-        if isinstance(raw_token_id, bool) or not isinstance(raw_token_id, int):
-            errors.append(f"token {token!r} has non-integer ID {raw_token_id!r}")
-            continue
-
-        token_id = int(raw_token_id)
-        if token_id < 0 or token_id >= logits_width:
-            errors.append(
-                f"token {token!r} has ID {token_id}, outside logits range [0, {logits_width})"
-            )
-            continue
-        if token_id in seen_ids and seen_ids[token_id] != token:
-            errors.append(
-                f"token ID {token_id} is assigned to both {seen_ids[token_id]!r} and {token!r}"
-            )
-            continue
-
-        seen_ids[token_id] = token
-        mapped_ids.add(token_id)
-
-        if token_id in special_ids or bool(getattr(added_tokens.get(token_id), "special", False)):
-            continue
-
-        if token_id in regular_added_ids:
-            content = str(getattr(added_tokens[token_id], "content", token))
-            vocabulary[token_id] = content.encode("utf-8")
-            continue
-
-        try:
-            vocabulary[token_id] = _decode_byte_level_token(str(token))
-        except ValueError as exc:
-            errors.append(f"token ID {token_id} ({token!r}) cannot be converted to bytes: {exc}")
-
-    byte_to_ids: Dict[bytes, List[int]] = {}
-    for token_id, token_bytes in enumerate(vocabulary):
-        if token_bytes:
-            byte_to_ids.setdefault(token_bytes, []).append(token_id)
-    duplicate_byte_sequences = sum(1 for ids in byte_to_ids.values() if len(ids) > 1)
-
-    stats = {
-        "populated_token_ids": len(mapped_ids),
-        "padded_or_missing_ids": logits_width - len(mapped_ids),
-        "special_token_ids": sorted(
-            token_id for token_id in special_ids if token_id < logits_width
-        ),
-        "regular_added_token_ids": sorted(
-            token_id for token_id in regular_added_ids if token_id < logits_width
-        ),
-        "duplicate_byte_sequences": duplicate_byte_sequences,
-    }
-    return vocabulary, stats, errors
 
 
 def _encode_without_special_tokens(tokenizer: Any, text: str) -> Tuple[int, ...]:

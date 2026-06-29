@@ -305,6 +305,11 @@ curl -X POST http://localhost:8000/v1/chat/completions \
 4. **Grammar-Aware Drafting**: Both models are constrained to the grammar, which can improve draft acceptance
 5. **Adaptive Draft Length (Experimental)**: An optional controller adjusts γ based on recent acceptance rate and timing signals
 
+Draft and target models must use the same meaning for every draft token ID and expose identical
+special-token IDs and logits widths. Onyx validates this contract while loading the pair and
+masks target-only or padded IDs from sampling. Grammar vocabularies are built from the tokenizer's
+byte-level BPE mapping and checked against representative UTF-8 samples.
+
 ---
 
 ## Benchmarks

@@ -57,6 +57,18 @@ class GreedyFakeModel:
         return logits
 
 
+class TrackingCache:
+    def __init__(self):
+        self.offset = 0
+
+
+class CacheAwareGreedyFakeModel(GreedyFakeModel):
+    def __call__(self, input_ids, cache):
+        for layer_cache in cache:
+            layer_cache.offset += input_ids.shape[1]
+        return super().__call__(input_ids, cache)
+
+
 class GreedyFakeTokenizer:
     vocab_size = 2
     eos_token_id = None
@@ -75,6 +87,14 @@ def configure_numpy_decode_runtime(module):
     module.mx.random = types.SimpleNamespace(
         categorical=lambda logits: np.argmax(logits, axis=-1),
     )
+
+
+def configure_tracking_caches(engine):
+    def reset_caches():
+        engine.draft_cache = [TrackingCache()]
+        engine.target_cache = [TrackingCache()]
+
+    engine._reset_caches = reset_caches
 
 
 def test_compile_requested_without_mx_compile_reports_inactive(monkeypatch):
@@ -127,6 +147,17 @@ def test_fake_mx_compile_marks_helper_compilation_active(monkeypatch):
     assert engine.compile_reason == "sampling_helpers_compiled"
     assert compiled == ["_greedy_argmax", "_mask_logits_with_indices"]
     assert engine._compile_metrics()["jit_compiled"] is True
+
+
+def test_sampling_masks_ids_outside_paired_tokenizer_vocabulary(monkeypatch):
+    speculative = import_speculative_with_fake_mlx(monkeypatch)
+    configure_numpy_decode_runtime(speculative)
+    engine = speculative.SpeculativeEngine(lazy_load=True, use_compile=False)
+    engine._tokenizer_vocab_mask = np.array([0.0, float("-inf")])
+
+    selected = engine._sample_token(np.array([[0.0, 100.0]]))
+
+    assert selected.item() == 0
 
 
 def test_draft_token_budget_never_exceeds_remaining_limit(monkeypatch):
@@ -190,6 +221,36 @@ def test_speculative_generation_honors_hard_token_limit(monkeypatch):
     assert stopped_metrics["finish_reason"] == "stop"
 
 
+def test_complete_draft_acceptance_keeps_caches_aligned(monkeypatch):
+    speculative = import_speculative_with_fake_mlx(monkeypatch)
+    configure_numpy_decode_runtime(speculative)
+
+    engine = speculative.SpeculativeEngine(
+        cache_mode="naive",
+        lazy_load=True,
+        use_compile=False,
+    )
+    engine.draft_model = CacheAwareGreedyFakeModel()
+    engine.target_model = CacheAwareGreedyFakeModel()
+    engine.tokenizer = GreedyFakeTokenizer()
+    configure_tracking_caches(engine)
+
+    output, metrics = engine.generate("prompt", max_tokens=9, gamma=4)
+
+    assert output == "x" * 9
+    assert metrics["acceptance_rate"] == 100.0
+    assert engine.draft_cache[0].offset == 9
+    assert engine.target_cache[0].offset == 9
+
+    streamed = list(engine.stream_generate("prompt", max_tokens=9, gamma=4))
+    streamed_text = "".join(text for text, chunk_metrics in streamed if chunk_metrics is None)
+
+    assert streamed_text == "x" * 9
+    assert streamed[-1][1]["acceptance_rate"] == 100.0
+    assert engine.draft_cache[0].offset == 9
+    assert engine.target_cache[0].offset == 9
+
+
 def test_adaptive_generation_honors_hard_token_limit(monkeypatch):
     speculative = import_speculative_with_fake_mlx(monkeypatch)
     configure_numpy_decode_runtime(speculative)
@@ -210,6 +271,30 @@ def test_adaptive_generation_honors_hard_token_limit(monkeypatch):
     assert output == "xxxxx"
     assert metrics["generated_tokens"] == 5
     assert metrics["finish_reason"] == "length"
+
+
+def test_adaptive_complete_draft_acceptance_keeps_caches_aligned(monkeypatch):
+    speculative = import_speculative_with_fake_mlx(monkeypatch)
+    configure_numpy_decode_runtime(speculative)
+    sys.modules.pop("onyx.adaptive", None)
+    adaptive = importlib.import_module("onyx.adaptive")
+
+    engine = adaptive.AdaptiveSpeculativeEngine(
+        cache_mode="naive",
+        lazy_load=True,
+        use_compile=False,
+    )
+    engine.draft_model = CacheAwareGreedyFakeModel()
+    engine.target_model = CacheAwareGreedyFakeModel()
+    engine.tokenizer = GreedyFakeTokenizer()
+    configure_tracking_caches(engine)
+
+    output, metrics = engine.generate_adaptive("prompt", max_tokens=9)
+
+    assert output == "x" * 9
+    assert metrics["acceptance_rate"] == 100.0
+    assert engine.draft_cache[0].offset == 9
+    assert engine.target_cache[0].offset == 9
 
 
 def test_single_model_engine_reports_length_and_rejects_invalid_limit(monkeypatch):

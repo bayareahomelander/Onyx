@@ -8,6 +8,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 import onyx
+from onyx.tokenizer_compat import build_grammar_vocabulary, validate_byte_reconstruction
 
 _GrammarConstraint = None
 if onyx.RUST_AVAILABLE:
@@ -162,16 +163,13 @@ class OnyxEngine:
         return self._load_time
     
     def _build_vocab_bytes(self) -> None:
-        vocab_size = self.tokenizer.vocab_size
-        self.vocab_bytes = []
-        
-        for token_id in range(vocab_size):
-            try:
-                token_str = self.tokenizer.decode([token_id])
-                token_bytes = token_str.encode('utf-8')
-                self.vocab_bytes.append(token_bytes)
-            except Exception:
-                self.vocab_bytes.append(b"")
+        logits_width = int(self.model.model.embed_tokens.weight.shape[0])
+        vocabulary, _stats, errors = build_grammar_vocabulary(self.tokenizer, logits_width)
+        if errors:
+            details = "; ".join(errors[:3])
+            raise ValueError(f"tokenizer grammar vocabulary is incompatible: {details}")
+        validate_byte_reconstruction(self.tokenizer, vocabulary)
+        self.vocab_bytes = vocabulary
     
     def _sample_token(
         self,
@@ -442,7 +440,7 @@ class OnyxEngine:
             if valid_tokens:
                 last_logits = self._apply_grammar_mask(last_logits, valid_tokens)
             else:
-                raise ValueError(f"Grammar constraint has no valid tokens at initial state.")
+                raise ValueError("Grammar constraint has no valid tokens at initial state.")
         
         next_token = self._sample_token(last_logits, temperature)
         mx.eval(next_token)

@@ -294,7 +294,7 @@ class AdaptiveSpeculativeEngine(SpeculativeEngine):
                         1 if accepted_count < len(draft_tokens) else 0
                     )
 
-                valid_draft_length = cache_position_before_draft + 1 + accepted_count
+                valid_draft_length = cache_position_before_draft + tokens_added
                 self._rollback_cache(self.draft_cache, valid_draft_length)
 
                 valid_target_length = target_cache_position + tokens_added

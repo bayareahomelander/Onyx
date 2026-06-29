@@ -16,6 +16,11 @@ from mlx_lm import load
 from mlx_lm.models.cache import KVCache, make_prompt_cache
 
 from onyx.cache import PagedKVCache, make_paged_cache
+from onyx.tokenizer_compat import (
+    build_grammar_vocabulary,
+    validate_byte_reconstruction,
+    validate_tokenizer_pair,
+)
 
 import onyx
 _GrammarConstraint = None
@@ -154,6 +159,8 @@ class SpeculativeEngine:
         self.draft_cache: Optional[List] = None
         self.target_cache: Optional[List] = None
         self.vocab_bytes: Optional[List[bytes]] = None
+        self._logits_width: Optional[int] = None
+        self._tokenizer_vocab_mask: Optional[mx.array] = None
         
         self._draft_load_time: Optional[float] = None
         self._target_load_time: Optional[float] = None
@@ -173,17 +180,27 @@ class SpeculativeEngine:
         self._target_load_time = time.perf_counter() - start
         print(f"  Target loaded in {self._target_load_time:.2f}s")
         
-        draft_vocab = self.draft_model.model.embed_tokens.weight.shape[0]
-        target_vocab = self.target_model.model.embed_tokens.weight.shape[0]
-        if draft_vocab != target_vocab:
-            min_vocab = min(draft_vocab, target_vocab)
-            max_vocab = max(draft_vocab, target_vocab)
-            if (max_vocab - min_vocab) / min_vocab > 0.01:
-                raise ValueError(
-                    f"Tokenizer mismatch: draft vocab={draft_vocab}, target vocab={target_vocab}"
-                )
-            print(f"  Note: vocab size differs (draft={draft_vocab}, target={target_vocab})")
-            print(f"        Using common vocabulary subset ({min_vocab} tokens)")
+        draft_vocab = int(self.draft_model.model.embed_tokens.weight.shape[0])
+        target_vocab = int(self.target_model.model.embed_tokens.weight.shape[0])
+        compatible_token_ids = validate_tokenizer_pair(
+            self.tokenizer,
+            target_tokenizer,
+            draft_logits_width=draft_vocab,
+            target_logits_width=target_vocab,
+        )
+        self._logits_width = draft_vocab
+        if len(compatible_token_ids) < draft_vocab:
+            valid_mask = mx.zeros((draft_vocab,), dtype=mx.bool_)
+            valid_indices = mx.array(compatible_token_ids)
+            valid_mask = valid_mask.at[valid_indices].add(True)
+            self._tokenizer_vocab_mask = mx.where(
+                valid_mask,
+                mx.zeros((draft_vocab,)),
+                mx.full((draft_vocab,), float("-inf")),
+            )
+            mx.eval(self._tokenizer_vocab_mask)
+        else:
+            self._tokenizer_vocab_mask = None
         
         print(f"  Cache mode: {self.cache_mode}" + 
               (f" (block_size={self.block_size})" if self.cache_mode == "paged" else ""))
@@ -233,16 +250,18 @@ class SpeculativeEngine:
     
     def _build_vocab_bytes(self) -> None:
         """build the vocabulary byte representation for grammar constraints"""
-        vocab_size = self.tokenizer.vocab_size
-        self.vocab_bytes = []
-        
-        for token_id in range(vocab_size):
-            try:
-                token_str = self.tokenizer.decode([token_id])
-                token_bytes = token_str.encode('utf-8')
-                self.vocab_bytes.append(token_bytes)
-            except Exception:
-                self.vocab_bytes.append(b"")
+        if self._logits_width is None:
+            raise RuntimeError("model vocabulary width is unavailable")
+
+        vocabulary, _stats, errors = build_grammar_vocabulary(
+            self.tokenizer,
+            self._logits_width,
+        )
+        if errors:
+            details = "; ".join(errors[:3])
+            raise ValueError(f"tokenizer grammar vocabulary is incompatible: {details}")
+        validate_byte_reconstruction(self.tokenizer, vocabulary)
+        self.vocab_bytes = vocabulary
     
     def _reset_caches(self) -> None:
         """reset KV caches for both models"""
@@ -290,6 +309,9 @@ class SpeculativeEngine:
         """sample a token from logits."""
         if top_p <= 0.0 or top_p > 1.0:
             raise ValueError("top_p must be in the range (0, 1]")
+
+        if self._tokenizer_vocab_mask is not None:
+            logits = logits + self._tokenizer_vocab_mask
 
         if temperature == 0.0:
             if self._compiled_sample_greedy is not None:
@@ -641,7 +663,12 @@ class SpeculativeEngine:
                 if _has_stop_suffix(generated_tokens, stop_sequences):
                     tokens_added = accepted_count + (1 if accepted_count < len(draft_tokens) else 0)
                 
-                valid_draft_length = cache_position_before_draft + 1 + accepted_count
+                # Both cache positions exclude the current token at iteration start.
+                # ``tokens_added`` is therefore exactly the accepted prefix that
+                # should be cached before the final generated token is fed on the
+                # next iteration. Keeping ``1 + accepted_count`` duplicates that
+                # final token when the complete draft batch is accepted.
+                valid_draft_length = cache_position_before_draft + tokens_added
                 self._rollback_cache(self.draft_cache, valid_draft_length)
                 
                 valid_target_length = target_cache_position + tokens_added
@@ -1119,7 +1146,7 @@ class SpeculativeEngine:
                 if _has_stop_suffix(generated_tokens, stop_sequences):
                     tokens_added = accepted_count + (1 if accepted_count < len(draft_tokens) else 0)
 
-                valid_draft_length = cache_position_before_draft + 1 + accepted_count
+                valid_draft_length = cache_position_before_draft + tokens_added
                 self._rollback_cache(self.draft_cache, valid_draft_length)
 
                 valid_target_length = target_cache_position + tokens_added

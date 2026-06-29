@@ -1,6 +1,22 @@
 import statistics
+import re
 from datetime import datetime
 from typing import Dict, List, Optional, Any
+
+
+def validate_grammar_completion(output: str, metrics: Dict[str, Any], pattern: str) -> None:
+    """Fail a benchmark run unless constrained generation completed and matched."""
+    finish_reason = metrics.get("finish_reason")
+    if finish_reason != "grammar_complete":
+        raise RuntimeError(
+            "grammar benchmark did not complete: "
+            f"finish_reason={finish_reason!r}, output={output!r}"
+        )
+    if re.fullmatch(pattern, output) is None:
+        raise RuntimeError(
+            f"grammar benchmark output does not fully match {pattern!r}: {output!r}"
+        )
+
 
 class Evaluator:
     @staticmethod
@@ -82,6 +98,10 @@ class Evaluator:
                     regex=task.get("regex"),
                     draft_grammar_aware=True,
                 )
+
+            pattern = task.get("regex")
+            if pattern is not None:
+                validate_grammar_completion(output, metrics, pattern)
 
             if run_idx < warmup_runs:
                 print(
@@ -217,3 +237,6 @@ class Evaluator:
         lines.append("")
         with open("metrics_log.txt", "a") as f:
             f.write("\n".join(lines))
+
+
+__all__ = ["Evaluator", "validate_grammar_completion"]

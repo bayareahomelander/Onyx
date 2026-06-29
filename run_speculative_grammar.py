@@ -9,10 +9,10 @@ the hypothesis is that:
 3. jit compilation makes grammar-aware speculation faster than baseline
 """
 
-import time
-from typing import Dict, List, Tuple
 import statistics
+from typing import Dict
 
+from onyx.evaluator import validate_grammar_completion
 from onyx.speculative import SpeculativeEngine
 
 
@@ -50,6 +50,8 @@ def run_scenario(
                 max_tokens=max_tokens,
                 regex=regex,
             )
+
+        validate_grammar_completion(output, metrics, regex)
         
         results.append(metrics)
         outputs.append(output)
@@ -87,7 +89,7 @@ def main():
     GAMMA = 4
     NUM_RUNS = 5
     
-    print(f"configuration:")
+    print("configuration:")
     print(f"prompt: '{PROMPT}'")
     print(f"regex pattern: {REGEX}")
     print(f"max tokens: {MAX_TOKENS}")
@@ -138,6 +140,14 @@ def main():
         draft_grammar_aware=True,
         use_speculation=True,
     )
+
+    for result in (blind, aware):
+        if result["output_sample"] != baseline["output_sample"]:
+            raise RuntimeError(
+                f"{result['scenario']} diverged from greedy target output: "
+                f"baseline={baseline['output_sample']!r}, "
+                f"speculative={result['output_sample']!r}"
+            )
     
     print(f"\n{'scenario':<30} {'tok/s':>10} {'acc rate':>12} {'vs baseline':>12}")
     print(f"{'baseline (target+grammar)':<30} {baseline['tokens_per_second_mean']:>10.1f} {'n/a':>12} {'1.00x':>12}")
@@ -150,7 +160,7 @@ def main():
     blind_vs_baseline = blind['tokens_per_second_mean'] / baseline['tokens_per_second_mean']
     aware_vs_blind = aware['tokens_per_second_mean'] / blind['tokens_per_second_mean']
     
-    print(f"key metrics:")
+    print("key metrics:")
     print(f"baseline: {baseline['tokens_per_second_mean']:.1f} tok/s")
     print(f"blind draft: {blind['tokens_per_second_mean']:.1f} tok/s ({blind_vs_baseline:.2f}x baseline, {blind['acceptance_rate_mean']:.1f}% acceptance)")
     print(f"aware draft: {aware['tokens_per_second_mean']:.1f} tok/s ({aware_vs_baseline:.2f}x baseline, {aware['acceptance_rate_mean']:.1f}% acceptance)")
@@ -203,10 +213,17 @@ def main():
         draft_grammar_aware=True,
         use_speculation=True,
     )
+
+    if long_aware["output_sample"] != long_baseline["output_sample"]:
+        raise RuntimeError(
+            "long aware draft diverged from greedy target output: "
+            f"baseline={long_baseline['output_sample']!r}, "
+            f"speculative={long_aware['output_sample']!r}"
+        )
     
     long_speedup = long_aware['tokens_per_second_mean'] / long_baseline['tokens_per_second_mean']
     
-    print(f"\nlonger generation results (amortizes overhead better):")
+    print("\nlonger generation results (amortizes overhead better):")
     print(f"baseline: {long_baseline['tokens_per_second_mean']:.1f} tok/s")
     print(f"aware draft: {long_aware['tokens_per_second_mean']:.1f} tok/s ({long_speedup:.2f}x baseline)")
     print(f"acceptance rate: {long_aware['acceptance_rate_mean']:.1f}%")
@@ -215,10 +232,10 @@ def main():
         print(f"\n[success] with longer generation, aware draft is {(long_speedup-1)*100:.1f}% faster than baseline!")
     
     print("final summary")
-    print(f"short generation (4 tokens):")
+    print("short generation (4 tokens):")
     print(f"- acceptance rate improvement: {aware['acceptance_rate_mean'] - blind['acceptance_rate_mean']:.1f} pp")
     print(f"- aware draft vs baseline: {aware_vs_baseline:.2f}x")
-    print(f"long generation (50 tokens):")
+    print("long generation (50 tokens):")
     print(f"- aware draft vs baseline: {long_speedup:.2f}x")
     print(f"- acceptance rate: {long_aware['acceptance_rate_mean']:.1f}%")
     
