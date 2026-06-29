@@ -85,6 +85,38 @@ after that one token. It does not allocate a KV cache, generate a sequence, or
 claim model tokens-per-second. Custom model IDs are intentionally outside this
 probe's fixed, tokenizer-validated contract.
 
+## Bounded Real-Model KV-Cache Probe
+
+`probe_cuda_kv_cache.py` extends the fixed real-model handoff by exactly one
+cache boundary. It loads the same pinned Qwen snapshot with Quanto INT4
+weights, runs prompt prefill with `use_cache=True`, selects one grammar-valid
+token, and feeds that token through one cached decode step.
+
+The probe validates and records every cache layer's key/value shape, dtype,
+device, sequence length, and storage size. Passing requires the prefill cache
+to match the prompt length and every decoded layer to grow by exactly one token.
+It also reports whether Transformers reused the mutable cache object in place,
+stage timings, peak CUDA allocation, and post-cleanup memory.
+
+Run it from the same x64 MSVC/CUDA environment as the real-logits probe:
+
+```powershell
+python -m pytest tests/test_cuda_kv_cache_probe.py -q
+python probe_cuda_kv_cache.py --local-files-only
+```
+
+Write the complete cache-layer and memory report when needed:
+
+```powershell
+python probe_cuda_kv_cache.py --local-files-only `
+  --json-output .benchmarks/kv_cache_probe.json
+```
+
+This remains a bounded correctness probe. It performs one prefill and one
+cached decode step, reloads the model for each invocation, and does not claim
+steady-state generation throughput, cache rollback, streaming, or a complete
+Windows inference backend.
+
 ## Current Components
 
 ### Sparse Masked Argmax

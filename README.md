@@ -395,8 +395,10 @@ python -m pytest tests/test_cuda_masked_argmax.py -q
 python -m pytest tests/test_cuda_decode_loop.py -q
 python -m pytest tests/test_cuda_tokenizer_probe.py -q
 python -m pytest tests/test_cuda_real_logits_handoff.py -q
+python -m pytest tests/test_cuda_kv_cache_probe.py -q
 python probe_cuda_tokenizer.py
 python probe_cuda_real_logits.py --local-files-only
+python probe_cuda_kv_cache.py --local-files-only
 python benchmark_cuda_masked_argmax.py
 python benchmark_cuda_grammar_handoff.py
 python benchmark_cuda_decode_loop.py
@@ -409,7 +411,10 @@ The tokenizer probe loads only the `Qwen/Qwen2.5-0.5B-Instruct` tokenizer and
 configuration metadata. The real-logits probe then loads the same pinned model
 with Quanto INT4 weights, runs one CUDA forward pass, verifies the observed
 logits width, and selects one grammar-valid token. It is intentionally not yet a
-multi-token generation loop.
+multi-token generation loop. The bounded KV-cache probe then enables cache
+output for the same pinned model, validates every layer after prefill, reuses
+the cache for one selected token, and requires the cached sequence length to
+grow by exactly one. It still stops before an autoregressive generation loop.
 
 See [`onyx_cuda/README.md`](onyx_cuda/README.md) for scope and constraints.
 

@@ -13,6 +13,15 @@ from .grammar_handoff import (
     masked_argmax_from_cached_grammar_state,
     masked_argmax_from_grammar_state,
 )
+from .kv_cache_probe import (
+    KvCacheLayerSnapshot,
+    KvCacheProbeReport,
+    KvCacheProbeTimings,
+    KvCacheSnapshot,
+    format_kv_cache_report,
+    inspect_kv_cache,
+    run_kv_cache_probe,
+)
 from .real_logits_handoff import (
     RealLogitsHandoffReport,
     format_real_logits_report,
@@ -36,13 +45,20 @@ __all__ = [
     "CudaGrammarDecodeResult",
     "CudaGrammarDecodeTimings",
     "CudaValidIdCache",
+    "KvCacheLayerSnapshot",
+    "KvCacheProbeReport",
+    "KvCacheProbeTimings",
+    "KvCacheSnapshot",
     "RealLogitsHandoffReport",
     "decode_greedy_from_logits",
     "extension_status",
+    "format_kv_cache_report",
     "format_real_logits_report",
+    "inspect_kv_cache",
     "masked_argmax_from_cached_grammar_state",
     "masked_argmax_from_grammar_state",
     "masked_argmax_tensor",
+    "run_kv_cache_probe",
     "run_real_logits_handoff",
     "torch_reference_masked_argmax",
 ]
