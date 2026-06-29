@@ -5,7 +5,7 @@
 
 **Grammar-Aware Speculative Decoding for Structured LLM Outputs on Apple Silicon**
 
-Onyx is a prototype inference engine for grammar-constrained structured output on Apple Silicon. In the recorded 8B year-pattern benchmark, grammar-aware speculation ran at 18.9 tok/s versus a 17.4 tok/s constrained baseline (**1.09x**); results are workload- and hardware-specific.
+Onyx is a prototype inference engine for grammar-constrained structured output on Apple Silicon. In the optimized 8B year-pattern benchmark recorded in commit `04764e1`, grammar-aware speculation ran at 22.6 tok/s versus a 15.6 tok/s constrained baseline (**1.45x**); results are workload- and hardware-specific.
 
 ## What's New in v0.2.0
 - **Shared Rust State Architecture:** Replaced deep cloning with `Arc` (Atomic Reference Counting) pointers for immutable schema blueprints and regex automata, reducing state-cloning overhead during vocabulary masking.
@@ -17,7 +17,7 @@ Onyx is a prototype inference engine for grammar-constrained structured output o
 
 | Configuration | Baseline | Onyx (Aware Draft) | Speedup |
 |---------------|----------|---------------------|---------|
-| 8B Target (year pattern) | 17.4 tok/s | 18.9 tok/s | **1.09x** |
+| 8B Target (year pattern) | 15.6 tok/s | 22.6 tok/s | **1.45x** |
 | 1.5B Target (year pattern) | 73.5 tok/s | 69.2 tok/s | 0.94x |
 
 - **Evaluated Grammar Compliance**: Recorded benchmark cases completed with grammar-compliant output; callers must check for `finish_reason="grammar_complete"`
@@ -323,9 +323,13 @@ All benchmarks run on Apple Silicon with 4-bit quantized Qwen models.
 | Configuration | Baseline | Aware Draft | vs Baseline |
 |---------------|----------|-------------|-------------|
 | 1.5B Target | 73.5 tok/s | 69.2 tok/s | 0.94x |
-| 8B Target | 17.4 tok/s | 18.9 tok/s | **1.09x** |
+| 8B Target | 15.6 tok/s | 22.6 tok/s | **1.45x** |
 
-These two recorded runs show a slowdown at 1.5B and a modest speedup at 8B. They do not establish a universal crossover model size.
+The historical 8B result comes from the optimized benchmark recorded in commit
+`04764e1`: a 4-bit Qwen2.5 0.5B draft model, a 4-bit Qwen3 8B target, paged
+cache, compiled helpers, `gamma=4`, five runs, and the `[0-9]{4}` year pattern.
+These recorded runs show a slowdown at 1.5B and a 1.45x speedup at 8B; they do
+not establish a universal crossover model size.
 
 ### Adaptive Gamma Benchmark
 
