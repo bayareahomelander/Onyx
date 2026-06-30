@@ -27,6 +27,13 @@ from .real_logits_handoff import (
     format_real_logits_report,
     run_real_logits_handoff,
 )
+from .target_generation import (
+    CudaTargetGenerationReport,
+    CudaTargetGenerationTimings,
+    GeneratedToken,
+    format_target_generation_report,
+    run_target_only_generation,
+)
 
 extension_status = _masked_argmax.extension_status
 masked_argmax_tensor = _masked_argmax.masked_argmax_tensor
@@ -44,7 +51,10 @@ __all__ = [
     "CUDA_EXTENSION_ERROR",
     "CudaGrammarDecodeResult",
     "CudaGrammarDecodeTimings",
+    "CudaTargetGenerationReport",
+    "CudaTargetGenerationTimings",
     "CudaValidIdCache",
+    "GeneratedToken",
     "KvCacheLayerSnapshot",
     "KvCacheProbeReport",
     "KvCacheProbeTimings",
@@ -54,11 +64,13 @@ __all__ = [
     "extension_status",
     "format_kv_cache_report",
     "format_real_logits_report",
+    "format_target_generation_report",
     "inspect_kv_cache",
     "masked_argmax_from_cached_grammar_state",
     "masked_argmax_from_grammar_state",
     "masked_argmax_tensor",
     "run_kv_cache_probe",
     "run_real_logits_handoff",
+    "run_target_only_generation",
     "torch_reference_masked_argmax",
 ]

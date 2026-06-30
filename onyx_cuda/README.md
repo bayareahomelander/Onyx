@@ -117,6 +117,43 @@ cached decode step, reloads the model for each invocation, and does not claim
 steady-state generation throughput, cache rollback, streaming, or a complete
 Windows inference backend.
 
+## Bounded Target-Only Constrained Generation
+
+`probe_cuda_target_generation.py` is the first repeated real-model decode path.
+It keeps the same fixed Qwen/Quanto INT4 contract, then runs one regex-constrained
+sequence through:
+
+1. tokenizer/config compatibility validation;
+2. prompt prefill with `use_cache=True`;
+3. grammar-valid CUDA token selection from real logits;
+4. cached target-model decode steps for subsequent logits;
+5. grammar-state advancement, incremental output decoding, and termination
+   reporting.
+
+The default correctness case generates up to four digits with regex `[0-9]{4}`.
+Passing requires grammar completion from real CUDA logits. The report separates
+model loading, tokenization, prefill, valid-ID lookup, CUDA selection, result
+synchronization, grammar advancement, cached decode, detokenization, and cleanup
+timings.
+
+Run it from the same x64 MSVC/CUDA environment as the KV-cache probe:
+
+```powershell
+python -m pytest tests/test_cuda_target_generation.py -q
+python probe_cuda_target_generation.py --local-files-only
+```
+
+Write the complete report when needed:
+
+```powershell
+python probe_cuda_target_generation.py --local-files-only `
+  --json-output .benchmarks/target_generation.json
+```
+
+This is still target-only and regex-only. It does not add JSON Schema support,
+batching, speculation, streaming, an API adapter, custom model IDs, or broad
+model-family support.
+
 ## Current Components
 
 ### Sparse Masked Argmax

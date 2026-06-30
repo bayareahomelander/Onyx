@@ -405,9 +405,11 @@ python -m pytest tests/test_cuda_decode_loop.py -q
 python -m pytest tests/test_cuda_tokenizer_probe.py -q
 python -m pytest tests/test_cuda_real_logits_handoff.py -q
 python -m pytest tests/test_cuda_kv_cache_probe.py -q
+python -m pytest tests/test_cuda_target_generation.py -q
 python probe_cuda_tokenizer.py
 python probe_cuda_real_logits.py --local-files-only
 python probe_cuda_kv_cache.py --local-files-only
+python probe_cuda_target_generation.py --local-files-only
 python benchmark_cuda_masked_argmax.py
 python benchmark_cuda_grammar_handoff.py
 python benchmark_cuda_decode_loop.py
@@ -423,7 +425,11 @@ logits width, and selects one grammar-valid token. It is intentionally not yet a
 multi-token generation loop. The bounded KV-cache probe then enables cache
 output for the same pinned model, validates every layer after prefill, reuses
 the cache for one selected token, and requires the cached sequence length to
-grow by exactly one. It still stops before an autoregressive generation loop.
+grow by exactly one. The bounded target-only generation probe builds on that
+cache contract by selecting multiple grammar-valid tokens from real CUDA logits
+and running cached decode steps until regex completion, stop/EOS, or the token
+limit. It remains regex-only and does not add JSON Schema, speculation,
+streaming, or API integration.
 
 See [`onyx_cuda/README.md`](onyx_cuda/README.md) for scope and constraints.
 
