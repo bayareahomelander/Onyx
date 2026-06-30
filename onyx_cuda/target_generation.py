@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import gc
+import json
+import math
 import time
 from dataclasses import asdict, dataclass
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -27,6 +29,10 @@ from .tokenizer_probe import _load_tokenizer_metadata, inspect_loaded_tokenizer
 DEFAULT_PROMPT = "The next four characters must be digits:"
 DEFAULT_REGEX = r"[0-9]{4}"
 DEFAULT_MAX_NEW_TOKENS = 4
+DEFAULT_JSON_PROMPT = (
+    "Return one compact JSON value that satisfies the provided schema, with no code fence:"
+)
+DEFAULT_JSON_MAX_NEW_TOKENS = 16
 
 
 @dataclass(frozen=True)
@@ -47,6 +53,7 @@ class CudaTargetGenerationTimings:
 
     metadata_load_s: float
     vocabulary_validation_s: float
+    grammar_compile_s: float
     model_load_s: float
     tokenization_s: float
     prefill_s: float
@@ -69,11 +76,14 @@ class CudaTargetGenerationReport:
     resolved_revision: Optional[str]
     quantization: str
     prompt: str
-    regex: str
+    constraint_type: str
+    regex: Optional[str]
+    json_schema: Optional[str]
     max_new_tokens: int
     input_token_count: int
     generated_token_ids: Tuple[int, ...]
     output_text: str
+    output_json_valid: Optional[bool]
     finish_reason: str
     grammar_matched: bool
     expected_layer_count: int
@@ -104,6 +114,7 @@ class CudaTargetGenerationReport:
             and self.observed_logits_width == self.expected_logits_width
             and self.finish_reason == "grammar_complete"
             and self.grammar_matched
+            and (self.constraint_type != "json_schema" or self.output_json_valid is True)
             and self.generated_tokens <= self.max_new_tokens
             and self.final_cache.sequence_length
             == self.input_token_count + self.cached_decode_steps
@@ -119,6 +130,177 @@ class CudaTargetGenerationReport:
 def _validate_positive_integer(name: str, value: int) -> None:
     if isinstance(value, bool) or not isinstance(value, int) or value < 1:
         raise ValueError(f"{name} must be a positive integer")
+
+
+_SUPPORTED_JSON_SCHEMA_TYPES = frozenset(
+    {"object", "array", "string", "number", "integer", "boolean", "null"}
+)
+_SUPPORTED_JSON_SCHEMA_KEYWORDS = frozenset(
+    {
+        "type",
+        "properties",
+        "required",
+        "items",
+        "enum",
+        "pattern",
+        "minLength",
+        "maxLength",
+        "minItems",
+        "maxItems",
+    }
+)
+
+
+def _json_value_matches_type(value: Any, schema_type: str) -> bool:
+    if schema_type == "object":
+        return isinstance(value, dict)
+    if schema_type == "array":
+        return isinstance(value, list)
+    if schema_type == "string":
+        return isinstance(value, str)
+    if schema_type == "number":
+        return isinstance(value, (int, float)) and not isinstance(value, bool)
+    if schema_type == "integer":
+        return isinstance(value, int) and not isinstance(value, bool)
+    if schema_type == "boolean":
+        return isinstance(value, bool)
+    if schema_type == "null":
+        return value is None
+    return False
+
+
+def _validate_finite_json_numbers(value: Any, path: str = "$") -> None:
+    if isinstance(value, float) and not math.isfinite(value):
+        raise ValueError(f"JSON Schema value at {path} must use a finite number")
+    if isinstance(value, list):
+        for index, item in enumerate(value):
+            _validate_finite_json_numbers(item, f"{path}[{index}]")
+    elif isinstance(value, dict):
+        for key, item in value.items():
+            _validate_finite_json_numbers(item, f"{path}.{key}")
+
+
+def _validate_json_schema_node(node: Any, path: str) -> None:
+    if not isinstance(node, dict):
+        raise ValueError(f"JSON Schema node at {path} must be an object")
+
+    unsupported = sorted(set(node) - _SUPPORTED_JSON_SCHEMA_KEYWORDS)
+    if unsupported:
+        raise ValueError(f"unsupported JSON Schema keyword at {path}: {unsupported[0]!r}")
+
+    raw_types = node.get("type")
+    if isinstance(raw_types, str):
+        schema_types = (raw_types,)
+    elif isinstance(raw_types, list) and raw_types:
+        if any(not isinstance(item, str) for item in raw_types):
+            raise ValueError(f"JSON Schema type union at {path} must contain strings")
+        schema_types = tuple(raw_types)
+    else:
+        raise ValueError(f"JSON Schema node at {path} must declare a supported type or type union")
+
+    if len(set(schema_types)) != len(schema_types):
+        raise ValueError(f"JSON Schema type union at {path} contains duplicates")
+    unknown_types = sorted(set(schema_types) - _SUPPORTED_JSON_SCHEMA_TYPES)
+    if unknown_types:
+        raise ValueError(f"unsupported JSON Schema type at {path}: {unknown_types[0]!r}")
+
+    enum_values = node.get("enum")
+    if enum_values is not None:
+        if not isinstance(enum_values, list) or not enum_values:
+            raise ValueError(f"JSON Schema enum at {path} must be a non-empty array")
+        if any(
+            not any(_json_value_matches_type(value, schema_type) for schema_type in schema_types)
+            for value in enum_values
+        ):
+            raise ValueError(f"JSON Schema enum at {path} contains a value of the wrong type")
+        intersecting_keywords = set(node) - {"type", "enum"}
+        if intersecting_keywords:
+            keyword = sorted(intersecting_keywords)[0]
+            raise ValueError(
+                f"JSON Schema enum at {path} cannot be combined with {keyword!r} "
+                "in the supported CUDA subset"
+            )
+
+    object_keywords = {"properties", "required"} & set(node)
+    if object_keywords and "object" not in schema_types:
+        raise ValueError(f"object keywords at {path} require type 'object'")
+    properties = node.get("properties", {})
+    if not isinstance(properties, dict):
+        raise ValueError(f"JSON Schema properties at {path} must be an object")
+    for name, property_schema in properties.items():
+        _validate_json_schema_node(property_schema, f"{path}.properties.{name}")
+
+    required = node.get("required", [])
+    if not isinstance(required, list) or any(not isinstance(item, str) for item in required):
+        raise ValueError(f"JSON Schema required at {path} must be an array of strings")
+    if len(set(required)) != len(required):
+        raise ValueError(f"JSON Schema required at {path} contains duplicates")
+    unknown_required = sorted(set(required) - set(properties))
+    if unknown_required:
+        raise ValueError(
+            f"JSON Schema required key at {path} is not declared in properties: "
+            f"{unknown_required[0]!r}"
+        )
+
+    array_keywords = {"items", "minItems", "maxItems"} & set(node)
+    if array_keywords and "array" not in schema_types:
+        raise ValueError(f"array keywords at {path} require type 'array'")
+    if "items" in node:
+        _validate_json_schema_node(node["items"], f"{path}.items")
+
+    string_keywords = {"pattern", "minLength", "maxLength"} & set(node)
+    if string_keywords and "string" not in schema_types:
+        raise ValueError(f"string keywords at {path} require type 'string'")
+    if "pattern" in node and not isinstance(node["pattern"], str):
+        raise ValueError(f"JSON Schema pattern at {path} must be a string")
+
+    for minimum_name, maximum_name in (
+        ("minLength", "maxLength"),
+        ("minItems", "maxItems"),
+    ):
+        for name in (minimum_name, maximum_name):
+            if name in node and (
+                isinstance(node[name], bool) or not isinstance(node[name], int) or node[name] < 0
+            ):
+                raise ValueError(f"JSON Schema {name} at {path} must be a non-negative integer")
+        if (
+            minimum_name in node
+            and maximum_name in node
+            and node[minimum_name] > node[maximum_name]
+        ):
+            raise ValueError(f"JSON Schema {minimum_name} at {path} cannot exceed {maximum_name}")
+
+
+def _validate_json_schema_subset(schema: str) -> None:
+    def reject_non_finite_constant(value: str) -> None:
+        raise ValueError(f"non-finite JSON number {value!r}")
+
+    try:
+        parsed = json.loads(
+            schema,
+            parse_constant=reject_non_finite_constant,
+        )
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise ValueError(f"json_schema must be valid JSON: {exc}") from exc
+    _validate_finite_json_numbers(parsed)
+    _validate_json_schema_node(parsed, "$")
+
+
+def _resolve_constraint(
+    regex: Optional[str], json_schema: Optional[str]
+) -> Tuple[Optional[str], Optional[str], str]:
+    if regex is None and json_schema is None:
+        regex = DEFAULT_REGEX
+    if regex is not None and json_schema is not None:
+        raise ValueError("provide exactly one of regex or json_schema")
+    if regex is not None:
+        if not isinstance(regex, str) or not regex:
+            raise ValueError("regex cannot be empty for target-only CUDA generation")
+        return regex, None, "regex"
+    if not isinstance(json_schema, str) or not json_schema:
+        raise ValueError("json_schema cannot be empty for target-only CUDA generation")
+    _validate_json_schema_subset(json_schema)
+    return None, json_schema, "json_schema"
 
 
 def _release_grammar_states(grammar: Any, states: Sequence[int]) -> None:
@@ -172,22 +354,30 @@ def run_target_only_generation(
     model_id: str = DEFAULT_MODEL_ID,
     *,
     revision: Optional[str] = DEFAULT_MODEL_REVISION,
-    prompt: str = DEFAULT_PROMPT,
-    regex: str = DEFAULT_REGEX,
-    max_new_tokens: int = DEFAULT_MAX_NEW_TOKENS,
+    prompt: Optional[str] = None,
+    regex: Optional[str] = None,
+    json_schema: Optional[str] = None,
+    max_new_tokens: Optional[int] = None,
     stop_strings: Optional[Sequence[str]] = None,
     local_files_only: bool = False,
     device_index: int = 0,
 ) -> CudaTargetGenerationReport:
-    """Run bounded regex-constrained generation through the fixed CUDA target model."""
+    """Run bounded constrained generation through the fixed CUDA target model."""
     if model_id != DEFAULT_MODEL_ID:
         raise ValueError(
             f"target-only CUDA generation only supports the validated model {DEFAULT_MODEL_ID!r}"
         )
+    regex, json_schema, constraint_type = _resolve_constraint(regex, json_schema)
+    if prompt is None:
+        prompt = DEFAULT_JSON_PROMPT if constraint_type == "json_schema" else DEFAULT_PROMPT
+    if max_new_tokens is None:
+        max_new_tokens = (
+            DEFAULT_JSON_MAX_NEW_TOKENS
+            if constraint_type == "json_schema"
+            else DEFAULT_MAX_NEW_TOKENS
+        )
     if not prompt:
         raise ValueError("prompt cannot be empty")
-    if not regex:
-        raise ValueError("regex cannot be empty for target-only CUDA generation")
     _validate_positive_integer("max_new_tokens", max_new_tokens)
     if isinstance(device_index, bool) or not isinstance(device_index, int) or device_index < 0:
         raise ValueError("device_index must be a non-negative integer")
@@ -237,6 +427,7 @@ def run_target_only_generation(
     generated_token_ids: List[int] = []
     generated_tokens: List[GeneratedToken] = []
     output_text = ""
+    output_json_valid: Optional[bool] = None
     finish_reason = "length"
     grammar_matched = False
     eos_token_ids: Tuple[int, ...] = ()
@@ -246,6 +437,7 @@ def run_target_only_generation(
 
     metadata_load_s = 0.0
     vocabulary_validation_s = 0.0
+    grammar_compile_s = 0.0
     model_load_s = 0.0
     tokenization_s = 0.0
     prefill_s = 0.0
@@ -282,6 +474,15 @@ def run_target_only_generation(
         if not tokenizer_report.compatible:
             details = "; ".join(tokenizer_report.errors[:3]) or "unknown incompatibility"
             raise ValueError(f"tokenizer compatibility probe failed: {details}")
+
+        stage_start = time.perf_counter()
+        grammar = grammar_factory(list(vocabulary))
+        if constraint_type == "json_schema":
+            grammar.compile_json_schema(json_schema)
+        else:
+            grammar.compile_regex(regex)
+        grammar_compile_s = time.perf_counter() - stage_start
+        snapshots.append(_memory_snapshot("grammar_compiled", torch, device))
 
         model_revision = resolved_revision or revision
         stage_start = time.perf_counter()
@@ -337,8 +538,6 @@ def run_target_only_generation(
         )
         snapshots.append(_memory_snapshot("prefill_complete", torch, device))
 
-        grammar = grammar_factory(list(vocabulary))
-        grammar.compile_regex(regex)
         grammar_state = int(grammar.init_state())
         live_grammar_states.append(grammar_state)
         valid_id_cache = CudaValidIdCache(grammar)
@@ -470,6 +669,15 @@ def run_target_only_generation(
         if finish_reason == "length":
             grammar_matched = bool(grammar.is_match_state(live_grammar_states[-1]))
 
+        if constraint_type == "json_schema":
+            try:
+                parsed_output = json.loads(output_text)
+                _validate_finite_json_numbers(parsed_output, "$output")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                output_json_valid = False
+            else:
+                output_json_valid = True
+
         final_cache_snapshot = inspect_kv_cache(
             current_cache,
             phase="final",
@@ -547,11 +755,14 @@ def run_target_only_generation(
         resolved_revision=resolved_revision,
         quantization=QUANTIZATION_NAME,
         prompt=prompt,
+        constraint_type=constraint_type,
         regex=regex,
+        json_schema=json_schema,
         max_new_tokens=max_new_tokens,
         input_token_count=input_token_count,
         generated_token_ids=tuple(generated_token_ids),
         output_text=output_text,
+        output_json_valid=output_json_valid,
         finish_reason=finish_reason,
         grammar_matched=grammar_matched,
         expected_layer_count=expected_layer_count,
@@ -570,6 +781,7 @@ def run_target_only_generation(
         timings=CudaTargetGenerationTimings(
             metadata_load_s=metadata_load_s,
             vocabulary_validation_s=vocabulary_validation_s,
+            grammar_compile_s=grammar_compile_s,
             model_load_s=model_load_s,
             tokenization_s=tokenization_s,
             prefill_s=prefill_s,
@@ -595,10 +807,16 @@ def format_target_generation_report(report: CudaTargetGenerationReport) -> str:
             f"  Model: {report.model_id}",
             f"  Revision: {report.resolved_revision or report.requested_revision or 'unavailable'}",
             f"  Quantization: {report.quantization}",
+            f"  Constraint type: {report.constraint_type}",
             f"  Prompt tokens: {report.input_token_count}",
             f"  Generated tokens: {report.generated_tokens}/{report.max_new_tokens}",
             f"  Finish reason: {report.finish_reason}",
             f"  Output: {report.output_text!r}",
+            *(
+                [f"  Output is valid JSON: {report.output_json_valid}"]
+                if report.constraint_type == "json_schema"
+                else []
+            ),
             (
                 f"  Final cache: {report.final_cache.cache_type}, "
                 f"layers={report.final_cache.layer_count}, "
@@ -607,6 +825,7 @@ def format_target_generation_report(report: CudaTargetGenerationReport) -> str:
             ),
             f"  Cached decode steps: {report.cached_decode_steps}",
             f"  Cache object reused in place: {report.cache_object_reused}",
+            f"  Grammar compile time: {report.timings.grammar_compile_s * 1000:.2f} ms",
             f"  Prefill time: {report.timings.prefill_s * 1000:.2f} ms",
             f"  Cached decode time: {report.timings.cached_decode_s * 1000:.2f} ms",
             (
@@ -625,6 +844,8 @@ def format_target_generation_report(report: CudaTargetGenerationReport) -> str:
 __all__ = [
     "CudaTargetGenerationReport",
     "CudaTargetGenerationTimings",
+    "DEFAULT_JSON_MAX_NEW_TOKENS",
+    "DEFAULT_JSON_PROMPT",
     "DEFAULT_MAX_NEW_TOKENS",
     "DEFAULT_PROMPT",
     "DEFAULT_REGEX",

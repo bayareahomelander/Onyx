@@ -1,3 +1,4 @@
+import json
 import os
 import weakref
 from contextlib import nullcontext
@@ -136,8 +137,9 @@ class FakeEncoded(dict):
 
 
 class FakeConfig:
-    vocab_size = 4
-    num_hidden_layers = 2
+    def __init__(self, vocab_size):
+        self.vocab_size = vocab_size
+        self.num_hidden_layers = 2
 
 
 class FakeGrammar:
@@ -148,16 +150,20 @@ class FakeGrammar:
         self.states = {1: b""}
         self.next_state = 2
         self.released_states = []
+        self.compiled_constraint = None
 
-    def compile_regex(self, _regex):
-        pass
+    def compile_regex(self, regex):
+        self.compiled_constraint = ("regex", regex)
+
+    def compile_json_schema(self, schema):
+        self.compiled_constraint = ("json_schema", schema)
 
     def init_state(self):
         return 1
 
     def get_valid_token_ids(self, state):
         self.states[state]
-        return [0, 1, 2, 3]
+        return list(range(len(self.vocabulary)))
 
     def advance_state(self, state, token_id):
         next_state = self.next_state
@@ -179,16 +185,20 @@ def _install_fake_runtime(
     *,
     selected_token_ids=(0, 1, 2),
     target_length=3,
+    vocabulary=None,
     fail_decode_at=None,
+    grammar_compile_fails=False,
     cleanup_fails=False,
 ):
     references = {}
     cleanup_calls = []
-    call_counts = {"prefill": 0, "decode": 0}
+    grammars = []
+    call_counts = {"model_load": 0, "prefill": 0, "decode": 0}
     selected_tokens = iter(selected_token_ids)
     decode_failure = RuntimeError("synthetic cached decode failure")
+    grammar_compile_failure = ValueError("synthetic grammar compile failure")
     cleanup_failure = RuntimeError("synthetic empty-cache failure")
-    vocabulary = [b"1", b"2", b"3", b"4"]
+    vocabulary = vocabulary or [b"1", b"2", b"3", b"4"]
 
     class FakeCuda:
         @staticmethod
@@ -299,17 +309,25 @@ def _install_fake_runtime(
     class FakeModelLoader:
         @staticmethod
         def from_pretrained(*_args, **_kwargs):
+            call_counts["model_load"] += 1
             model = FakeModel()
             references["model"] = weakref.ref(model)
             return model
 
     class RuntimeGrammar(FakeGrammar):
-        pass
+        def __init__(self, grammar_vocabulary):
+            super().__init__(grammar_vocabulary)
+            grammars.append(self)
+
+        def compile_json_schema(self, schema):
+            if grammar_compile_fails:
+                raise grammar_compile_failure
+            super().compile_json_schema(schema)
 
     RuntimeGrammar.target_length = target_length
 
     def load_metadata(*_args, **_kwargs):
-        config = FakeConfig()
+        config = FakeConfig(len(vocabulary))
         tokenizer = FakeTokenizer(vocabulary)
         references["config"] = weakref.ref(config)
         references["tokenizer"] = weakref.ref(tokenizer)
@@ -343,9 +361,11 @@ def _install_fake_runtime(
 
     return SimpleNamespace(
         references=references,
+        grammars=grammars,
         cleanup_calls=cleanup_calls,
         call_counts=call_counts,
         decode_failure=decode_failure,
+        grammar_compile_failure=grammar_compile_failure,
         cleanup_failure=cleanup_failure,
     )
 
@@ -365,7 +385,106 @@ def test_target_only_generation_reuses_cache_for_repeated_decode(monkeypatch):
     assert (
         report.final_cache.sequence_length == report.input_token_count + report.cached_decode_steps
     )
-    assert runtime.call_counts == {"prefill": 1, "decode": 2}
+    assert runtime.call_counts == {"model_load": 1, "prefill": 1, "decode": 2}
+    assert all(reference() is None for reference in runtime.references.values())
+    assert runtime.cleanup_calls[-3:] == ["gc.collect", "empty_cache", "synchronize"]
+
+
+def test_target_only_generation_runs_json_schema_through_repeated_decode(monkeypatch):
+    schema = json.dumps(
+        {
+            "type": "object",
+            "properties": {"status": {"type": "string", "enum": ["ok"]}},
+            "required": ["status"],
+        },
+        separators=(",", ":"),
+    )
+    vocabulary = [b"{", b'"status"', b":", b'"ok"', b"}"]
+    runtime = _install_fake_runtime(
+        monkeypatch,
+        selected_token_ids=(0, 1, 2, 3, 4),
+        target_length=sum(len(token) for token in vocabulary),
+        vocabulary=vocabulary,
+    )
+
+    report = run_target_only_generation(
+        regex=None,
+        json_schema=schema,
+    )
+
+    assert report.passed is True
+    assert report.constraint_type == "json_schema"
+    assert report.regex is None
+    assert report.json_schema == schema
+    assert report.prompt == target_generation.DEFAULT_JSON_PROMPT
+    assert report.max_new_tokens == target_generation.DEFAULT_JSON_MAX_NEW_TOKENS
+    assert report.output_text == '{"status":"ok"}'
+    assert report.output_json_valid is True
+    assert report.finish_reason == "grammar_complete"
+    assert report.cached_decode_steps == 4
+    serialized = report.to_dict()
+    assert serialized["constraint_type"] == "json_schema"
+    assert serialized["output_json_valid"] is True
+    json.dumps(serialized)
+    assert runtime.call_counts == {"model_load": 1, "prefill": 1, "decode": 4}
+    assert runtime.grammars[0].compiled_constraint == ("json_schema", schema)
+    assert runtime.grammars[0].states == {}
+
+
+@pytest.mark.parametrize(
+    ("schema", "message"),
+    [
+        (
+            '{"type":"object","properties":{},"additionalProperties":false}',
+            "additionalProperties",
+        ),
+        ('{"type":"mystery"}', "unsupported JSON Schema type"),
+        (
+            '{"type":"object","properties":{},"required":["missing"]}',
+            "not declared in properties",
+        ),
+        (
+            '{"type":"string","enum":["ok"],"pattern":"^ok$"}',
+            "cannot be combined",
+        ),
+    ],
+)
+def test_target_only_generation_rejects_unsupported_schema_before_runtime(
+    monkeypatch, schema, message
+):
+    monkeypatch.setattr(
+        target_generation,
+        "_require_runtime",
+        lambda: pytest.fail("runtime loading must not start for an unsupported schema"),
+    )
+
+    with pytest.raises(ValueError, match=message):
+        run_target_only_generation(regex=None, json_schema=schema)
+
+
+def test_target_only_generation_requires_one_constraint_before_runtime(monkeypatch):
+    monkeypatch.setattr(
+        target_generation,
+        "_require_runtime",
+        lambda: pytest.fail("runtime loading must not start for conflicting constraints"),
+    )
+
+    with pytest.raises(ValueError, match="exactly one"):
+        run_target_only_generation(
+            regex="x",
+            json_schema='{"type":"string"}',
+        )
+
+
+def test_target_only_generation_compiles_schema_before_model_loading(monkeypatch):
+    schema = '{"type":"object","properties":{}}'
+    runtime = _install_fake_runtime(monkeypatch, grammar_compile_fails=True)
+
+    with pytest.raises(ValueError, match="synthetic grammar compile failure") as raised:
+        run_target_only_generation(regex=None, json_schema=schema)
+
+    assert raised.value is runtime.grammar_compile_failure
+    assert runtime.call_counts == {"model_load": 0, "prefill": 0, "decode": 0}
     assert all(reference() is None for reference in runtime.references.values())
     assert runtime.cleanup_calls[-3:] == ["gc.collect", "empty_cache", "synchronize"]
 
@@ -381,7 +500,7 @@ def test_target_only_generation_supports_stop_strings(monkeypatch):
     assert report.generated_token_ids == (0, 1)
     assert report.cached_decode_steps == 1
     assert report.final_cache.sequence_length == 3
-    assert runtime.call_counts == {"prefill": 1, "decode": 1}
+    assert runtime.call_counts == {"model_load": 1, "prefill": 1, "decode": 1}
 
 
 def test_target_only_generation_preserves_decode_failure_and_releases_resources(monkeypatch):
@@ -435,6 +554,7 @@ def test_target_generation_cli_uses_fixed_qwen_model_and_revision(monkeypatch):
                 "revision": target_generation.DEFAULT_MODEL_REVISION,
                 "prompt": target_generation.DEFAULT_PROMPT,
                 "regex": target_generation.DEFAULT_REGEX,
+                "json_schema": None,
                 "max_new_tokens": target_generation.DEFAULT_MAX_NEW_TOKENS,
                 "stop_strings": None,
                 "local_files_only": False,
@@ -443,6 +563,44 @@ def test_target_generation_cli_uses_fixed_qwen_model_and_revision(monkeypatch):
         )
     ]
     assert not hasattr(probe_cuda_target_generation.build_parser().parse_args([]), "model")
+
+
+def test_target_generation_cli_reads_json_schema_file(monkeypatch, tmp_path):
+    schema = '{"type":"object","properties":{}}'
+    schema_path = tmp_path / "schema.json"
+    schema_path.write_text(schema, encoding="utf-8")
+    calls = []
+
+    def record(model_id, **kwargs):
+        calls.append((model_id, kwargs))
+        return SimpleNamespace(passed=True)
+
+    monkeypatch.setattr(probe_cuda_target_generation, "run_target_only_generation", record)
+    monkeypatch.setattr(
+        probe_cuda_target_generation, "format_target_generation_report", lambda _report: "ok"
+    )
+
+    assert (
+        probe_cuda_target_generation.main(
+            ["--json-schema-file", str(schema_path), "--prompt", "Return {}"]
+        )
+        == 0
+    )
+    assert calls == [
+        (
+            target_generation.DEFAULT_MODEL_ID,
+            {
+                "revision": target_generation.DEFAULT_MODEL_REVISION,
+                "prompt": "Return {}",
+                "regex": None,
+                "json_schema": schema,
+                "max_new_tokens": target_generation.DEFAULT_JSON_MAX_NEW_TOKENS,
+                "stop_strings": None,
+                "local_files_only": False,
+                "device_index": 0,
+            },
+        )
+    ]
 
 
 def test_target_generation_cli_returns_dependency_error(monkeypatch):
@@ -468,4 +626,38 @@ def test_live_quantized_target_only_generation():
     assert report.final_cache.layer_count == 24
     assert report.generated_tokens == 4
     assert report.cached_decode_steps == 3
+    assert report.memory_snapshots[-1].phase == "after_cleanup"
+
+
+@pytest.mark.skipif(
+    os.environ.get("ONYX_RUN_REAL_MODEL_TEST") != "1",
+    reason="set ONYX_RUN_REAL_MODEL_TEST=1 to load the pinned quantized model",
+)
+def test_live_quantized_target_only_json_generation():
+    schema = json.dumps(
+        {
+            "type": "object",
+            "properties": {"status": {"type": "string", "enum": ["ok"]}},
+            "required": ["status"],
+        },
+        separators=(",", ":"),
+    )
+
+    report = run_target_only_generation(
+        prompt='Return exactly this compact JSON object and nothing else: {"status":"ok"}',
+        regex=None,
+        json_schema=schema,
+        max_new_tokens=16,
+        local_files_only=True,
+    )
+
+    assert report.passed is True
+    assert report.constraint_type == "json_schema"
+    assert report.output_json_valid is True
+    assert json.loads(report.output_text) == {"status": "ok"}
+    assert report.finish_reason == "grammar_complete"
+    assert report.final_cache.layer_count == 24
+    assert (
+        report.final_cache.sequence_length == report.input_token_count + report.cached_decode_steps
+    )
     assert report.memory_snapshots[-1].phase == "after_cleanup"

@@ -120,8 +120,8 @@ Windows inference backend.
 ## Bounded Target-Only Constrained Generation
 
 `probe_cuda_target_generation.py` is the first repeated real-model decode path.
-It keeps the same fixed Qwen/Quanto INT4 contract, then runs one regex-constrained
-sequence through:
+It keeps the same fixed Qwen/Quanto INT4 contract, then runs one regex- or JSON
+Schema-constrained sequence through:
 
 1. tokenizer/config compatibility validation;
 2. prompt prefill with `use_cache=True`;
@@ -132,9 +132,9 @@ sequence through:
 
 The default correctness case generates up to four digits with regex `[0-9]{4}`.
 Passing requires grammar completion from real CUDA logits. The report separates
-model loading, tokenization, prefill, valid-ID lookup, CUDA selection, result
-synchronization, grammar advancement, cached decode, detokenization, and cleanup
-timings.
+grammar compilation, model loading, tokenization, prefill, valid-ID lookup, CUDA
+selection, result synchronization, grammar advancement, cached decode,
+detokenization, and cleanup timings.
 
 Run it from the same x64 MSVC/CUDA environment as the KV-cache probe:
 
@@ -143,6 +143,22 @@ python -m pytest tests/test_cuda_target_generation.py -q
 python probe_cuda_target_generation.py --local-files-only
 ```
 
+Run the deterministic bounded JSON object case with the checked-in schema:
+
+```powershell
+python probe_cuda_target_generation.py --local-files-only `
+  --json-schema-file examples/cuda_status_schema.json `
+  --prompt 'Return exactly this compact JSON object and nothing else: {"status":"ok"}' `
+  --max-new-tokens 16
+```
+
+The Windows/CUDA entry point accepts the currently enforced Rust subset:
+explicit object, array, string, number, integer, boolean, and null types; type
+unions; `properties`; `required`; `items`; `enum`; `pattern`; and string/array
+length bounds. It rejects unsupported keywords, unknown types, inconsistent
+required keys, and constraint combinations that the Rust engine would otherwise
+ignore. Schema validation and Rust compilation occur before model weights load.
+
 Write the complete report when needed:
 
 ```powershell
@@ -150,9 +166,17 @@ python probe_cuda_target_generation.py --local-files-only `
   --json-output .benchmarks/target_generation.json
 ```
 
-This is still target-only and regex-only. It does not add JSON Schema support,
-batching, speculation, streaming, an API adapter, custom model IDs, or broad
-model-family support.
+This is still a bounded target-only probe. It does not add batching, speculation,
+streaming, an API adapter, custom model IDs, or broad model-family support. The
+JSON milestone proves one deterministic object; broader real-model nested and
+typed-array matrices remain future work.
+
+JSON valid-token discovery currently scans the full 151,936-entry vocabulary for
+each new grammar state. On the development RTX 4050, a deliberately loose prompt
+produced valid schema-complete JSON but spent about 32.6 seconds in valid-ID
+lookup and selection across 12 generated tokens. This milestone establishes
+correctness and ownership, not usable JSON throughput; cache diagnostics and
+profiling are the next evidence-driven optimization boundary.
 
 ## Current Components
 

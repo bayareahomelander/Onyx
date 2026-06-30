@@ -1,4 +1,4 @@
-"""Run bounded target-only CUDA constrained generation."""
+"""Run bounded target-only CUDA regex or JSON Schema generation."""
 
 from __future__ import annotations
 
@@ -10,6 +10,8 @@ from typing import Optional, Sequence
 
 from onyx_cuda.real_logits_handoff import DEFAULT_MODEL_ID, DEFAULT_MODEL_REVISION
 from onyx_cuda.target_generation import (
+    DEFAULT_JSON_MAX_NEW_TOKENS,
+    DEFAULT_JSON_PROMPT,
     DEFAULT_MAX_NEW_TOKENS,
     DEFAULT_PROMPT,
     DEFAULT_REGEX,
@@ -28,7 +30,7 @@ def print_console_safe(value: str) -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Load the pinned INT4 Qwen model and run bounded regex-constrained "
+            "Load the pinned INT4 Qwen model and run bounded constrained "
             "target-only generation with the CUDA selector and KV cache."
         )
     )
@@ -38,14 +40,27 @@ def build_parser() -> argparse.ArgumentParser:
         help="Pinned Qwen model revision; defaults to the tokenizer-validated snapshot",
     )
     parser.add_argument(
-        "--prompt", default=DEFAULT_PROMPT, help="Prompt for bounded target-only generation"
+        "--prompt",
+        default=None,
+        help="Prompt for bounded target-only generation; defaults depend on constraint type",
     )
-    parser.add_argument("--regex", default=DEFAULT_REGEX, help="Regex constraint for generation")
+    constraint_group = parser.add_mutually_exclusive_group()
+    constraint_group.add_argument(
+        "--regex",
+        default=None,
+        help=f"Regex constraint for generation; defaults to {DEFAULT_REGEX!r}",
+    )
+    constraint_group.add_argument(
+        "--json-schema-file",
+        type=Path,
+        default=None,
+        help="UTF-8 JSON Schema file using the supported Windows/CUDA subset",
+    )
     parser.add_argument(
         "--max-new-tokens",
         type=int,
-        default=DEFAULT_MAX_NEW_TOKENS,
-        help="Maximum constrained tokens to generate",
+        default=None,
+        help="Maximum constrained tokens; defaults to 4 for regex and 16 for JSON Schema",
     )
     parser.add_argument(
         "--stop",
@@ -71,12 +86,28 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = build_parser().parse_args(argv)
     try:
+        json_schema = None
+        regex = args.regex
+        if args.json_schema_file is not None:
+            json_schema = args.json_schema_file.read_text(encoding="utf-8")
+        elif regex is None:
+            regex = DEFAULT_REGEX
+        prompt = args.prompt
+        if prompt is None:
+            prompt = DEFAULT_JSON_PROMPT if json_schema is not None else DEFAULT_PROMPT
+        max_new_tokens = args.max_new_tokens
+        if max_new_tokens is None:
+            max_new_tokens = (
+                DEFAULT_JSON_MAX_NEW_TOKENS if json_schema is not None else DEFAULT_MAX_NEW_TOKENS
+            )
+
         report = run_target_only_generation(
             DEFAULT_MODEL_ID,
             revision=args.revision,
-            prompt=args.prompt,
-            regex=args.regex,
-            max_new_tokens=args.max_new_tokens,
+            prompt=prompt,
+            regex=regex,
+            json_schema=json_schema,
+            max_new_tokens=max_new_tokens,
             stop_strings=args.stop,
             local_files_only=args.local_files_only,
             device_index=args.device_index,
