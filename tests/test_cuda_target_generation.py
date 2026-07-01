@@ -215,6 +215,7 @@ def _install_fake_runtime(
     references = {}
     cleanup_calls = []
     grammars = []
+    selection_valid_token_ids = []
     call_counts = {"model_load": 0, "prefill": 0, "decode": 0}
     selected_tokens = iter(selected_token_ids)
     decode_failure = RuntimeError("synthetic cached decode failure")
@@ -369,6 +370,7 @@ def _install_fake_runtime(
 
     def selector(_logits, valid_ids, *, check_inputs):
         assert check_inputs is True
+        selection_valid_token_ids.append(tuple(valid_ids.values))
         token_id = next(selected_tokens)
         assert token_id in valid_ids.values
         selected = FakeSelectedToken(token_id)
@@ -416,6 +418,7 @@ def _install_fake_runtime(
         decode_failure=decode_failure,
         grammar_compile_failure=grammar_compile_failure,
         cleanup_failure=cleanup_failure,
+        selection_valid_token_ids=selection_valid_token_ids,
     )
 
 
@@ -504,6 +507,167 @@ def _rust_grammar_or_skip():
     except ImportError:
         pytest.skip("onyx Rust extension is not available")
     return GrammarConstraint
+
+
+def _assert_real_rust_json_controller_success(report, runtime, expected_output):
+    assert report.passed is True
+    assert report.constraint_type == "json_schema"
+    assert report.output_json_valid is True
+    assert json.loads(report.output_text) == expected_output
+    assert report.finish_reason == "grammar_complete"
+    assert len(report.selection_diagnostics) == report.generated_tokens
+    assert report.valid_id_cache_hits == 0
+    assert report.valid_id_cache_misses == report.generated_tokens
+    assert report.unique_grammar_states == report.generated_tokens
+    assert report.peak_valid_id_cache_entries == 1
+    assert report.final_cache.sequence_length == (
+        report.input_token_count + report.cached_decode_steps
+    )
+    assert report.memory_snapshots[-1].phase == "after_cleanup"
+    assert runtime.call_counts == {
+        "model_load": 1,
+        "prefill": 1,
+        "decode": report.generated_tokens - 1,
+    }
+    assert all(reference() is None for reference in runtime.references.values())
+    assert runtime.cleanup_calls[-3:] == ["gc.collect", "empty_cache", "synchronize"]
+
+    grammar = runtime.grammars[0]
+    for state in range(1, report.generated_tokens + 2):
+        with pytest.raises(ValueError, match="Unknown grammar state handle"):
+            grammar.get_valid_token_ids(state)
+
+
+@pytest.mark.parametrize(
+    ("selected_token_ids", "expected_output"),
+    [
+        ((0, 1, 0), "ok"),
+        ((3,), None),
+    ],
+    ids=("string-branch", "null-branch"),
+)
+def test_target_only_generation_enforces_type_union_with_real_rust_grammar(
+    monkeypatch,
+    selected_token_ids,
+    expected_output,
+):
+    grammar_factory = _rust_grammar_or_skip()
+    schema = '{"type":["string","null"]}'
+    vocabulary = [b'"', b"ok", b"x", b"null", b"true"]
+    runtime = _install_fake_runtime(
+        monkeypatch,
+        selected_token_ids=selected_token_ids,
+        vocabulary=vocabulary,
+        grammar_factory=grammar_factory,
+    )
+
+    report = run_target_only_generation(
+        regex=None,
+        json_schema=schema,
+        max_new_tokens=4,
+    )
+
+    _assert_real_rust_json_controller_success(report, runtime, expected_output)
+    initial_valid_ids = runtime.selection_valid_token_ids[0]
+    assert 0 in initial_valid_ids
+    assert 3 in initial_valid_ids
+    assert 4 not in initial_valid_ids
+
+
+def test_target_only_generation_enforces_string_pattern_with_real_rust_grammar(monkeypatch):
+    grammar_factory = _rust_grammar_or_skip()
+    schema = '{"type":"string","pattern":"^[A-Z]{2}$"}'
+    vocabulary = [b'"', b"O", b"K", b"x"]
+    runtime = _install_fake_runtime(
+        monkeypatch,
+        selected_token_ids=(0, 1, 2, 0),
+        vocabulary=vocabulary,
+        grammar_factory=grammar_factory,
+    )
+
+    report = run_target_only_generation(
+        regex=None,
+        json_schema=schema,
+        max_new_tokens=4,
+    )
+
+    _assert_real_rust_json_controller_success(report, runtime, "OK")
+    assert 3 not in runtime.selection_valid_token_ids[1]
+    assert 3 not in runtime.selection_valid_token_ids[2]
+    assert runtime.selection_valid_token_ids[3] == (0,)
+
+
+def test_target_only_generation_enforces_string_length_bounds_with_real_rust_grammar(
+    monkeypatch,
+):
+    grammar_factory = _rust_grammar_or_skip()
+    schema = '{"type":"string","minLength":2,"maxLength":2}'
+    vocabulary = [b'"', b"a", b"b", b"c"]
+    runtime = _install_fake_runtime(
+        monkeypatch,
+        selected_token_ids=(0, 1, 2, 0),
+        vocabulary=vocabulary,
+        grammar_factory=grammar_factory,
+    )
+
+    report = run_target_only_generation(
+        regex=None,
+        json_schema=schema,
+        max_new_tokens=4,
+    )
+
+    _assert_real_rust_json_controller_success(report, runtime, "ab")
+    assert 0 not in runtime.selection_valid_token_ids[1]
+    assert 0 not in runtime.selection_valid_token_ids[2]
+    assert runtime.selection_valid_token_ids[3] == (0,)
+
+
+@pytest.mark.parametrize(
+    ("selected_token_ids", "expected_output"),
+    [
+        ((0, 1, 2, 5), [1.5]),
+        ((0, 3, 4, 5), [100.0]),
+    ],
+    ids=("decimal-prefix", "exponent-prefix"),
+)
+def test_target_only_generation_enforces_number_prefixes_with_real_rust_grammar(
+    monkeypatch,
+    selected_token_ids,
+    expected_output,
+):
+    grammar_factory = _rust_grammar_or_skip()
+    schema = '{"type":"array","items":{"type":"number"},' '"minItems":1,"maxItems":1}'
+    vocabulary = [
+        b"[",
+        b"1.",
+        b"5",
+        b"1e+",
+        b"2",
+        b"]",
+        b"01",
+        b"1.e2",
+        b"-e2",
+    ]
+    runtime = _install_fake_runtime(
+        monkeypatch,
+        selected_token_ids=selected_token_ids,
+        vocabulary=vocabulary,
+        grammar_factory=grammar_factory,
+    )
+
+    report = run_target_only_generation(
+        regex=None,
+        json_schema=schema,
+        max_new_tokens=4,
+    )
+
+    _assert_real_rust_json_controller_success(report, runtime, expected_output)
+    value_start_valid_ids = runtime.selection_valid_token_ids[1]
+    assert {1, 3}.issubset(value_start_valid_ids)
+    assert {6, 7, 8}.isdisjoint(value_start_valid_ids)
+    after_prefix_valid_ids = runtime.selection_valid_token_ids[2]
+    assert {2, 4}.issubset(after_prefix_valid_ids)
+    assert 5 not in after_prefix_valid_ids
 
 
 def test_target_only_generation_enforces_nested_object_with_real_rust_grammar(monkeypatch):
@@ -688,6 +852,36 @@ def test_target_only_generation_preserves_decode_failure_and_releases_resources(
         run_target_only_generation(max_new_tokens=3)
 
     assert raised.value is runtime.decode_failure
+    assert all(reference() is None for reference in runtime.references.values())
+    assert getattr(raised.value, "_onyx_cleanup_failures") == (
+        "torch.cuda.empty_cache: RuntimeError: synthetic empty-cache failure",
+    )
+    assert runtime.cleanup_calls[-3:] == ["gc.collect", "empty_cache", "synchronize"]
+
+
+def test_json_generation_preserves_decode_failure_and_releases_real_rust_states(monkeypatch):
+    grammar_factory = _rust_grammar_or_skip()
+    runtime = _install_fake_runtime(
+        monkeypatch,
+        selected_token_ids=(0,),
+        vocabulary=[b'"', b"O", b"K"],
+        fail_decode_at=1,
+        cleanup_fails=True,
+        grammar_factory=grammar_factory,
+    )
+
+    with pytest.raises(RuntimeError, match="synthetic cached decode failure") as raised:
+        run_target_only_generation(
+            regex=None,
+            json_schema='{"type":"string","pattern":"^OK$"}',
+            max_new_tokens=4,
+        )
+
+    assert raised.value is runtime.decode_failure
+    assert runtime.selection_valid_token_ids == [(0,)]
+    for state in (1, 2):
+        with pytest.raises(ValueError, match="Unknown grammar state handle"):
+            runtime.grammars[0].get_valid_token_ids(state)
     assert all(reference() is None for reference in runtime.references.values())
     assert getattr(raised.value, "_onyx_cleanup_failures") == (
         "torch.cuda.empty_cache: RuntimeError: synthetic empty-cache failure",
@@ -896,6 +1090,73 @@ def test_live_quantized_hardened_json_generation(
         assert all(isinstance(item, int) and not isinstance(item, bool) for item in parsed)
     else:
         assert parsed == expected
+    assert report.finish_reason == "grammar_complete"
+    assert report.valid_id_cache_hits == 0
+    assert report.valid_id_cache_misses == report.generated_tokens
+    assert report.unique_grammar_states == report.generated_tokens
+    assert report.peak_valid_id_cache_entries == 1
+    assert report.final_cache.sequence_length == (
+        report.input_token_count + report.cached_decode_steps
+    )
+    assert report.memory_snapshots[-1].phase == "after_cleanup"
+
+
+@pytest.mark.skipif(
+    os.environ.get("ONYX_RUN_REAL_MODEL_TEST") != "1",
+    reason="set ONYX_RUN_REAL_MODEL_TEST=1 to load the pinned quantized model",
+)
+@pytest.mark.parametrize(
+    ("schema", "prompt", "assertion_kind"),
+    [
+        (
+            {"type": ["string", "null"]},
+            "Return exactly the JSON value null and nothing else.",
+            "nullable-string",
+        ),
+        (
+            {
+                "type": "string",
+                "pattern": "^OK$",
+                "minLength": 2,
+                "maxLength": 2,
+            },
+            'Return exactly the JSON string "OK" and nothing else.',
+            "exact-ok",
+        ),
+        (
+            {
+                "type": "array",
+                "items": {"type": "number"},
+                "minItems": 1,
+                "maxItems": 1,
+            },
+            "Return exactly the JSON array [1.5] and nothing else.",
+            "single-number-array",
+        ),
+    ],
+    ids=("type-union", "pattern-and-length", "number-syntax"),
+)
+def test_live_quantized_remaining_json_boundaries(schema, prompt, assertion_kind):
+    report = run_target_only_generation(
+        prompt=prompt,
+        regex=None,
+        json_schema=json.dumps(schema, separators=(",", ":")),
+        max_new_tokens=16,
+        local_files_only=True,
+    )
+
+    assert report.passed is True
+    parsed = json.loads(report.output_text)
+    if assertion_kind == "nullable-string":
+        assert parsed is None or isinstance(parsed, str)
+    elif assertion_kind == "exact-ok":
+        assert parsed == "OK"
+    elif assertion_kind == "single-number-array":
+        assert isinstance(parsed, list)
+        assert len(parsed) == 1
+        assert isinstance(parsed[0], (int, float)) and not isinstance(parsed[0], bool)
+    else:
+        pytest.fail(f"unknown live JSON assertion kind: {assertion_kind}")
     assert report.finish_reason == "grammar_complete"
     assert report.valid_id_cache_hits == 0
     assert report.valid_id_cache_misses == report.generated_tokens
