@@ -50,6 +50,27 @@ def test_masked_argmax_matches_reference_float16():
     assert int(actual.item()) == int(expected.item())
 
 
+def test_masked_argmax_diagnostics_preserve_selection_result():
+    torch, module = _cuda_module_or_skip()
+
+    logits = torch.tensor([0.0, 4.0, 2.0, 9.0], device="cuda", dtype=torch.float32)
+    valid_ids = torch.tensor([1, 2], device="cuda", dtype=torch.long)
+
+    selected, diagnostics = module.masked_argmax_tensor_with_diagnostics(logits, valid_ids)
+
+    assert int(selected.item()) == 1
+    assert diagnostics.input_preparation_s >= 0
+    assert diagnostics.input_validation_s >= 0
+    assert diagnostics.extension_load_s >= 0
+    assert diagnostics.selector_launch_s >= 0
+    assert diagnostics.total_s == pytest.approx(
+        diagnostics.input_preparation_s
+        + diagnostics.input_validation_s
+        + diagnostics.extension_load_s
+        + diagnostics.selector_launch_s
+    )
+
+
 def test_masked_argmax_tie_chooses_smallest_token_id():
     torch, module = _cuda_module_or_skip()
 
@@ -96,3 +117,8 @@ def test_masked_argmax_rejects_invalid_valid_ids():
 
     with pytest.raises(ValueError, match="valid_token_ids must be in"):
         masked_argmax_tensor(logits, [0, 8], check_inputs=True)
+
+    from onyx_cuda.masked_argmax import masked_argmax_tensor_with_diagnostics
+
+    with pytest.raises(ValueError, match="valid_token_ids must be in"):
+        masked_argmax_tensor_with_diagnostics(logits, [0, 8], check_inputs=True)

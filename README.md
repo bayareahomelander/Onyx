@@ -411,6 +411,8 @@ python probe_cuda_real_logits.py --local-files-only
 python probe_cuda_kv_cache.py --local-files-only
 python probe_cuda_target_generation.py --local-files-only
 python probe_cuda_target_generation.py --local-files-only --json-schema-file examples/cuda_status_schema.json --prompt 'Return exactly this compact JSON object and nothing else: {"status":"ok"}' --max-new-tokens 16
+python probe_cuda_target_generation.py --local-files-only --json-schema-file examples/cuda_nested_status_schema.json --prompt 'Return exactly this compact JSON object: {"profile":{"status":"ok"}}' --max-new-tokens 32
+python probe_cuda_target_generation.py --local-files-only --json-schema-file examples/cuda_two_integer_array_schema.json --prompt 'Return one compact JSON array containing exactly two integers.' --max-new-tokens 16
 python benchmark_cuda_masked_argmax.py
 python benchmark_cuda_grammar_handoff.py
 python benchmark_cuda_decode_loop.py
@@ -430,9 +432,12 @@ grow by exactly one. The bounded target-only generation probe builds on that
 cache contract by selecting multiple grammar-valid tokens from real CUDA logits
 and running cached decode steps until regex or JSON Schema completion, stop/EOS,
 or the token limit. The JSON path validates a conservative supported subset and
-compiles the schema before loading model weights; the checked-in example proves
-one deterministic required object. It remains target-only and does not add
-speculation, streaming, or API integration.
+compiles the schema before loading model weights. Checked-in examples and focused
+tests cover a required object, a required nested object, and a bounded typed
+array. Reports separate Rust traversal, fingerprinting, cache lookup, CUDA upload,
+selector validation/loading/launch, and result synchronization, with per-token
+cache and tensor diagnostics. It remains target-only and does not add speculation,
+streaming, or API integration.
 
 See [`onyx_cuda/README.md`](onyx_cuda/README.md) for scope and constraints.
 

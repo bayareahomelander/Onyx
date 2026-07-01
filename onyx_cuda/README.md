@@ -132,9 +132,11 @@ Schema-constrained sequence through:
 
 The default correctness case generates up to four digits with regex `[0-9]{4}`.
 Passing requires grammar completion from real CUDA logits. The report separates
-grammar compilation, model loading, tokenization, prefill, valid-ID lookup, CUDA
-selection, result synchronization, grammar advancement, cached decode,
-detokenization, and cleanup timings.
+Rust grammar traversal, valid-ID fingerprinting, cache lookup, CUDA upload,
+selector input validation, extension loading, selector launch, result
+synchronization, grammar advancement, cached decode, detokenization, and cleanup.
+It also records per-token valid-ID counts and tensor sizes, cache hits/misses,
+unique grammar states, and peak valid-ID cache entries.
 
 Run it from the same x64 MSVC/CUDA environment as the KV-cache probe:
 
@@ -149,6 +151,20 @@ Run the deterministic bounded JSON object case with the checked-in schema:
 python probe_cuda_target_generation.py --local-files-only `
   --json-schema-file examples/cuda_status_schema.json `
   --prompt 'Return exactly this compact JSON object and nothing else: {"status":"ok"}' `
+  --max-new-tokens 16
+```
+
+Nested-object and bounded typed-array schemas are also checked in for the
+hardening cases:
+
+```powershell
+python probe_cuda_target_generation.py --local-files-only `
+  --json-schema-file examples/cuda_nested_status_schema.json `
+  --prompt 'Return exactly this compact JSON object: {"profile":{"status":"ok"}}' `
+  --max-new-tokens 32
+python probe_cuda_target_generation.py --local-files-only `
+  --json-schema-file examples/cuda_two_integer_array_schema.json `
+  --prompt 'Return one compact JSON array containing exactly two integers.' `
   --max-new-tokens 16
 ```
 
@@ -168,15 +184,18 @@ python probe_cuda_target_generation.py --local-files-only `
 
 This is still a bounded target-only probe. It does not add batching, speculation,
 streaming, an API adapter, custom model IDs, or broad model-family support. The
-JSON milestone proves one deterministic object; broader real-model nested and
-typed-array matrices remain future work.
+focused tests run nested-object and bounded typed-array outputs through the full
+controller with the real Rust grammar and a fake model runtime. Equivalent live
+model cases remain opt-in through `ONYX_RUN_REAL_MODEL_TEST=1` because each case
+loads the pinned quantized model.
 
 JSON valid-token discovery currently scans the full 151,936-entry vocabulary for
 each new grammar state. On the development RTX 4050, a deliberately loose prompt
 produced valid schema-complete JSON but spent about 32.6 seconds in valid-ID
 lookup and selection across 12 generated tokens. This milestone establishes
-correctness and ownership, not usable JSON throughput; cache diagnostics and
-profiling are the next evidence-driven optimization boundary.
+correctness and ownership, not usable JSON throughput. The diagnostic report now
+exposes the individual costs needed to justify any later cache or CUDA change;
+it does not itself optimize the full-vocabulary scan.
 
 ## Current Components
 

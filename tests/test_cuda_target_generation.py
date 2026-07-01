@@ -77,15 +77,36 @@ class FakeValidIdCache:
     def __init__(self, grammar):
         self.grammar = grammar
         self.cleared = False
+        self._states = set()
 
     def get(self, state, _device):
         return FakeValidIds(self.grammar.get_valid_token_ids(state))
 
-    def discard(self, _state):
-        pass
+    def get_with_diagnostics(self, state, _device):
+        values = self.grammar.get_valid_token_ids(state)
+        cache_hit = state in self._states
+        self._states.add(state)
+        return SimpleNamespace(
+            valid_ids=FakeValidIds(values),
+            valid_token_count=len(values),
+            tensor_bytes=len(values) * 8,
+            cache_hit=cache_hit,
+            grammar_traversal_s=0.001,
+            fingerprint_s=0.002,
+            cache_lookup_s=0.003,
+            cuda_upload_s=0.0 if cache_hit else 0.004,
+        )
+
+    def discard(self, state):
+        self._states.discard(state)
 
     def clear(self):
         self.cleared = True
+        self._states.clear()
+
+    @property
+    def num_entries(self):
+        return len(self._states)
 
 
 class FakeCache:
@@ -189,6 +210,7 @@ def _install_fake_runtime(
     fail_decode_at=None,
     grammar_compile_fails=False,
     cleanup_fails=False,
+    grammar_factory=None,
 ):
     references = {}
     cleanup_calls = []
@@ -314,17 +336,26 @@ def _install_fake_runtime(
             references["model"] = weakref.ref(model)
             return model
 
-    class RuntimeGrammar(FakeGrammar):
-        def __init__(self, grammar_vocabulary):
-            super().__init__(grammar_vocabulary)
-            grammars.append(self)
+    if grammar_factory is None:
 
-        def compile_json_schema(self, schema):
-            if grammar_compile_fails:
-                raise grammar_compile_failure
-            super().compile_json_schema(schema)
+        class RuntimeGrammar(FakeGrammar):
+            def __init__(self, grammar_vocabulary):
+                super().__init__(grammar_vocabulary)
+                grammars.append(self)
 
-    RuntimeGrammar.target_length = target_length
+            def compile_json_schema(self, schema):
+                if grammar_compile_fails:
+                    raise grammar_compile_failure
+                super().compile_json_schema(schema)
+
+        RuntimeGrammar.target_length = target_length
+        runtime_grammar_factory = RuntimeGrammar
+    else:
+
+        def runtime_grammar_factory(grammar_vocabulary):
+            grammar = grammar_factory(grammar_vocabulary)
+            grammars.append(grammar)
+            return grammar
 
     def load_metadata(*_args, **_kwargs):
         config = FakeConfig(len(vocabulary))
@@ -340,9 +371,22 @@ def _install_fake_runtime(
         assert check_inputs is True
         token_id = next(selected_tokens)
         assert token_id in valid_ids.values
-        return FakeSelectedToken(token_id)
+        selected = FakeSelectedToken(token_id)
+        references[f"selected_{token_id}"] = weakref.ref(selected)
+        return selected, SimpleNamespace(
+            input_preparation_s=0.005,
+            input_validation_s=0.006,
+            extension_load_s=0.007,
+            selector_launch_s=0.008,
+        )
 
     original_collect = target_generation.gc.collect
+
+    class TrackingValidIdCache(FakeValidIdCache):
+        def get_with_diagnostics(self, state, device):
+            lookup = super().get_with_diagnostics(state, device)
+            references[f"valid_ids_{state}"] = weakref.ref(lookup.valid_ids)
+            return lookup
 
     def recording_collect():
         cleanup_calls.append("gc.collect")
@@ -351,12 +395,17 @@ def _install_fake_runtime(
     monkeypatch.setattr(
         target_generation,
         "_require_runtime",
-        lambda: (FakeTorch, FakeModelLoader, lambda **_kwargs: object(), RuntimeGrammar),
+        lambda: (
+            FakeTorch,
+            FakeModelLoader,
+            lambda **_kwargs: object(),
+            runtime_grammar_factory,
+        ),
     )
     monkeypatch.setattr(target_generation, "_load_tokenizer_metadata", load_metadata)
     monkeypatch.setattr(target_generation, "inspect_loaded_tokenizer", inspect_tokenizer)
-    monkeypatch.setattr(target_generation, "CudaValidIdCache", FakeValidIdCache)
-    monkeypatch.setattr(target_generation, "masked_argmax_tensor", selector)
+    monkeypatch.setattr(target_generation, "CudaValidIdCache", TrackingValidIdCache)
+    monkeypatch.setattr(target_generation, "masked_argmax_tensor_with_diagnostics", selector)
     monkeypatch.setattr(target_generation.gc, "collect", recording_collect)
 
     return SimpleNamespace(
@@ -382,6 +431,24 @@ def test_target_only_generation_reuses_cache_for_repeated_decode(monkeypatch):
     assert report.cached_decode_steps == 2
     assert report.prefill_cache.sequence_length == 2
     assert report.final_cache.sequence_length == 4
+    assert len(report.selection_diagnostics) == 3
+    assert report.valid_id_cache_hits == 0
+    assert report.valid_id_cache_misses == 3
+    assert report.unique_grammar_states == 3
+    assert report.peak_valid_id_cache_entries == 1
+    assert report.peak_valid_id_tensor_bytes == 32
+    assert report.timings.grammar_traversal_s == pytest.approx(0.003)
+    assert report.timings.valid_id_fingerprint_s == pytest.approx(0.006)
+    assert report.timings.valid_id_cache_lookup_s == pytest.approx(0.009)
+    assert report.timings.valid_id_upload_s == pytest.approx(0.012)
+    assert report.timings.selector_input_preparation_s == pytest.approx(0.015)
+    assert report.timings.selector_input_validation_s == pytest.approx(0.018)
+    assert report.timings.selector_extension_load_s == pytest.approx(0.021)
+    assert report.timings.selector_launch_s == pytest.approx(0.024)
+    formatted = target_generation.format_target_generation_report(report)
+    assert "Valid-ID cache: hits=0, misses=3, unique_states=3, peak_entries=1" in formatted
+    assert "Rust grammar traversal:" in formatted
+    assert "Selector launch:" in formatted
     assert (
         report.final_cache.sequence_length == report.input_token_count + report.cached_decode_steps
     )
@@ -429,6 +496,111 @@ def test_target_only_generation_runs_json_schema_through_repeated_decode(monkeyp
     assert runtime.call_counts == {"model_load": 1, "prefill": 1, "decode": 4}
     assert runtime.grammars[0].compiled_constraint == ("json_schema", schema)
     assert runtime.grammars[0].states == {}
+
+
+def _rust_grammar_or_skip():
+    try:
+        from onyx._rust import GrammarConstraint
+    except ImportError:
+        pytest.skip("onyx Rust extension is not available")
+    return GrammarConstraint
+
+
+def test_target_only_generation_enforces_nested_object_with_real_rust_grammar(monkeypatch):
+    grammar_factory = _rust_grammar_or_skip()
+    schema = json.dumps(
+        {
+            "type": "object",
+            "properties": {
+                "profile": {
+                    "type": "object",
+                    "properties": {
+                        "status": {"type": "string", "enum": ["ok"]},
+                    },
+                    "required": ["status"],
+                }
+            },
+            "required": ["profile"],
+        },
+        separators=(",", ":"),
+    )
+    vocabulary = [
+        b"{",
+        b'"profile"',
+        b":",
+        b"{",
+        b'"status"',
+        b":",
+        b'"ok"',
+        b"}",
+        b"}",
+    ]
+    runtime = _install_fake_runtime(
+        monkeypatch,
+        selected_token_ids=tuple(range(len(vocabulary))),
+        vocabulary=vocabulary,
+        grammar_factory=grammar_factory,
+    )
+
+    report = run_target_only_generation(
+        regex=None,
+        json_schema=schema,
+        max_new_tokens=len(vocabulary),
+    )
+
+    assert report.passed is True
+    assert json.loads(report.output_text) == {"profile": {"status": "ok"}}
+    assert report.finish_reason == "grammar_complete"
+    assert report.generated_tokens == len(vocabulary)
+    assert report.cached_decode_steps == len(vocabulary) - 1
+    assert report.valid_id_cache_hits == 0
+    assert report.valid_id_cache_misses == len(vocabulary)
+    assert runtime.call_counts == {
+        "model_load": 1,
+        "prefill": 1,
+        "decode": len(vocabulary) - 1,
+    }
+
+
+def test_target_only_generation_enforces_bounded_typed_array_with_real_rust_grammar(
+    monkeypatch,
+):
+    grammar_factory = _rust_grammar_or_skip()
+    schema = json.dumps(
+        {
+            "type": "array",
+            "items": {"type": "integer"},
+            "minItems": 2,
+            "maxItems": 2,
+        },
+        separators=(",", ":"),
+    )
+    vocabulary = [b"[", b"1", b",", b"2", b"]"]
+    runtime = _install_fake_runtime(
+        monkeypatch,
+        selected_token_ids=tuple(range(len(vocabulary))),
+        vocabulary=vocabulary,
+        grammar_factory=grammar_factory,
+    )
+
+    report = run_target_only_generation(
+        regex=None,
+        json_schema=schema,
+        max_new_tokens=len(vocabulary),
+    )
+
+    assert report.passed is True
+    assert json.loads(report.output_text) == [1, 2]
+    assert report.finish_reason == "grammar_complete"
+    assert report.generated_tokens == len(vocabulary)
+    assert report.cached_decode_steps == len(vocabulary) - 1
+    assert report.valid_id_cache_hits == 0
+    assert report.valid_id_cache_misses == len(vocabulary)
+    assert runtime.call_counts == {
+        "model_load": 1,
+        "prefill": 1,
+        "decode": len(vocabulary) - 1,
+    }
 
 
 @pytest.mark.parametrize(
@@ -659,5 +831,77 @@ def test_live_quantized_target_only_json_generation():
     assert report.final_cache.layer_count == 24
     assert (
         report.final_cache.sequence_length == report.input_token_count + report.cached_decode_steps
+    )
+    assert report.memory_snapshots[-1].phase == "after_cleanup"
+
+
+@pytest.mark.skipif(
+    os.environ.get("ONYX_RUN_REAL_MODEL_TEST") != "1",
+    reason="set ONYX_RUN_REAL_MODEL_TEST=1 to load the pinned quantized model",
+)
+@pytest.mark.parametrize(
+    ("schema", "prompt", "max_new_tokens", "expected"),
+    [
+        (
+            {
+                "type": "object",
+                "properties": {
+                    "profile": {
+                        "type": "object",
+                        "properties": {
+                            "status": {"type": "string", "enum": ["ok"]},
+                        },
+                        "required": ["status"],
+                    }
+                },
+                "required": ["profile"],
+            },
+            'Return exactly this compact JSON object: {"profile":{"status":"ok"}}',
+            32,
+            {"profile": {"status": "ok"}},
+        ),
+        (
+            {
+                "type": "array",
+                "items": {"type": "integer"},
+                "minItems": 2,
+                "maxItems": 2,
+            },
+            "Return one compact JSON array containing exactly two integers.",
+            16,
+            None,
+        ),
+    ],
+    ids=("nested-object", "bounded-integer-array"),
+)
+def test_live_quantized_hardened_json_generation(
+    schema,
+    prompt,
+    max_new_tokens,
+    expected,
+):
+    report = run_target_only_generation(
+        prompt=prompt,
+        regex=None,
+        json_schema=json.dumps(schema, separators=(",", ":")),
+        max_new_tokens=max_new_tokens,
+        local_files_only=True,
+    )
+
+    assert report.passed is True
+    parsed = json.loads(report.output_text)
+    if expected is None:
+        assert isinstance(parsed, list)
+        assert len(parsed) == 2
+        assert all(isinstance(item, int) and not isinstance(item, bool) for item in parsed)
+    else:
+        assert parsed == expected
+    assert report.finish_reason == "grammar_complete"
+    assert report.valid_id_cache_hits == 0
+    assert report.valid_id_cache_misses == report.generated_tokens
+    assert report.unique_grammar_states == report.generated_tokens
+    assert report.peak_valid_id_cache_entries == 1
+    assert report.final_cache.sequence_length == (
+        report.input_token_count + report.cached_decode_steps
     )
     assert report.memory_snapshots[-1].phase == "after_cleanup"

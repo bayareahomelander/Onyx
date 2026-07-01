@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import os
+import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Optional, Tuple
 
@@ -11,6 +13,25 @@ CUDA_EXTENSION_ERROR: Optional[str] = None
 
 _EXTENSION = None
 _EXTENSION_ATTEMPTED = False
+
+
+@dataclass(frozen=True)
+class MaskedArgmaxCallDiagnostics:
+    """Host-observed phases before a selected token is synchronized."""
+
+    input_preparation_s: float
+    input_validation_s: float
+    extension_load_s: float
+    selector_launch_s: float
+
+    @property
+    def total_s(self) -> float:
+        return (
+            self.input_preparation_s
+            + self.input_validation_s
+            + self.extension_load_s
+            + self.selector_launch_s
+        )
 
 
 def _require_torch():
@@ -157,6 +178,42 @@ def masked_argmax_tensor(logits, valid_token_ids: Any, *, check_inputs: bool = T
 
     extension = _load_extension()
     return extension.masked_argmax(logits.contiguous(), valid_ids)
+
+
+def masked_argmax_tensor_with_diagnostics(
+    logits, valid_token_ids: Any, *, check_inputs: bool = True
+):
+    """return selected IDs and phase-separated host-call diagnostics.
+
+    ``selector_launch_s`` measures the asynchronous extension call. The caller
+    must measure the later host synchronization separately when it consumes the
+    returned CUDA tensor.
+    """
+    torch = _require_torch()
+    if not torch.is_tensor(logits):
+        raise TypeError("logits must be a torch.Tensor")
+
+    stage_start = time.perf_counter()
+    valid_ids = _as_valid_id_tensor(valid_token_ids, torch, logits.device)
+    input_preparation_s = time.perf_counter() - stage_start
+
+    stage_start = time.perf_counter()
+    _validate_inputs(logits, valid_ids, torch, check_inputs)
+    input_validation_s = time.perf_counter() - stage_start
+
+    stage_start = time.perf_counter()
+    extension = _load_extension()
+    extension_load_s = time.perf_counter() - stage_start
+
+    stage_start = time.perf_counter()
+    selected = extension.masked_argmax(logits.contiguous(), valid_ids)
+    selector_launch_s = time.perf_counter() - stage_start
+    return selected, MaskedArgmaxCallDiagnostics(
+        input_preparation_s=input_preparation_s,
+        input_validation_s=input_validation_s,
+        extension_load_s=extension_load_s,
+        selector_launch_s=selector_launch_s,
+    )
 
 
 def masked_argmax(logits, valid_token_ids: Any, *, check_inputs: bool = True):

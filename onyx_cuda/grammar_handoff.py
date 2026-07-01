@@ -2,9 +2,25 @@
 
 from __future__ import annotations
 
+import time
+from dataclasses import dataclass
 from typing import Any, Dict, Tuple
 
 from .masked_argmax import masked_argmax_tensor
+
+
+@dataclass(frozen=True)
+class CudaValidIdLookup:
+    """One instrumented grammar-state lookup and CUDA tensor result."""
+
+    valid_ids: Any
+    valid_token_count: int
+    tensor_bytes: int
+    cache_hit: bool
+    grammar_traversal_s: float
+    fingerprint_s: float
+    cache_lookup_s: float
+    cuda_upload_s: float
 
 
 def _require_torch():
@@ -66,6 +82,68 @@ class CudaValidIdCache:
         valid_ids = torch.as_tensor(valid_token_ids, dtype=torch.long, device=device).contiguous()
         self._cache[key] = (valid_token_ids, valid_ids)
         return valid_ids
+
+    def get_with_diagnostics(self, state: int, device) -> CudaValidIdLookup:
+        """return valid IDs with phase-separated host-observed diagnostics.
+
+        CUDA upload timing uses explicit synchronization around cache misses.
+        Callers should use :meth:`get` when they do not want this diagnostic
+        synchronization to affect the measured path.
+        """
+        return self._get_with_diagnostics(state, device)
+
+    def _get_with_diagnostics(self, state: int, device) -> CudaValidIdLookup:
+        torch = _require_torch()
+        device = torch.device(device)
+        if device.type != "cuda":
+            raise ValueError("CudaValidIdCache requires a CUDA device")
+        if device.index is None:
+            device = torch.device("cuda", torch.cuda.current_device())
+
+        stage_start = time.perf_counter()
+        raw_valid_token_ids = self.grammar_constraint.get_valid_token_ids(state)
+        grammar_traversal_s = time.perf_counter() - stage_start
+
+        stage_start = time.perf_counter()
+        valid_token_ids = tuple(raw_valid_token_ids)
+        fingerprint_s = time.perf_counter() - stage_start
+        if not valid_token_ids:
+            raise ValueError("grammar state produced no valid token ids")
+
+        key = (int(state), str(device))
+        stage_start = time.perf_counter()
+        cached = self._cache.get(key)
+        if cached is not None and cached[0] == valid_token_ids:
+            cache_lookup_s = time.perf_counter() - stage_start
+            valid_ids = cached[1]
+            return CudaValidIdLookup(
+                valid_ids=valid_ids,
+                valid_token_count=len(valid_token_ids),
+                tensor_bytes=int(valid_ids.numel()) * int(valid_ids.element_size()),
+                cache_hit=True,
+                grammar_traversal_s=grammar_traversal_s,
+                fingerprint_s=fingerprint_s,
+                cache_lookup_s=cache_lookup_s,
+                cuda_upload_s=0.0,
+            )
+        cache_lookup_s = time.perf_counter() - stage_start
+
+        torch.cuda.synchronize(device)
+        stage_start = time.perf_counter()
+        valid_ids = torch.as_tensor(valid_token_ids, dtype=torch.long, device=device).contiguous()
+        torch.cuda.synchronize(device)
+        cuda_upload_s = time.perf_counter() - stage_start
+        self._cache[key] = (valid_token_ids, valid_ids)
+        return CudaValidIdLookup(
+            valid_ids=valid_ids,
+            valid_token_count=len(valid_token_ids),
+            tensor_bytes=int(valid_ids.numel()) * int(valid_ids.element_size()),
+            cache_hit=False,
+            grammar_traversal_s=grammar_traversal_s,
+            fingerprint_s=fingerprint_s,
+            cache_lookup_s=cache_lookup_s,
+            cuda_upload_s=cuda_upload_s,
+        )
 
 
 def masked_argmax_from_grammar_state(

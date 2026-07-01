@@ -11,7 +11,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from .grammar_handoff import CudaValidIdCache
 from .kv_cache_probe import KvCacheSnapshot, inspect_kv_cache
-from .masked_argmax import masked_argmax_tensor
+from .masked_argmax import masked_argmax_tensor_with_diagnostics
 from .real_logits_handoff import (
     DEFAULT_MODEL_ID,
     DEFAULT_MODEL_REVISION,
@@ -48,6 +48,27 @@ class GeneratedToken:
 
 
 @dataclass(frozen=True)
+class CudaSelectionStepDiagnostics:
+    """Phase-separated diagnostics for one grammar-constrained selection."""
+
+    index: int
+    grammar_state: int
+    valid_token_count: int
+    valid_id_tensor_bytes: int
+    valid_id_cache_hit: bool
+    valid_id_cache_entries: int
+    grammar_traversal_s: float
+    valid_id_fingerprint_s: float
+    valid_id_cache_lookup_s: float
+    valid_id_upload_s: float
+    selector_input_preparation_s: float
+    selector_input_validation_s: float
+    selector_extension_load_s: float
+    selector_launch_s: float
+    result_sync_s: float
+
+
+@dataclass(frozen=True)
 class CudaTargetGenerationTimings:
     """Host-observed timings for bounded target-only generation."""
 
@@ -58,7 +79,15 @@ class CudaTargetGenerationTimings:
     tokenization_s: float
     prefill_s: float
     valid_id_lookup_s: float
+    grammar_traversal_s: float
+    valid_id_fingerprint_s: float
+    valid_id_cache_lookup_s: float
+    valid_id_upload_s: float
     selection_s: float
+    selector_input_preparation_s: float
+    selector_input_validation_s: float
+    selector_extension_load_s: float
+    selector_launch_s: float
     result_sync_s: float
     grammar_advance_s: float
     detokenization_s: float
@@ -98,6 +127,7 @@ class CudaTargetGenerationReport:
     prefill_cache: KvCacheSnapshot
     final_cache: KvCacheSnapshot
     tokens: Tuple[GeneratedToken, ...]
+    selection_diagnostics: Tuple[CudaSelectionStepDiagnostics, ...]
     peak_cuda_allocated_bytes: int
     timings: CudaTargetGenerationTimings
     memory_snapshots: Tuple[MemorySnapshot, ...]
@@ -105,6 +135,32 @@ class CudaTargetGenerationReport:
     @property
     def generated_tokens(self) -> int:
         return len(self.generated_token_ids)
+
+    @property
+    def valid_id_cache_hits(self) -> int:
+        return sum(item.valid_id_cache_hit for item in self.selection_diagnostics)
+
+    @property
+    def valid_id_cache_misses(self) -> int:
+        return len(self.selection_diagnostics) - self.valid_id_cache_hits
+
+    @property
+    def unique_grammar_states(self) -> int:
+        return len({item.grammar_state for item in self.selection_diagnostics})
+
+    @property
+    def peak_valid_id_cache_entries(self) -> int:
+        return max(
+            (item.valid_id_cache_entries for item in self.selection_diagnostics),
+            default=0,
+        )
+
+    @property
+    def peak_valid_id_tensor_bytes(self) -> int:
+        return max(
+            (item.valid_id_tensor_bytes for item in self.selection_diagnostics),
+            default=0,
+        )
 
     @property
     def passed(self) -> bool:
@@ -116,6 +172,7 @@ class CudaTargetGenerationReport:
             and self.grammar_matched
             and (self.constraint_type != "json_schema" or self.output_json_valid is True)
             and self.generated_tokens <= self.max_new_tokens
+            and len(self.selection_diagnostics) == self.generated_tokens
             and self.final_cache.sequence_length
             == self.input_token_count + self.cached_decode_steps
         )
@@ -123,6 +180,11 @@ class CudaTargetGenerationReport:
     def to_dict(self) -> Dict[str, Any]:
         result = asdict(self)
         result["generated_tokens"] = self.generated_tokens
+        result["valid_id_cache_hits"] = self.valid_id_cache_hits
+        result["valid_id_cache_misses"] = self.valid_id_cache_misses
+        result["unique_grammar_states"] = self.unique_grammar_states
+        result["peak_valid_id_cache_entries"] = self.peak_valid_id_cache_entries
+        result["peak_valid_id_tensor_bytes"] = self.peak_valid_id_tensor_bytes
         result["passed"] = self.passed
         return result
 
@@ -316,13 +378,6 @@ def _release_grammar_states(grammar: Any, states: Sequence[int]) -> None:
         release_one(state)
 
 
-def _tensor_length(value: Any) -> int:
-    numel = getattr(value, "numel", None)
-    if callable(numel):
-        return int(numel())
-    return len(value)
-
-
 def _normalize_stop_strings(stop_strings: Optional[Sequence[str]]) -> Tuple[str, ...]:
     if not stop_strings:
         return ()
@@ -409,6 +464,10 @@ def run_target_only_generation(
     decode_kwargs = None
     grammar = None
     valid_id_cache = None
+    valid_id_lookup = None
+    valid_ids = None
+    selected = None
+    selector_diagnostics = None
     live_grammar_states: List[int] = []
     failure: Optional[BaseException] = None
     cleanup_failures: List[Tuple[str, BaseException]] = []
@@ -426,6 +485,7 @@ def run_target_only_generation(
     final_cache_snapshot = None
     generated_token_ids: List[int] = []
     generated_tokens: List[GeneratedToken] = []
+    selection_diagnostics: List[CudaSelectionStepDiagnostics] = []
     output_text = ""
     output_json_valid: Optional[bool] = None
     finish_reason = "length"
@@ -442,7 +502,15 @@ def run_target_only_generation(
     tokenization_s = 0.0
     prefill_s = 0.0
     valid_id_lookup_s = 0.0
+    grammar_traversal_s = 0.0
+    valid_id_fingerprint_s = 0.0
+    valid_id_cache_lookup_s = 0.0
+    valid_id_upload_s = 0.0
     selection_s = 0.0
+    selector_input_preparation_s = 0.0
+    selector_input_validation_s = 0.0
+    selector_extension_load_s = 0.0
+    selector_launch_s = 0.0
     result_sync_s = 0.0
     grammar_advance_s = 0.0
     detokenization_s = 0.0
@@ -550,19 +618,53 @@ def run_target_only_generation(
                 raise ValueError("target-only CUDA generation requires one logits row")
 
             stage_start = time.perf_counter()
-            valid_ids = valid_id_cache.get(grammar_state, device)
+            valid_id_lookup = valid_id_cache.get_with_diagnostics(grammar_state, device)
             valid_id_lookup_s += time.perf_counter() - stage_start
-            valid_token_count = _tensor_length(valid_ids)
+            valid_ids = valid_id_lookup.valid_ids
+            valid_token_count = valid_id_lookup.valid_token_count
+            grammar_traversal_s += valid_id_lookup.grammar_traversal_s
+            valid_id_fingerprint_s += valid_id_lookup.fingerprint_s
+            valid_id_cache_lookup_s += valid_id_lookup.cache_lookup_s
+            valid_id_upload_s += valid_id_lookup.cuda_upload_s
+            cache_entries = valid_id_cache.num_entries
 
             stage_start = time.perf_counter()
-            selected = masked_argmax_tensor(last_logits, valid_ids, check_inputs=True)
+            selected, selector_diagnostics = masked_argmax_tensor_with_diagnostics(
+                last_logits,
+                valid_ids,
+                check_inputs=True,
+            )
             selection_s += time.perf_counter() - stage_start
+            selector_input_preparation_s += selector_diagnostics.input_preparation_s
+            selector_input_validation_s += selector_diagnostics.input_validation_s
+            selector_extension_load_s += selector_diagnostics.extension_load_s
+            selector_launch_s += selector_diagnostics.selector_launch_s
             if selected.numel() != 1:
                 raise ValueError("target-only CUDA generation requires one selected token")
 
             stage_start = time.perf_counter()
             token_id = int(selected.item())
-            result_sync_s += time.perf_counter() - stage_start
+            step_result_sync_s = time.perf_counter() - stage_start
+            result_sync_s += step_result_sync_s
+            selection_diagnostics.append(
+                CudaSelectionStepDiagnostics(
+                    index=len(generated_token_ids),
+                    grammar_state=grammar_state,
+                    valid_token_count=valid_token_count,
+                    valid_id_tensor_bytes=valid_id_lookup.tensor_bytes,
+                    valid_id_cache_hit=valid_id_lookup.cache_hit,
+                    valid_id_cache_entries=cache_entries,
+                    grammar_traversal_s=valid_id_lookup.grammar_traversal_s,
+                    valid_id_fingerprint_s=valid_id_lookup.fingerprint_s,
+                    valid_id_cache_lookup_s=valid_id_lookup.cache_lookup_s,
+                    valid_id_upload_s=valid_id_lookup.cuda_upload_s,
+                    selector_input_preparation_s=selector_diagnostics.input_preparation_s,
+                    selector_input_validation_s=selector_diagnostics.input_validation_s,
+                    selector_extension_load_s=selector_diagnostics.extension_load_s,
+                    selector_launch_s=selector_diagnostics.selector_launch_s,
+                    result_sync_s=step_result_sync_s,
+                )
+            )
             valid_id_cache.discard(grammar_state)
 
             stage_start = time.perf_counter()
@@ -707,6 +809,10 @@ def run_target_only_generation(
             )
             live_grammar_states.clear()
         valid_id_cache = None
+        valid_id_lookup = None
+        valid_ids = None
+        selected = None
+        selector_diagnostics = None
         grammar = None
         decode_kwargs = None
         next_cache = None
@@ -777,6 +883,7 @@ def run_target_only_generation(
         prefill_cache=prefill_cache_snapshot,
         final_cache=final_cache_snapshot,
         tokens=tuple(generated_tokens),
+        selection_diagnostics=tuple(selection_diagnostics),
         peak_cuda_allocated_bytes=peak_cuda_allocated_bytes,
         timings=CudaTargetGenerationTimings(
             metadata_load_s=metadata_load_s,
@@ -786,7 +893,15 @@ def run_target_only_generation(
             tokenization_s=tokenization_s,
             prefill_s=prefill_s,
             valid_id_lookup_s=valid_id_lookup_s,
+            grammar_traversal_s=grammar_traversal_s,
+            valid_id_fingerprint_s=valid_id_fingerprint_s,
+            valid_id_cache_lookup_s=valid_id_cache_lookup_s,
+            valid_id_upload_s=valid_id_upload_s,
             selection_s=selection_s,
+            selector_input_preparation_s=selector_input_preparation_s,
+            selector_input_validation_s=selector_input_validation_s,
+            selector_extension_load_s=selector_extension_load_s,
+            selector_launch_s=selector_launch_s,
             result_sync_s=result_sync_s,
             grammar_advance_s=grammar_advance_s,
             detokenization_s=detokenization_s,
@@ -825,6 +940,14 @@ def format_target_generation_report(report: CudaTargetGenerationReport) -> str:
             ),
             f"  Cached decode steps: {report.cached_decode_steps}",
             f"  Cache object reused in place: {report.cache_object_reused}",
+            (
+                "  Valid-ID cache: "
+                f"hits={report.valid_id_cache_hits}, "
+                f"misses={report.valid_id_cache_misses}, "
+                f"unique_states={report.unique_grammar_states}, "
+                f"peak_entries={report.peak_valid_id_cache_entries}"
+            ),
+            ("  Peak valid-ID tensor: " f"{report.peak_valid_id_tensor_bytes / 1024:.1f} KiB"),
             f"  Grammar compile time: {report.timings.grammar_compile_s * 1000:.2f} ms",
             f"  Prefill time: {report.timings.prefill_s * 1000:.2f} ms",
             f"  Cached decode time: {report.timings.cached_decode_s * 1000:.2f} ms",
@@ -832,6 +955,21 @@ def format_target_generation_report(report: CudaTargetGenerationReport) -> str:
                 "  Selection time: "
                 f"{(report.timings.valid_id_lookup_s + report.timings.selection_s + report.timings.result_sync_s) * 1000:.2f} ms"
             ),
+            f"    Rust grammar traversal: {report.timings.grammar_traversal_s * 1000:.2f} ms",
+            f"    Valid-ID fingerprint: {report.timings.valid_id_fingerprint_s * 1000:.2f} ms",
+            f"    Valid-ID cache lookup: {report.timings.valid_id_cache_lookup_s * 1000:.2f} ms",
+            f"    Valid-ID CUDA upload: {report.timings.valid_id_upload_s * 1000:.2f} ms",
+            (
+                "    Selector input preparation: "
+                f"{report.timings.selector_input_preparation_s * 1000:.2f} ms"
+            ),
+            (
+                "    Selector input validation: "
+                f"{report.timings.selector_input_validation_s * 1000:.2f} ms"
+            ),
+            f"    Extension load/check: {report.timings.selector_extension_load_s * 1000:.2f} ms",
+            f"    Selector launch: {report.timings.selector_launch_s * 1000:.2f} ms",
+            f"    Result sync: {report.timings.result_sync_s * 1000:.2f} ms",
             (
                 "  Peak CUDA allocation increase: "
                 f"{report.peak_cuda_allocated_bytes / (1024 * 1024):.1f} MiB"
@@ -844,6 +982,7 @@ def format_target_generation_report(report: CudaTargetGenerationReport) -> str:
 __all__ = [
     "CudaTargetGenerationReport",
     "CudaTargetGenerationTimings",
+    "CudaSelectionStepDiagnostics",
     "DEFAULT_JSON_MAX_NEW_TOKENS",
     "DEFAULT_JSON_PROMPT",
     "DEFAULT_MAX_NEW_TOKENS",

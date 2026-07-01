@@ -9,6 +9,7 @@ from .decode_loop import (
     decode_greedy_from_logits,
 )
 from .grammar_handoff import (
+    CudaValidIdLookup,
     CudaValidIdCache,
     masked_argmax_from_cached_grammar_state,
     masked_argmax_from_grammar_state,
@@ -28,6 +29,7 @@ from .real_logits_handoff import (
     run_real_logits_handoff,
 )
 from .target_generation import (
+    CudaSelectionStepDiagnostics,
     CudaTargetGenerationReport,
     CudaTargetGenerationTimings,
     GeneratedToken,
@@ -51,9 +53,11 @@ __all__ = [
     "CUDA_EXTENSION_ERROR",
     "CudaGrammarDecodeResult",
     "CudaGrammarDecodeTimings",
+    "CudaSelectionStepDiagnostics",
     "CudaTargetGenerationReport",
     "CudaTargetGenerationTimings",
     "CudaValidIdCache",
+    "CudaValidIdLookup",
     "GeneratedToken",
     "KvCacheLayerSnapshot",
     "KvCacheProbeReport",
