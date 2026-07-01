@@ -13,6 +13,7 @@ mod grammar;
 mod json_engine;
 mod regex_engine;
 mod schema;
+mod token_index;
 use grammar::GrammarConstraint;
 
 /// a compiled regex validator exposed to Python

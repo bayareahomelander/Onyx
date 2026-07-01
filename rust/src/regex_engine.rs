@@ -10,7 +10,8 @@ use regex_automata::util::start::Config as StartConfig;
 use regex_automata::Anchored;
 use std::sync::Arc;
 
-use crate::constraint::{ConstraintEngine, ConstraintError};
+use crate::constraint::{ConstraintEngine, ConstraintError, IndexedValidTokens};
+use crate::token_index::FirstByteTokenIndex;
 
 /// compiled DFA with initial state for regex pattern matching
 pub struct CompiledDfa {
@@ -97,6 +98,28 @@ impl RegexEngine {
 
         current
     }
+
+    fn token_is_valid(&self, token_bytes: &[u8]) -> bool {
+        let mut test_state = self.current_state;
+
+        for &byte in token_bytes {
+            test_state = self.dfa.next_state(test_state, byte);
+            if self.dfa.is_dead_state(test_state) {
+                return false;
+            }
+        }
+
+        true
+    }
+
+    fn allowed_first_bytes(&self) -> [bool; 256] {
+        let mut allowed = [false; 256];
+        for (byte, slot) in allowed.iter_mut().enumerate() {
+            let next_state = self.dfa.next_state(self.current_state, byte as u8);
+            *slot = !self.dfa.is_dead_state(next_state);
+        }
+        allowed
+    }
 }
 
 impl ConstraintEngine for RegexEngine {
@@ -112,24 +135,34 @@ impl ConstraintEngine for RegexEngine {
                 continue;
             }
 
-            let mut test_state = self.current_state;
-            let mut is_valid = true;
-
-            for &byte in token_bytes {
-                test_state = self.dfa.next_state(test_state, byte);
-
-                if self.dfa.is_dead_state(test_state) {
-                    is_valid = false;
-                    break;
-                }
-            }
-
-            if is_valid {
+            if self.token_is_valid(token_bytes) {
                 valid_tokens.push(token_id);
             }
         }
 
         valid_tokens
+    }
+
+    fn get_valid_tokens_indexed(&self, index: &FirstByteTokenIndex) -> IndexedValidTokens {
+        let allowed_first_bytes = self.allowed_first_bytes();
+        let candidate_count = index.candidate_count(&allowed_first_bytes);
+        let mut token_ids = Vec::new();
+
+        index.for_each_candidate(&allowed_first_bytes, |token_id| {
+            if self
+                .vocabulary
+                .get(token_id)
+                .is_some_and(|token_bytes| self.token_is_valid(token_bytes))
+            {
+                token_ids.push(token_id);
+            }
+        });
+        token_ids.sort_unstable();
+
+        IndexedValidTokens {
+            token_ids,
+            candidate_count,
+        }
     }
 
     fn advance(&mut self, token_id: usize) -> Result<(), ConstraintError> {

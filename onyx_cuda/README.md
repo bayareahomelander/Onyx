@@ -197,6 +197,37 @@ correctness and ownership, not usable JSON throughput. The diagnostic report now
 exposes the individual costs needed to justify any later cache or CUDA change;
 it does not itself optimize the full-vocabulary scan.
 
+## Model-Free Rust Valid-Token Index Experiment
+
+`benchmark_rust_valid_token_index.py` compares the production Rust
+full-vocabulary scan with an explicitly experimental first-byte candidate index.
+The index is built lazily once per `GrammarConstraint`, excludes empty/special
+vocabulary entries, retains distinct token IDs for duplicate byte sequences, and
+is reused across state handles, resets, and constraint recompilation.
+
+The experiment does not change `get_valid_token_ids(state)`. Its separate
+`get_valid_token_ids_indexed_experimental(state)` path must return the exact same
+IDs in the exact same order before any timing is accepted. The benchmark uses the
+pinned 151,936-ID tokenizer vocabulary but does not load model weights, import an
+MLX runtime, or allocate CUDA tensors.
+
+```powershell
+python -m maturin develop --release
+python -m pytest tests/test_rust_valid_token_index.py -q
+python benchmark_rust_valid_token_index.py --local-files-only
+```
+
+The deterministic parity matrix covers regex states, nested objects, bounded
+typed arrays, enums, unions, Unicode splits, string patterns and length bounds,
+valid decimal/exponent prefixes, invalid number forms, finished states, reset,
+recompilation, and opaque handle reuse.
+
+A five-iteration run on the pinned vocabulary retained approximately 1.16 MiB,
+built the index in approximately 1.30 ms, preserved exact parity in every
+scenario, and measured a 3.35x aggregate median speedup across the JSON states.
+This is evidence for a separate production follow-up, not authorization to
+replace the reference path in this deliverable.
+
 ## Current Components
 
 ### Sparse Masked Argmax

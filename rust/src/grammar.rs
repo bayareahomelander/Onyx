@@ -7,10 +7,12 @@
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use std::collections::HashMap;
+use std::sync::OnceLock;
 
 use crate::constraint::ConstraintEngine;
 use crate::json_engine::JsonEngine;
 use crate::regex_engine::RegexEngine;
+use crate::token_index::FirstByteTokenIndex;
 
 /// a grammar constraint engine exposed to Python
 ///
@@ -20,6 +22,8 @@ use crate::regex_engine::RegexEngine;
 pub struct GrammarConstraint {
     /// the model vocabulary as byte sequences, indexed by token ID
     vocabulary: Vec<Vec<u8>>,
+    /// lazily built experimental index shared by all grammar states
+    valid_token_index: OnceLock<FirstByteTokenIndex>,
     /// the compiled initial engine template (None until a pattern is compiled)
     initial_engine: Option<Box<dyn ConstraintEngine>>,
     /// independent state engines keyed by opaque Python-visible handles
@@ -62,6 +66,11 @@ impl GrammarConstraint {
         Ok(state_id)
     }
 
+    fn valid_token_index(&self) -> &FirstByteTokenIndex {
+        self.valid_token_index
+            .get_or_init(|| FirstByteTokenIndex::new(&self.vocabulary))
+    }
+
     fn install_engine(
         &mut self,
         engine: Box<dyn ConstraintEngine>,
@@ -89,6 +98,7 @@ impl GrammarConstraint {
 
         Ok(GrammarConstraint {
             vocabulary,
+            valid_token_index: OnceLock::new(),
             initial_engine: None,
             states: HashMap::new(),
             next_state_id: 1,
@@ -161,6 +171,34 @@ impl GrammarConstraint {
     /// the state parameter is an opaque handle returned by init_state or advance_state.
     fn get_valid_token_ids(&self, state: u32) -> PyResult<Vec<usize>> {
         Ok(self.state_engine(state)?.get_valid_tokens())
+    }
+
+    /// build the experimental first-byte index and report its bounded size
+    ///
+    /// returns `(non_empty_token_count, retained_bytes)`. Production lookup
+    /// does not call this method or build the index.
+    fn build_valid_token_index_experimental(&self) -> (usize, usize) {
+        let index = self.valid_token_index();
+        (index.non_empty_token_count(), index.retained_bytes())
+    }
+
+    /// report whether the experimental index has been built
+    fn valid_token_index_built_experimental(&self) -> bool {
+        self.valid_token_index.get().is_some()
+    }
+
+    /// get valid token IDs through the experimental first-byte candidate index
+    ///
+    /// returns `(token_ids, candidate_count)`. `token_ids` must exactly match
+    /// `get_valid_token_ids`, including ordering. Production lookup remains on
+    /// the reference full-vocabulary scan.
+    fn get_valid_token_ids_indexed_experimental(
+        &self,
+        state: u32,
+    ) -> PyResult<(Vec<usize>, usize)> {
+        let engine = self.state_engine(state)?;
+        let result = engine.get_valid_tokens_indexed(self.valid_token_index());
+        Ok((result.token_ids, result.candidate_count))
     }
 
     /// check if the given state is a match state (pattern fully matched)
@@ -276,6 +314,15 @@ impl GrammarConstraint {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn assert_indexed_parity(constraint: &GrammarConstraint, state: u32) -> usize {
+        let reference = constraint.get_valid_token_ids(state).unwrap();
+        let (indexed, candidate_count) = constraint
+            .get_valid_token_ids_indexed_experimental(state)
+            .unwrap();
+        assert_eq!(indexed, reference);
+        candidate_count
+    }
 
     fn make_test_vocab() -> Vec<Vec<u8>> {
         vec![
@@ -396,5 +443,70 @@ mod tests {
         assert!(constraint.advance_state(999, 0).is_err());
         assert!(constraint.is_match_state(999).is_err());
         assert!(constraint.is_dead_state(999).is_err());
+    }
+
+    #[test]
+    fn test_experimental_index_matches_regex_states() {
+        let vocab = vec![
+            Vec::new(),
+            b"A".to_vec(),
+            b"B".to_vec(),
+            b"AB".to_vec(),
+            b"-".to_vec(),
+            b"1".to_vec(),
+            b"9".to_vec(),
+            b"x".to_vec(),
+        ];
+        let mut constraint = GrammarConstraint::new(vocab).unwrap();
+        constraint.compile_regex("[A-Z]{2}-[0-9]").unwrap();
+        let initial = constraint.init_state().unwrap();
+        let initial_candidates = assert_indexed_parity(&constraint, initial);
+        let after_a = constraint.advance_state(initial, 1).unwrap();
+        assert_indexed_parity(&constraint, after_a);
+        let after_b = constraint.advance_state(after_a, 2).unwrap();
+        assert_indexed_parity(&constraint, after_b);
+        let after_dash = constraint.advance_state(after_b, 4).unwrap();
+        assert_indexed_parity(&constraint, after_dash);
+        let finished = constraint.advance_state(after_dash, 5).unwrap();
+        assert_indexed_parity(&constraint, finished);
+
+        let (non_empty_tokens, retained_bytes) = constraint.build_valid_token_index_experimental();
+        assert_eq!(non_empty_tokens, 7);
+        assert!(retained_bytes < 16 * 1024);
+        assert!(initial_candidates < non_empty_tokens);
+    }
+
+    #[test]
+    fn test_experimental_index_matches_json_union_and_number_prefixes() {
+        let vocab = vec![
+            Vec::new(),
+            b"[".to_vec(),
+            b"]".to_vec(),
+            b"1.".to_vec(),
+            b"5".to_vec(),
+            b"1e+".to_vec(),
+            b"2".to_vec(),
+            b"01".to_vec(),
+            b"null".to_vec(),
+            b"true".to_vec(),
+        ];
+        let schema =
+            r#"{"type":["array","null"],"items":{"type":"number"},"minItems":1,"maxItems":1}"#;
+        let mut constraint = GrammarConstraint::new(vocab).unwrap();
+        constraint.compile_json_schema(schema).unwrap();
+        let initial = constraint.init_state().unwrap();
+        assert_indexed_parity(&constraint, initial);
+
+        let in_array = constraint.advance_state(initial, 1).unwrap();
+        assert_indexed_parity(&constraint, in_array);
+        let decimal_prefix = constraint.advance_state(in_array, 3).unwrap();
+        assert_indexed_parity(&constraint, decimal_prefix);
+        let decimal_complete = constraint.advance_state(decimal_prefix, 4).unwrap();
+        assert_indexed_parity(&constraint, decimal_complete);
+        let finished_array = constraint.advance_state(decimal_complete, 2).unwrap();
+        assert_indexed_parity(&constraint, finished_array);
+
+        let null_finished = constraint.advance_state(initial, 8).unwrap();
+        assert_indexed_parity(&constraint, null_finished);
     }
 }

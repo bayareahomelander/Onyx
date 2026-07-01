@@ -7,6 +7,14 @@
 use std::error::Error;
 use std::fmt;
 
+use crate::token_index::FirstByteTokenIndex;
+
+/// Result from the experimental candidate-indexed valid-token path.
+pub struct IndexedValidTokens {
+    pub token_ids: Vec<usize>,
+    pub candidate_count: usize,
+}
+
 /// error type for constraint engine operations
 #[derive(Debug)]
 pub enum ConstraintError {
@@ -60,6 +68,12 @@ pub trait ConstraintEngine: Send + Sync {
     /// returns a vector of token IDs that are valid continuations from
     /// the current state. the sampling loop uses this to mask invalid tokens.
     fn get_valid_tokens(&self) -> Vec<usize>;
+
+    /// get valid token IDs through an experimental bounded candidate index
+    ///
+    /// implementations must preserve exact token-ID contents and ordering from
+    /// `get_valid_tokens`. The production sampling path does not call this.
+    fn get_valid_tokens_indexed(&self, index: &FirstByteTokenIndex) -> IndexedValidTokens;
 
     /// advance the state by consuming a token
     ///

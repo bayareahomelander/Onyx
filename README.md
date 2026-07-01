@@ -406,6 +406,7 @@ python -m pytest tests/test_cuda_tokenizer_probe.py -q
 python -m pytest tests/test_cuda_real_logits_handoff.py -q
 python -m pytest tests/test_cuda_kv_cache_probe.py -q
 python -m pytest tests/test_cuda_target_generation.py -q
+python -m pytest tests/test_rust_valid_token_index.py -q
 python probe_cuda_tokenizer.py
 python probe_cuda_real_logits.py --local-files-only
 python probe_cuda_kv_cache.py --local-files-only
@@ -416,11 +417,15 @@ python probe_cuda_target_generation.py --local-files-only --json-schema-file exa
 python benchmark_cuda_masked_argmax.py
 python benchmark_cuda_grammar_handoff.py
 python benchmark_cuda_decode_loop.py
+python benchmark_rust_valid_token_index.py --local-files-only
 ```
 
-On Windows, the benchmark also needs the NVIDIA CUDA Toolkit with `nvcc` on
-`PATH`, compatible Microsoft C++ Build Tools, and a CUDA-enabled PyTorch build.
-The current CUDA experiment is intended for editable-source-tree development.
+On Windows, the CUDA benchmarks and model-facing probes need the NVIDIA CUDA
+Toolkit with `nvcc` on `PATH`, compatible Microsoft C++ Build Tools, and a
+CUDA-enabled PyTorch build. The model-free Rust valid-token index benchmark
+needs the Rust extension and tokenizer metadata but does not require CUDA or
+model weights. The current CUDA experiment is intended for editable-source-tree
+development.
 The tokenizer probe loads only the `Qwen/Qwen2.5-0.5B-Instruct` tokenizer and
 configuration metadata. The real-logits probe then loads the same pinned model
 with Quanto INT4 weights, runs one CUDA forward pass, verifies the observed
@@ -438,6 +443,13 @@ array. Reports separate Rust traversal, fingerprinting, cache lookup, CUDA uploa
 selector validation/loading/launch, and result synchronization, with per-token
 cache and tensor diagnostics. It remains target-only and does not add speculation,
 streaming, or API integration.
+
+The model-free Rust valid-token index experiment compares the production
+full-vocabulary scan with a lazy first-byte candidate index over the same pinned
+151,936-ID tokenizer vocabulary. It requires exact token-ID and ordering parity,
+reports build time, retained host memory, candidate reduction, and warm lookup
+latency, and leaves `get_valid_token_ids(...)` on the reference scan. It does not
+load model weights or use CUDA.
 
 See [`onyx_cuda/README.md`](onyx_cuda/README.md) for scope and constraints.
 

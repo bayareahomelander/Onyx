@@ -10,9 +10,10 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::constraint::{ConstraintEngine, ConstraintError};
+use crate::constraint::{ConstraintEngine, ConstraintError, IndexedValidTokens};
 use crate::regex_engine::compile_pattern_dfa;
 use crate::schema::{validate_schema_patterns, PropertyBlueprint, SchemaBlueprint, SchemaType};
+use crate::token_index::FirstByteTokenIndex;
 
 /// syntax state within an object scope
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -793,6 +794,18 @@ impl JsonEngine {
         true
     }
 
+    fn allowed_first_bytes(&self) -> [bool; 256] {
+        let mut allowed = [false; 256];
+        if self.dead || self.finished {
+            return allowed;
+        }
+
+        for (byte, slot) in allowed.iter_mut().enumerate() {
+            *slot = self.validate_token(&[byte as u8]);
+        }
+        allowed
+    }
+
     /// advance the actual state with a byte
     fn advance_byte(&mut self, byte: u8) -> Result<(), ConstraintError> {
         let valid = Self::validate_byte_static(
@@ -1431,6 +1444,35 @@ impl ConstraintEngine for JsonEngine {
         }
 
         valid_tokens
+    }
+
+    fn get_valid_tokens_indexed(&self, index: &FirstByteTokenIndex) -> IndexedValidTokens {
+        if self.dead || self.finished {
+            return IndexedValidTokens {
+                token_ids: Vec::new(),
+                candidate_count: 0,
+            };
+        }
+
+        let allowed_first_bytes = self.allowed_first_bytes();
+        let candidate_count = index.candidate_count(&allowed_first_bytes);
+        let mut token_ids = Vec::new();
+
+        index.for_each_candidate(&allowed_first_bytes, |token_id| {
+            if self
+                .vocab
+                .get(&token_id)
+                .is_some_and(|token_bytes| self.validate_token(token_bytes))
+            {
+                token_ids.push(token_id);
+            }
+        });
+        token_ids.sort_unstable();
+
+        IndexedValidTokens {
+            token_ids,
+            candidate_count,
+        }
     }
 
     fn advance(&mut self, token_id: usize) -> Result<(), ConstraintError> {
