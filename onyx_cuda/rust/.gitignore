@@ -1,0 +1,2 @@
+# The Windows extension is a released binary crate; keep its exact dependency resolution.
+!Cargo.lock
