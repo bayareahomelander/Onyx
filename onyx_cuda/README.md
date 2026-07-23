@@ -21,6 +21,8 @@ Transformers instead of the Apple MLX runtime used by the macOS package.
 - Exact checkpoint and transactional rollback of the pinned production `DynamicCache`.
 - A framework-neutral, model-free draft-proposal primitive with exact rejection rollback
   checkpoints, deterministic replay, and failure-atomic cleanup.
+- Direct isolated qualification of the pinned 0.5B production backend as a D32 proposal producer
+  on `cuda:0`, with greedy and fresh-seeded CUDA selection plus exact rejection rollback.
 - Pinned production batched target verification in one Transformers forward, with exact checkpoint
   rollback and replay composition.
 - A framework-neutral, model-free match/replace acceptance decision that accepts target-matching
@@ -207,7 +209,7 @@ and CUDA mask-application totals in `metrics.grammar_timing`.
 
 The Windows package does not yet provide:
 
-- a production draft model or selected draft/target pair;
+- a selected two-model draft/target pair or a separate production draft engine;
 - a cache-coordinated iterative speculative engine or user-visible speculative decoding;
 - production draft/target evidence pairing, cache reconciliation, or a final-row/bonus-token policy;
 - grammar-state speculation or speculative metrics;
@@ -220,7 +222,7 @@ The Windows package does not yet provide:
 The 0.5B target is the only production default. A separately pinned 3B model has bounded
 target-only qualification but is not the default, is not qualified for cache checkpoints or
 simultaneous draft/target residency, and carries a research/evaluation license rather than Apache
-2.0.
+2.0. The isolated D34 proposal-role qualification does not select the 0.5B model as a release draft.
 
 ## Development
 

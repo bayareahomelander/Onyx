@@ -1,5 +1,5 @@
 from contextlib import nullcontext
-from dataclasses import FrozenInstanceError, replace
+from dataclasses import FrozenInstanceError, fields, replace
 import inspect
 from types import SimpleNamespace
 import gc
@@ -18,7 +18,9 @@ from onyx_cuda import (
     CacheCheckpointStateError,
     CheckpointableAutoregressiveBackend,
     DEFAULT_TARGET_PROFILE,
+    DraftProposalCleanupError,
     QWEN_3B_CANDIDATE_PROFILE,
+    generate_draft_proposal,
 )
 from onyx_cuda.torch_backend import (
     TorchBackendExecutionError,
@@ -1184,6 +1186,435 @@ def test_verification_rows_and_parent_logits_are_caller_owned_only():
     assert backend_checkpoint_state(backend) != state_before
     backend.rollback_cache(checkpoint)
     assert_cache_prefix(backend, (0,))
+
+
+# D34 production draft-proposal composition
+
+
+def _release_d34_result(backend, result):
+    for checkpoint in result.rollback_checkpoints:
+        backend.release_cache_checkpoint(checkpoint)
+
+
+def _d34_recording_selector(token_ids, seen_rows):
+    selected = iter(token_ids)
+
+    def select(row):
+        seen_rows.append(row)
+        return next(selected)
+
+    return select
+
+
+def _assert_d34_checkpoint_metadata_is_tensor_free(backend, result, selector):
+    forbidden_types = (
+        FakeInputTensor,
+        FakeLogits,
+        FakeLogitVector,
+        FakeCacheTensor,
+        FakeModel,
+        type(selector),
+    )
+    assert not hasattr(result, "__dict__")
+    assert all(
+        not isinstance(value, forbidden_types)
+        for value in (
+            result.proposal_token_ids,
+            result.rollback_checkpoints,
+            result.initial_cache_length,
+            result.final_cache_length,
+        )
+    )
+    for checkpoint in result.rollback_checkpoints:
+        snapshot = backend._cache_checkpoints[checkpoint.allocation_id]
+        assert all(
+            isinstance(getattr(checkpoint, field.name), int)
+            for field in fields(checkpoint)
+        )
+        assert all(isinstance(token_id, int) for token_id in snapshot.token_ids)
+        assert all(
+            not isinstance(getattr(snapshot.layout, field.name), forbidden_types)
+            for field in fields(snapshot.layout)
+        )
+
+
+def test_d34_one_token_proposal_uses_two_one_token_decodes_and_no_verification(
+    monkeypatch,
+):
+    model = FakeModel()
+    backend = make_backend(model=model)
+    backend.prefill([0, 1])
+    cache = backend._cache
+    layout = backend._active_cache_layout
+    model_calls_before = len(model.calls)
+    seen_rows = []
+
+    def fail_verification(*args, **kwargs):
+        raise AssertionError("D34 must not invoke batched target verification")
+
+    monkeypatch.setattr(backend, "verify_proposal", fail_verification)
+    result = generate_draft_proposal(
+        backend,
+        2,
+        proposal_length=1,
+        select_token=_d34_recording_selector((3,), seen_rows),
+    )
+
+    decode_calls = model.calls[model_calls_before:]
+    assert [tuple(call["input_ids"].values[0]) for call in decode_calls] == [
+        (2,),
+        (3,),
+    ]
+    assert [call["logits_to_keep"] for call in decode_calls] == [1, 1]
+    assert [row.marker for row in seen_rows] == [(0, 1, 2)]
+    assert result.proposal_token_ids == (3,)
+    assert result.initial_cache_length == 2
+    assert result.final_cache_length == 4
+    assert tuple(cp.cache_length for cp in result.rollback_checkpoints) == (3,)
+    assert tuple(backend._cache_checkpoints) == (
+        result.rollback_checkpoints[0].allocation_id,
+    )
+    assert backend._cache is cache
+    assert backend._active_cache_layout == layout
+    assert_cache_prefix(backend, (0, 1, 2, 3))
+
+    final_prefix = tuple(backend._active_token_ids)
+    _release_d34_result(backend, result)
+    _release_d34_result(backend, result)
+    assert backend._cache_checkpoints == {}
+    assert tuple(backend._active_token_ids) == final_prefix
+    assert backend._cache is cache
+    assert backend._active_cache_layout == layout
+    assert_cache_prefix(backend, final_prefix)
+
+
+def test_d34_multi_token_proposal_aligns_rows_checkpoints_and_production_cache():
+    model = FakeModel()
+    backend = make_backend(model=model)
+    backend.prefill([0, 1])
+    cache = backend._cache
+    layout = backend._active_cache_layout
+    model_calls_before = len(model.calls)
+    seen_rows = []
+    selector = _d34_recording_selector((3, 4, 5), seen_rows)
+
+    result = generate_draft_proposal(
+        backend,
+        2,
+        proposal_length=3,
+        select_token=selector,
+    )
+
+    decode_calls = model.calls[model_calls_before:]
+    assert [tuple(call["input_ids"].values[0]) for call in decode_calls] == [
+        (2,),
+        (3,),
+        (4,),
+        (5,),
+    ]
+    assert all(call["logits_to_keep"] == 1 for call in decode_calls)
+    assert [row.marker for row in seen_rows] == [
+        (0, 1, 2),
+        (0, 1, 2, 3),
+        (0, 1, 2, 3, 4),
+    ]
+    assert all(row.marker != (0, 1, 2, 3, 4, 5) for row in seen_rows)
+    assert result.proposal_token_ids == (3, 4, 5)
+    assert result.initial_cache_length == 2
+    assert result.final_cache_length == 6
+    assert tuple(cp.cache_length for cp in result.rollback_checkpoints) == (3, 4, 5)
+    assert tuple(backend._cache_checkpoints) == tuple(
+        cp.allocation_id for cp in result.rollback_checkpoints
+    )
+    assert backend._next_checkpoint_id == 5
+    assert backend._cache is cache
+    assert backend._active_cache_layout == layout
+    assert len(backend._cache.layers) == 24
+    assert_cache_prefix(backend, (0, 1, 2, 3, 4, 5))
+    _assert_d34_checkpoint_metadata_is_tensor_free(backend, result, selector)
+
+    _release_d34_result(backend, result)
+
+
+@pytest.mark.parametrize("rejection_index", [0, 1, 2])
+def test_d34_each_rejection_checkpoint_restores_the_exact_production_prefix(
+    rejection_index,
+):
+    backend = make_backend()
+    prompt = (0, 1)
+    backend.prefill(prompt)
+    root = backend.create_cache_checkpoint()
+    result = generate_draft_proposal(
+        backend,
+        2,
+        proposal_length=3,
+        select_token=_d34_recording_selector((3, 4, 5), []),
+    )
+    target = result.rollback_checkpoints[rejection_index]
+
+    backend.rollback_cache(target)
+
+    expected_prefix = (*prompt, 2, *result.proposal_token_ids[:rejection_index])
+    assert target.cache_length == len(prompt) + 1 + rejection_index
+    assert_cache_prefix(backend, expected_prefix)
+    assert tuple(backend._cache_checkpoints) == (
+        root.allocation_id,
+        *(cp.allocation_id for cp in result.rollback_checkpoints[: rejection_index + 1]),
+    )
+    same_position_state = backend_checkpoint_state(backend)
+    backend.rollback_cache(target)
+    assert backend_checkpoint_state(backend) == same_position_state
+    for checkpoint in result.rollback_checkpoints[rejection_index + 1 :]:
+        with pytest.raises(CacheCheckpointStateError, match="discarded suffix"):
+            backend.rollback_cache(checkpoint)
+
+    cache_state = (
+        id(backend._cache),
+        backend._active_cache_layout,
+        tuple(backend._active_token_ids),
+    )
+    _release_d34_result(backend, result)
+    _release_d34_result(backend, result)
+    assert (
+        id(backend._cache),
+        backend._active_cache_layout,
+        tuple(backend._active_token_ids),
+    ) == cache_state
+    assert tuple(backend._cache_checkpoints) == (root.allocation_id,)
+    backend.rollback_cache(root)
+    assert_cache_prefix(backend, prompt)
+    backend.release_cache_checkpoint(root)
+
+
+def test_d34_root_rollback_replays_with_fresh_selector_and_new_allocations():
+    backend = make_backend()
+    prompt = (0, 1)
+    backend.prefill(prompt)
+    root = backend.create_cache_checkpoint()
+    cache = backend._cache
+    layout = backend._active_cache_layout
+
+    first = generate_draft_proposal(
+        backend,
+        2,
+        proposal_length=3,
+        select_token=_d34_recording_selector((3, 4, 5), []),
+    )
+    first_allocations = tuple(cp.allocation_id for cp in first.rollback_checkpoints)
+    backend.rollback_cache(root)
+    _release_d34_result(backend, first)
+
+    replay = generate_draft_proposal(
+        backend,
+        2,
+        proposal_length=3,
+        select_token=_d34_recording_selector((3, 4, 5), []),
+    )
+
+    replay_allocations = tuple(cp.allocation_id for cp in replay.rollback_checkpoints)
+    assert replay.proposal_token_ids == first.proposal_token_ids == (3, 4, 5)
+    assert tuple(cp.cache_length for cp in replay.rollback_checkpoints) == (3, 4, 5)
+    assert min(replay_allocations) > max(first_allocations)
+    assert backend._cache is cache
+    assert backend._active_cache_layout == layout
+    assert_cache_prefix(backend, (*prompt, 2, *replay.proposal_token_ids))
+
+    backend.rollback_cache(root)
+    _release_d34_result(backend, replay)
+    backend.release_cache_checkpoint(root)
+
+
+def test_d34_bounded_propose_rollback_release_keeps_one_root_and_monotonic_ids():
+    backend = make_backend()
+    prompt = (0,)
+    backend.prefill(prompt)
+    root = backend.create_cache_checkpoint()
+    cache = backend._cache
+    layout = backend._active_cache_layout
+    epoch = backend._epoch
+    previous_allocation = root.allocation_id
+
+    for _ in range(250):
+        result = generate_draft_proposal(
+            backend,
+            1,
+            proposal_length=1,
+            select_token=lambda row: 2,
+        )
+        allocation = result.rollback_checkpoints[0].allocation_id
+        assert allocation > previous_allocation
+        previous_allocation = allocation
+        backend.rollback_cache(root)
+        _release_d34_result(backend, result)
+        _release_d34_result(backend, result)
+        assert tuple(backend._cache_checkpoints) == (root.allocation_id,)
+        assert backend._epoch == epoch
+        assert backend._cache is cache
+        assert backend._active_cache_layout == layout
+        assert_cache_prefix(backend, prompt)
+
+    assert backend._next_checkpoint_id == 502
+    backend.release_cache_checkpoint(root)
+    assert backend._cache_checkpoints == {}
+
+
+def test_d34_unsupported_production_profile_fails_before_decode_or_selection():
+    model = FakeModel()
+    backend = make_backend(model=model, profile=QWEN_3B_CANDIDATE_PROFILE)
+    backend.prefill([0, 1])
+    before = backend_checkpoint_state(backend)
+    model_calls_before = len(model.calls)
+    selector_calls = []
+
+    with pytest.raises(BackendStateError, match="pinned 0.5B target on cuda:0"):
+        generate_draft_proposal(
+            backend,
+            2,
+            proposal_length=1,
+            select_token=lambda row: selector_calls.append(row),
+        )
+
+    assert len(model.calls) == model_calls_before
+    assert selector_calls == []
+    assert backend_checkpoint_state(backend) == before
+    assert_cache_prefix(backend, (0, 1))
+
+
+def test_d34_selector_failure_restores_root_and_backend_is_immediately_reusable():
+    model = FakeModel()
+    backend = make_backend(model=model)
+    prompt = (0, 1)
+    backend.prefill(prompt)
+    root = backend.create_cache_checkpoint()
+    cache = backend._cache
+    layout = backend._active_cache_layout
+    epoch = backend._epoch
+    failure = LookupError("injected D34 selector failure")
+    seen_rows = []
+
+    def failing_selector(row):
+        seen_rows.append(row)
+        if len(seen_rows) == 2:
+            raise failure
+        return 3
+
+    with pytest.raises(LookupError, match="injected D34 selector failure") as raised:
+        generate_draft_proposal(
+            backend,
+            2,
+            proposal_length=3,
+            select_token=failing_selector,
+        )
+
+    assert raised.value is failure
+    assert [row.marker for row in seen_rows] == [(0, 1, 2), (0, 1, 2, 3)]
+    assert backend._cache is cache
+    assert backend._active_cache_layout == layout
+    assert backend._epoch == epoch
+    assert tuple(backend._cache_checkpoints) == (root.allocation_id,)
+    assert backend._next_checkpoint_id == 5
+    assert_cache_prefix(backend, prompt)
+
+    result = generate_draft_proposal(
+        backend,
+        2,
+        proposal_length=3,
+        select_token=_d34_recording_selector((3, 4, 5), []),
+    )
+    assert min(cp.allocation_id for cp in result.rollback_checkpoints) > 4
+    assert_cache_prefix(backend, (*prompt, 2, *result.proposal_token_ids))
+    backend.rollback_cache(root)
+    _release_d34_result(backend, result)
+    backend.release_cache_checkpoint(root)
+
+
+def test_d34_terminal_decode_failure_reports_cleanup_error_and_safe_empty_epoch():
+    model = FakeModel()
+    backend = make_backend(model=model)
+    backend.prefill([0, 1])
+    root = backend.create_cache_checkpoint()
+    previous_epoch = backend._epoch
+    injected = RuntimeError("injected D34 post-mutation failure")
+
+    def arm_terminal_failure(row):
+        model.error_after_cache_update = injected
+        return 3
+
+    with pytest.raises(DraftProposalCleanupError) as raised:
+        generate_draft_proposal(
+            backend,
+            2,
+            proposal_length=2,
+            select_token=arm_terminal_failure,
+        )
+
+    error = raised.value
+    assert isinstance(error.original_failure, TorchBackendExecutionError)
+    assert error.original_failure.__cause__ is injected
+    assert [operation for operation, _ in error.cleanup_failures] == [
+        "start checkpoint rollback"
+    ]
+    assert isinstance(error.cleanup_failures[0][1], CacheCheckpointStateError)
+    assert backend._epoch == previous_epoch + 1
+    assert backend._cache is None
+    assert backend.cache_length == 0
+    assert backend._active_token_ids == []
+    assert backend._active_cache_layout is None
+    assert backend._cache_checkpoints == {}
+    assert backend._next_checkpoint_id == 1
+    with pytest.raises(CacheCheckpointStateError, match="stale sequence"):
+        backend.rollback_cache(root)
+    backend.release_cache_checkpoint(root)
+
+    model.error_after_cache_update = None
+    backend.prefill([0, 1])
+    assert_cache_prefix(backend, (0, 1))
+
+
+def test_d34_result_and_checkpoint_registry_do_not_retain_transient_objects():
+    class NonRetainingFakeModel(FakeModel):
+        def __init__(self):
+            super().__init__()
+            self.input_refs = []
+
+        def __call__(self, **kwargs):
+            self.input_refs.append(weakref.ref(kwargs["input_ids"]))
+            output = super().__call__(**kwargs)
+            self.calls.clear()
+            return output
+
+    class WeakRecordingSelector:
+        def __init__(self):
+            self.row_refs = []
+            self.token_ids = iter((3, 4, 5))
+
+        def __call__(self, row):
+            self.row_refs.append(weakref.ref(row))
+            return next(self.token_ids)
+
+    model = NonRetainingFakeModel()
+    backend = make_backend(model=model)
+    backend.prefill([0, 1])
+    selector = WeakRecordingSelector()
+    selector_ref = weakref.ref(selector)
+
+    result = generate_draft_proposal(
+        backend,
+        2,
+        proposal_length=3,
+        select_token=selector,
+    )
+    row_refs = tuple(selector.row_refs)
+    _assert_d34_checkpoint_metadata_is_tensor_free(backend, result, selector)
+    assert all(reference() is None for reference in model.input_refs)
+
+    del selector
+    gc.collect()
+
+    assert selector_ref() is None
+    assert all(reference() is None for reference in row_refs)
+    assert_cache_prefix(backend, (0, 1, 2, 3, 4, 5))
+    _release_d34_result(backend, result)
 
 
 @pytest.mark.parametrize(

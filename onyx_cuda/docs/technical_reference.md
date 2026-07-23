@@ -107,8 +107,30 @@ selector or RNG, backend or model, target result, grammar state, tensor, or metr
 The deterministic fake proves row identity and alignment, exact token/cache transitions, every
 rejection position, caller-owned replay and alternative selection, cleanup aggregation, monotonic
 allocation identity, repeated epochs, bounded reuse, and optional-runtime-free import behavior.
-There is no production draft backend, selected draft/target pair, acceptance loop, or grammar-state
-integration; this primitive by itself is not speculative decoding.
+
+D34 qualifies the existing pinned `TorchCUDATargetBackend`, loaded through
+`load_torch_cuda_target()`, as a direct producer for this one isolated operation on `cuda:0`. No
+draft-specific adapter, subclass, factory, lifecycle owner, or package export is added: `draft`
+describes the backend's role for the call, not a selected release model. Every proposal uses the
+ordinary one-token decode path with `logits_to_keep=1`; the selector receives the first `n` cropped
+native FP16 CUDA rows directly, while the final decoded row is validated but not selected or
+retained. The active `DynamicCache` object and D29 layout remain unchanged, and the returned
+checkpoints map exactly to rejection after zero through `n-1` accepted proposal tokens.
+
+Greedy replay borrows `select_cuda_argmax` directly. Seeded temperature/top-p replay rolls the
+backend back to a caller-owned root and creates a fresh same-policy, same-seed CUDA sampler for the
+new operation; an already-consumed sampler is not treated as replayable state. Unsupported profiles
+fail at private-start checkpoint creation before decode or selection. A selector exception while
+the backend remains healthy restores the private start, preserves an external root, releases all
+D32-owned handles, and leaves the backend reusable. A terminal production decode failure instead
+clears the backend epoch; D32 reports `DraftProposalCleanupError` containing the original typed
+backend failure and the failed stale-checkpoint rollback rather than weakening that safe-empty
+policy.
+
+D30/D31 batched target verification and the D33 match/replace decision are regression boundaries,
+not inputs to D34, and are never invoked by this path. There is still no selected two-model pair,
+separate production draft engine, cache coordinator, acceptance loop, or grammar-state integration;
+this isolated qualification is not speculative decoding.
 
 ### Batched target verification
 
@@ -315,8 +337,9 @@ cache-creation failure, terminal forward failure, and terminal invariant failure
 affected epoch.
 
 This qualification is deliberately narrow. Checkpoint and batched-verification support do not cover
-the 3B candidate, another device, sliding/offloaded caches, arbitrary Transformers cache classes, or
-speculative decoding.
+the 3B candidate, another device, sliding/offloaded caches, arbitrary Transformers cache classes,
+or a two-model speculative engine. D34 reuses the same narrow checkpoint support for an isolated
+proposal role only.
 
 ## Selection, stops, and streaming
 
@@ -503,6 +526,20 @@ differences range from 0.0234375 to 0.025390625, so cross-kernel bitwise equalit
 The higher D31 peak is 553,419,776 allocated and 801,112,064 reserved bytes; final cleanup again
 returns to 8,520,704 allocated / 497,025,024 reserved bytes without second-lifecycle growth.
 
+The D34 production draft-proposal qualifier runs two complete single-model lifecycles and 200 total
+proposal/root-rollback/release cycles with a qualification fixture length of three. The fixed
+eight-token prompt selects current token `12890`; greedy proposal `(271, 785, 9960)` and fresh-seeded
+proposal `(271, 2121, 949)` both replay exactly. Each operation uses four ordinary one-token
+forwards and three selector calls, returns rejection checkpoint lengths `(9, 10, 11)`, and leaves
+the full cache at length 12. Every rejection prefix, full-acceptance release, selector-failure
+recovery, cache identity/layout, and all 24 physical layer prefixes pass exact checks. The unchanged
+target-only baseline is `(12890, 271, 785, 9960)` before and after the matrix and across lifecycles.
+
+After warmup, both D34 lifecycles stabilize at 467,202,560 allocated and 803,209,216 reserved bytes,
+with 1,326 current allocations and 1,326 active allocations. Lifecycle allocated peaks are
+544,899,072 and 553,419,776 bytes; reserved peak is 803,209,216 bytes in both. Post-close cleanup
+returns to 8,520,704 allocated / 497,025,024 reserved bytes without second-lifecycle growth.
+
 These measurements do not establish final release context, output, concurrency, or speculative
 `gamma` limits.
 
@@ -546,7 +583,7 @@ path, source, package, or import dependency on the root Rust crate.
 
 The current Windows package does not yet provide:
 
-- a production draft model or selected draft/target pair;
+- a selected two-model draft/target pair or a separate production draft engine;
 - a cache-coordinated iterative speculative loop, production evidence pairing, or final-row/bonus
   policy;
 - grammar-state speculation;
@@ -560,6 +597,6 @@ The current Windows package does not yet provide:
 - native valid-token caching or a persistent CUDA mask workspace.
 
 Those capabilities remain separately sized roadmap work. Production rollback support, the
-model-free draft-proposal primitive, the batched-verification contract, and the pure match/replace
-acceptance decision do not form speculative decoding without the separately owned production-draft
-and cache-coordinated engine layers.
+model-free draft-proposal primitive, the isolated production proposal-role qualification, the
+batched-verification contract, and the pure match/replace acceptance decision do not form
+speculative decoding without a selected pair and a separately owned cache-coordinated engine.
