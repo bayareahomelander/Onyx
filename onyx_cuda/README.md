@@ -28,6 +28,10 @@ Transformers instead of the Apple MLX runtime used by the macOS package.
 - A framework-neutral, model-free match/replace acceptance decision that accepts target-matching
   draft tokens, returns the first target-selected mismatch replacement, and deliberately leaves the
   post-proposal final row unused.
+- A framework-neutral, model-free one-iteration coordinator that composes proposal, verification,
+  and acceptance over two already-prefilled checkpointable roles. A mismatch restores both caches
+  to the exact accepted prefix and leaves the target replacement uncached; full acceptance keeps
+  both complete proposal suffixes cached without selecting a bonus token.
 - A lazy independent Rust grammar runtime; normal package import does not initialize CUDA or load a
   model.
 
@@ -211,7 +215,8 @@ The Windows package does not yet provide:
 
 - a selected two-model draft/target pair or a separate production draft engine;
 - a cache-coordinated iterative speculative engine or user-visible speculative decoding;
-- production draft/target evidence pairing, cache reconciliation, or a final-row/bonus-token policy;
+- production draft/target evidence pairing, an iterative full-acceptance handoff, or a
+  final-row/bonus-token policy;
 - grammar-state speculation or speculative metrics;
 - final context, output, concurrency, or fixed-`gamma` operating limits;
 - CPU offload;

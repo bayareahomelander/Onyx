@@ -234,6 +234,82 @@ backend snapshots and every caller-owned D32 rollback handle remain unchanged. T
 production draft integration, cache coordinator, grammar-state composition, or iterative
 speculative loop, and by itself is not speculative decoding.
 
+### One-iteration speculative coordination
+
+`coordinate_speculative_iteration(...)` composes D32 proposal generation, D30 target verification,
+and D33 match/replace acceptance exactly once over two distinct, already-prefilled backend roles.
+Its public signature requires a checkpointable draft, a separately checkpointable and
+`BatchedTargetVerificationBackend` target, one common uncached current token, a positive proposal
+length, borrowed draft and target selectors, and one caller-owned root checkpoint for each role:
+
+```python
+coordinate_speculative_iteration(
+    draft_backend,
+    target_backend,
+    current_token_id,
+    *,
+    proposal_length,
+    draft_select_token,
+    target_select_token,
+    draft_root_checkpoint,
+    target_root_checkpoint,
+)
+```
+
+Both backends must report the same positive initial cache length `P` and the same positive
+vocabulary size. This layer proves numeric token-domain compatibility only; semantic tokenizer
+identity remains a later production-pair responsibility. Each root must report `P`. Before D32
+begins, same-position rollback validates the roots' actual owner, epoch, allocation, lifetime, and
+canonical state without changing either logical prefix. The coordinator borrows the roots and never
+releases them.
+
+For proposal `(d0, ..., d[n-1])`, D32 runs once and leaves the draft at `P + n + 1`; D30 runs once
+over the exact proposal tuple and leaves the target at the same length; D33 runs once over the exact
+complete `n + 1` target-row tuple. The coordinator does not inspect, copy, convert, or retain any
+row, and it never invokes the target selector independently of D33. The post-proposal row `rn`
+remains unused.
+
+On a mismatch after `k` accepted tokens, the draft rolls back through D32 checkpoint `k` to
+`P + 1 + k`. The target rolls back to its root at `P`, then ordinary one-token `decode()` calls
+rebuild exactly `(current_token_id, *proposal[:k])`. Replay rows are validated only as `ModelStep`
+cache evidence and are never selected. Both roles finish with the exact common
+`(prompt, current_token_id, *proposal[:k])` prefix; the target-selected replacement is returned as
+the uncached continuation and is absent from both caches.
+
+On full acceptance, neither role is rolled back or replayed. Both retain the complete
+`(prompt, current_token_id, *proposal)` prefix at `P + n + 1`. No bonus token is selected, and the
+result exposes no uncached continuation. This is a completed bounded transaction, not an iterative
+handoff.
+
+The frozen, slotted `SpeculativeIterationResult` has exactly five fields:
+
+- `proposal_token_ids`;
+- `accepted_count`;
+- `replacement_token_id`;
+- `initial_cache_length`; and
+- `final_cache_length`.
+
+It derives `fully_accepted`, `accepted_token_ids`, `rejected_proposal_token_id`,
+`output_token_ids`, and `uncached_next_token_id`. The latter is the mismatch replacement or `None`
+after full acceptance. There is deliberately no D35 `next_current_token_id` alias because the final
+proposal token is already cached after full acceptance. The result retains no backend, checkpoint,
+selector, row, model, tensor, grammar state, metric, or mutable collection.
+
+D35 assumes ownership of every D32 rejection checkpoint as soon as the proposal returns. Success
+releases those handles in proposal order while leaving both caller roots active. Any failure after
+D32 begins attempts draft-root rollback, target-root rollback, and every D32-handle release in that
+deterministic order. Healthy cleanup re-raises the original D28-D33, selector, or backend exception
+unchanged. `SpeculativeIterationCleanupError` retains the original failure plus an immutable ordered
+tuple of every cleanup failure. Terminal backend failure remains honest: a stale root is reported
+instead of being hidden by `reset()`, while the healthy peer is still restored and remaining
+cleanup continues.
+
+The current proof uses deterministic dual backends only. It covers every mismatch position, full
+acceptance, exact replay and cache equality, root/handle ownership, selector and row non-retention,
+failure aggregation, bounded reuse, repeated epochs, and optional-runtime-free import. D35 adds no
+production model pair, loader, iterative loop, grammar-state policy, stops, streaming, speculative
+metrics, fixed `gamma`, bonus/final-row policy, offload, operating limit, or API behavior.
+
 ### Tokenizer and text engine
 
 `TokenizerAdapter` exposes `tokenizer_id`, `vocab_size`, `encode(text)`, and `decode(token_ids)`.
@@ -584,8 +660,8 @@ path, source, package, or import dependency on the root Rust crate.
 The current Windows package does not yet provide:
 
 - a selected two-model draft/target pair or a separate production draft engine;
-- a cache-coordinated iterative speculative loop, production evidence pairing, or final-row/bonus
-  policy;
+- a cache-coordinated iterative speculative loop, production evidence pairing, iterative
+  full-acceptance handoff, or final-row/bonus policy;
 - grammar-state speculation;
 - speculative streaming or acceptance metrics;
 - fixed or adaptive `gamma`;
@@ -596,7 +672,7 @@ The current Windows package does not yet provide:
 - a complete public `NativeGrammarCompiler`;
 - native valid-token caching or a persistent CUDA mask workspace.
 
-Those capabilities remain separately sized roadmap work. Production rollback support, the
-model-free draft-proposal primitive, the isolated production proposal-role qualification, the
-batched-verification contract, and the pure match/replace acceptance decision do not form
-speculative decoding without a selected pair and a separately owned cache-coordinated engine.
+Those capabilities remain separately sized roadmap work. The model-free one-iteration coordinator
+proves exact dual-cache transaction semantics, but production rollback/proposal/verification
+primitives and the isolated production proposal-role qualification do not form user-visible
+speculative decoding without a selected pair and a separately owned iterative engine.

@@ -24,6 +24,13 @@ from .acceptance import (
     MatchReplaceAcceptanceResult,
     decide_match_replace_acceptance,
 )
+from .speculative_iteration import (
+    SpeculativeIterationCleanupError,
+    SpeculativeIterationError,
+    SpeculativeIterationInvariantError,
+    SpeculativeIterationResult,
+    coordinate_speculative_iteration,
+)
 from .verification import (
     BatchedTargetVerificationBackend,
     BatchedTargetVerificationResult,
@@ -314,6 +321,10 @@ __all__ = [
     "SamplingDistributionError",
     "SelectionError",
     "SelectionPolicy",
+    "SpeculativeIterationCleanupError",
+    "SpeculativeIterationError",
+    "SpeculativeIterationInvariantError",
+    "SpeculativeIterationResult",
     "TemperatureTopPSelection",
     "create_cuda_sampler",
     "create_cuda_grammar_logit_mask",
@@ -324,6 +335,7 @@ __all__ = [
     "compile_native_regex",
     "compile_native_json_schema",
     "build_qwen_grammar_vocabulary",
+    "coordinate_speculative_iteration",
     "decide_match_replace_acceptance",
     "discover_nvidia_devices",
     "generate_greedy",

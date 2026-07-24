@@ -36,12 +36,8 @@ def test_package_identifies_the_windows_cuda_variant():
         "CheckpointableAutoregressiveBackend",
     ):
         assert checkpoint_symbol in onyx_cuda.__all__
-    assert (
-        onyx_cuda.BatchedTargetVerificationResult.__module__ == "onyx_cuda.verification"
-    )
-    assert (
-        onyx_cuda.BatchedTargetVerificationBackend.__module__ == "onyx_cuda.verification"
-    )
+    assert onyx_cuda.BatchedTargetVerificationResult.__module__ == "onyx_cuda.verification"
+    assert onyx_cuda.BatchedTargetVerificationBackend.__module__ == "onyx_cuda.verification"
     for verification_symbol in (
         "BatchedTargetVerificationResult",
         "BatchedTargetVerificationBackend",
@@ -66,6 +62,16 @@ def test_package_identifies_the_windows_cuda_variant():
         exported = getattr(onyx_cuda, acceptance_symbol)
         assert exported.__module__ == "onyx_cuda.acceptance"
         assert acceptance_symbol in onyx_cuda.__all__
+    for iteration_symbol in (
+        "SpeculativeIterationCleanupError",
+        "SpeculativeIterationError",
+        "SpeculativeIterationInvariantError",
+        "SpeculativeIterationResult",
+        "coordinate_speculative_iteration",
+    ):
+        exported = getattr(onyx_cuda, iteration_symbol)
+        assert exported.__module__ == "onyx_cuda.speculative_iteration"
+        assert iteration_symbol in onyx_cuda.__all__
     assert callable(onyx_cuda.build_qwen_grammar_vocabulary)
     assert callable(onyx_cuda.create_cuda_grammar_logit_mask)
     assert callable(onyx_cuda.generate_constrained_target)
