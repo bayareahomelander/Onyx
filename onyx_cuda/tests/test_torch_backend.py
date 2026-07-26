@@ -20,6 +20,8 @@ from onyx_cuda import (
     DEFAULT_TARGET_PROFILE,
     DraftProposalCleanupError,
     QWEN_3B_CANDIDATE_PROFILE,
+    SpeculativeIterationCleanupError,
+    coordinate_speculative_iteration,
     generate_draft_proposal,
 )
 from onyx_cuda.torch_backend import (
@@ -2496,3 +2498,621 @@ def test_factory_load_and_cleanup_failures_are_both_reported(monkeypatch):
         match="load failed.*failed-load cleanup also failed.*cleanup failed",
     ):
         load_torch_cuda_target()
+
+
+# D36 dual-production-backend speculative-iteration composition
+
+
+D36_PROPOSAL = (3, 4, 5)
+D36_PROPOSAL_LENGTH = 3
+D36_PROMPT = (0, 1)
+D36_CURRENT_TOKEN = 2
+
+
+class D36RecordingSelector:
+    def __init__(self, token_ids):
+        self._token_ids = iter(token_ids)
+        self.rows = []
+
+    def __call__(self, row):
+        self.rows.append(row)
+        return next(self._token_ids)
+
+
+def _make_d36_fixture(*, draft_model=None, target_model=None):
+    torch_module = FakeTorch()
+    transformers_module = FakeTransformers()
+    draft_model = draft_model or FakeModel()
+    target_model = target_model or FakeModel()
+    draft = make_backend(
+        model=draft_model,
+        torch_module=torch_module,
+        transformers_module=transformers_module,
+    )
+    target = make_backend(
+        model=target_model,
+        torch_module=torch_module,
+        transformers_module=transformers_module,
+    )
+    draft.prefill(D36_PROMPT)
+    target.prefill(D36_PROMPT)
+
+    assert draft is not target
+    assert draft._model is not target._model
+    assert draft.tokenizer is not target.tokenizer
+    assert draft.tokenizer.tokenizer_id == target.tokenizer.tokenizer_id
+    assert draft.tokenizer.vocab_size == target.tokenizer.vocab_size == 6
+    assert draft._owner_id != target._owner_id
+    assert draft._cache is not target._cache
+    assert draft._cache.layers is not target._cache.layers
+    assert len(draft._cache.layers) == len(target._cache.layers) == 24
+    for draft_layer, target_layer in zip(
+        draft._cache.layers,
+        target._cache.layers,
+        strict=True,
+    ):
+        assert draft_layer is not target_layer
+        assert draft_layer.keys is not target_layer.keys
+        assert draft_layer.values is not target_layer.values
+
+    draft_root = draft.create_cache_checkpoint()
+    target_root = target.create_cache_checkpoint()
+    assert draft_root.cache_length == target_root.cache_length == len(D36_PROMPT)
+    assert draft_root.owner_id != target_root.owner_id
+    return SimpleNamespace(
+        torch=torch_module,
+        transformers=transformers_module,
+        draft=draft,
+        target=target,
+        draft_model=draft_model,
+        target_model=target_model,
+        draft_root=draft_root,
+        target_root=target_root,
+        draft_cache=draft._cache,
+        target_cache=target._cache,
+        draft_layer_ids=tuple(id(layer) for layer in draft._cache.layers),
+        target_layer_ids=tuple(id(layer) for layer in target._cache.layers),
+        draft_layout=draft._active_cache_layout,
+        target_layout=target._active_cache_layout,
+        draft_epoch=draft._epoch,
+        target_epoch=target._epoch,
+    )
+
+
+def _assert_d36_root_state(fixture):
+    draft = fixture.draft
+    target = fixture.target
+    assert_cache_prefix(draft, D36_PROMPT)
+    assert_cache_prefix(target, D36_PROMPT)
+    assert draft._cache is fixture.draft_cache
+    assert target._cache is fixture.target_cache
+    assert tuple(id(layer) for layer in draft._cache.layers) == fixture.draft_layer_ids
+    assert tuple(id(layer) for layer in target._cache.layers) == fixture.target_layer_ids
+    assert draft._active_cache_layout == fixture.draft_layout
+    assert target._active_cache_layout == fixture.target_layout
+    assert draft._epoch == fixture.draft_epoch
+    assert target._epoch == fixture.target_epoch
+    assert tuple(draft._cache_checkpoints) == (fixture.draft_root.allocation_id,)
+    assert tuple(target._cache_checkpoints) == (fixture.target_root.allocation_id,)
+
+
+def _run_d36_outcome(fixture, mismatch_position):
+    draft = fixture.draft
+    target = fixture.target
+    draft_calls_before = len(fixture.draft_model.calls)
+    target_calls_before = len(fixture.target_model.calls)
+    draft_next_before = draft._next_checkpoint_id
+    target_next_before = target._next_checkpoint_id
+    created = []
+    released = []
+    target_created = []
+    original_create = draft.create_cache_checkpoint
+    original_release = draft.release_cache_checkpoint
+    original_target_create = target.create_cache_checkpoint
+
+    def recording_create():
+        checkpoint = original_create()
+        created.append(checkpoint)
+        return checkpoint
+
+    def recording_release(checkpoint, /):
+        released.append(checkpoint)
+        return original_release(checkpoint)
+
+    def recording_target_create():
+        checkpoint = original_target_create()
+        target_created.append(checkpoint)
+        return checkpoint
+
+    draft.create_cache_checkpoint = recording_create
+    draft.release_cache_checkpoint = recording_release
+    target.create_cache_checkpoint = recording_target_create
+    draft_selector = D36RecordingSelector(D36_PROPOSAL)
+    if mismatch_position is None:
+        target_tokens = D36_PROPOSAL
+        expected_accepted = D36_PROPOSAL_LENGTH
+        expected_replacement = None
+    else:
+        expected_accepted = mismatch_position
+        forced = (D36_PROPOSAL[mismatch_position] + 1) % draft.vocab_size
+        target_tokens = (*D36_PROPOSAL[:mismatch_position], forced)
+        expected_replacement = forced
+    target_selector = D36RecordingSelector(target_tokens)
+    try:
+        result = coordinate_speculative_iteration(
+            draft,
+            target,
+            D36_CURRENT_TOKEN,
+            proposal_length=D36_PROPOSAL_LENGTH,
+            draft_select_token=draft_selector,
+            target_select_token=target_selector,
+            draft_root_checkpoint=fixture.draft_root,
+            target_root_checkpoint=fixture.target_root,
+        )
+    finally:
+        draft.create_cache_checkpoint = original_create
+        draft.release_cache_checkpoint = original_release
+        target.create_cache_checkpoint = original_target_create
+
+    expected_final_length = len(D36_PROMPT) + 1 + expected_accepted
+    expected_prefix = (*D36_PROMPT, D36_CURRENT_TOKEN, *D36_PROPOSAL[:expected_accepted])
+    draft_calls = fixture.draft_model.calls[draft_calls_before:]
+    target_calls = fixture.target_model.calls[target_calls_before:]
+
+    assert [tuple(call["input_ids"].values[0]) for call in draft_calls] == [
+        (D36_CURRENT_TOKEN,),
+        (D36_PROPOSAL[0],),
+        (D36_PROPOSAL[1],),
+        (D36_PROPOSAL[2],),
+    ]
+    assert [call["logits_to_keep"] for call in draft_calls] == [1, 1, 1, 1]
+    expected_target_inputs = [
+        (D36_CURRENT_TOKEN, *D36_PROPOSAL),
+        *(
+            [(token_id,) for token_id in (D36_CURRENT_TOKEN, *D36_PROPOSAL[:expected_accepted])]
+            if mismatch_position is not None
+            else []
+        ),
+    ]
+    assert [tuple(call["input_ids"].values[0]) for call in target_calls] == expected_target_inputs
+    assert [call["logits_to_keep"] for call in target_calls] == [
+        D36_PROPOSAL_LENGTH + 1,
+        *([1] * (expected_accepted + 1) if mismatch_position is not None else []),
+    ]
+    assert [row.marker for row in draft_selector.rows] == [
+        (*D36_PROMPT, D36_CURRENT_TOKEN),
+        (*D36_PROMPT, D36_CURRENT_TOKEN, D36_PROPOSAL[0]),
+        (*D36_PROMPT, D36_CURRENT_TOKEN, *D36_PROPOSAL[:2]),
+    ]
+    assert [row.marker for row in target_selector.rows] == [
+        (*D36_PROMPT, D36_CURRENT_TOKEN, *D36_PROPOSAL[:position])
+        for position in range(expected_accepted + (0 if mismatch_position is None else 1))
+    ]
+    assert all(
+        row.marker != (*D36_PROMPT, D36_CURRENT_TOKEN, *D36_PROPOSAL)
+        for row in target_selector.rows
+    )
+
+    assert result.proposal_token_ids == D36_PROPOSAL
+    assert result.accepted_count == expected_accepted
+    assert result.accepted_token_ids == D36_PROPOSAL[:expected_accepted]
+    assert result.replacement_token_id == expected_replacement
+    assert result.uncached_next_token_id == expected_replacement
+    assert result.rejected_proposal_token_id == (
+        None if mismatch_position is None else D36_PROPOSAL[mismatch_position]
+    )
+    assert result.output_token_ids == (
+        D36_PROPOSAL
+        if mismatch_position is None
+        else (*D36_PROPOSAL[:expected_accepted], expected_replacement)
+    )
+    assert result.initial_cache_length == len(D36_PROMPT)
+    assert result.final_cache_length == expected_final_length
+    assert_cache_prefix(draft, expected_prefix)
+    assert_cache_prefix(target, expected_prefix)
+    assert draft._cache is fixture.draft_cache
+    assert target._cache is fixture.target_cache
+    assert tuple(id(layer) for layer in draft._cache.layers) == fixture.draft_layer_ids
+    assert tuple(id(layer) for layer in target._cache.layers) == fixture.target_layer_ids
+    assert draft._active_cache_layout == fixture.draft_layout
+    assert target._active_cache_layout == fixture.target_layout
+    assert draft._epoch == fixture.draft_epoch
+    assert target._epoch == fixture.target_epoch
+    assert all(
+        layer.keys.shape == (1, 2, expected_final_length, 64) for layer in draft._cache.layers
+    )
+    assert all(
+        layer.values.shape == (1, 2, expected_final_length, 64) for layer in draft._cache.layers
+    )
+    assert all(
+        layer.keys.shape == (1, 2, expected_final_length, 64) for layer in target._cache.layers
+    )
+    assert all(
+        layer.values.shape == (1, 2, expected_final_length, 64) for layer in target._cache.layers
+    )
+    assert tuple(draft._cache_checkpoints) == (fixture.draft_root.allocation_id,)
+    assert tuple(target._cache_checkpoints) == (fixture.target_root.allocation_id,)
+
+    assert [checkpoint.cache_length for checkpoint in created] == [
+        len(D36_PROMPT),
+        len(D36_PROMPT) + 1,
+        len(D36_PROMPT) + 2,
+        len(D36_PROMPT) + 3,
+    ]
+    assert [checkpoint.allocation_id for checkpoint in created] == list(
+        range(draft_next_before, draft_next_before + 4)
+    )
+    assert released == created
+    assert released[0] is not fixture.draft_root
+    assert [checkpoint.cache_length for checkpoint in released[1:]] == [3, 4, 5]
+    assert target_created == []
+    assert target._next_checkpoint_id == target_next_before
+
+    draft.rollback_cache(fixture.draft_root)
+    target.rollback_cache(fixture.target_root)
+    _assert_d36_root_state(fixture)
+    return result
+
+
+def test_d36_two_production_backends_have_independent_ownership_and_close():
+    fixture = _make_d36_fixture()
+    draft_before = backend_checkpoint_state(fixture.draft)
+    target_before = backend_checkpoint_state(fixture.target)
+
+    with pytest.raises(CacheCheckpointStateError, match="belongs to another backend"):
+        fixture.draft.rollback_cache(fixture.target_root)
+    with pytest.raises(CacheCheckpointStateError, match="belongs to another backend"):
+        fixture.target.rollback_cache(fixture.draft_root)
+
+    assert backend_checkpoint_state(fixture.draft) == draft_before
+    assert backend_checkpoint_state(fixture.target) == target_before
+    fixture.target.close()
+    assert fixture.target.is_closed
+    assert not fixture.draft.is_closed
+    assert fixture.draft._model is fixture.draft_model
+    assert tuple(fixture.draft._cache_checkpoints) == (fixture.draft_root.allocation_id,)
+    fixture.draft.decode(D36_CURRENT_TOKEN)
+    fixture.draft.rollback_cache(fixture.draft_root)
+    assert_cache_prefix(fixture.draft, D36_PROMPT)
+    assert fixture.draft._cache is fixture.draft_cache
+    assert fixture.draft._active_cache_layout == fixture.draft_layout
+    assert tuple(fixture.draft._cache_checkpoints) == (fixture.draft_root.allocation_id,)
+    fixture.draft.close()
+
+
+@pytest.mark.parametrize("close_order", [("draft", "target"), ("target", "draft")])
+def test_d36_factory_calls_return_independent_backends_and_close_in_either_order(
+    monkeypatch,
+    close_order,
+):
+    torch_module = FakeTorch()
+    transformers_module = FakeTransformers()
+    modules = {
+        "torch": torch_module,
+        "transformers": transformers_module,
+        "bitsandbytes": SimpleNamespace(__version__="0.49.2"),
+    }
+    models = []
+    tokenizers = []
+    monkeypatch.setattr(
+        torch_backend_module.importlib,
+        "import_module",
+        lambda name: modules[name],
+    )
+
+    def load_tokenizer(profile, *, local_files_only):
+        tokenizer = SimpleNamespace(
+            vocab_size=6,
+            tokenizer_id=profile.pinned_id,
+        )
+        tokenizers.append(tokenizer)
+        return SimpleNamespace(tokenizer=tokenizer)
+
+    def load_model(*args, **kwargs):
+        model = FakeModel()
+        models.append(model)
+        return model
+
+    monkeypatch.setattr(torch_backend_module, "load_qwen_tokenizer", load_tokenizer)
+    monkeypatch.setattr(torch_backend_module, "_load_nf4_model", load_model)
+
+    backends = {
+        "draft": load_torch_cuda_target(local_files_only=True),
+        "target": load_torch_cuda_target(local_files_only=True),
+    }
+    draft = backends["draft"]
+    target = backends["target"]
+    assert draft is not target
+    assert models == [draft._model, target._model]
+    assert models[0] is not models[1]
+    assert tokenizers == [draft.tokenizer, target.tokenizer]
+    assert tokenizers[0] is not tokenizers[1]
+    assert draft._owner_id != target._owner_id
+    draft.prefill(D36_PROMPT)
+    target.prefill(D36_PROMPT)
+
+    first, second = (backends[name] for name in close_order)
+    first.close()
+    assert first.is_closed
+    assert not second.is_closed
+    second.decode(D36_CURRENT_TOKEN)
+    assert second.cache_length == len(D36_PROMPT) + 1
+    second.close()
+    assert second.is_closed
+
+
+@pytest.mark.parametrize("mismatch_position", [0, 1, 2, None])
+def test_d36_exact_three_token_outcome_matrix(mismatch_position):
+    fixture = _make_d36_fixture()
+
+    _run_d36_outcome(fixture, mismatch_position)
+
+
+@pytest.mark.parametrize("phase", ["draft-selector", "target-selector", "target-replay"])
+def test_d36_healthy_failures_restore_both_roots_and_allow_immediate_reuse(phase):
+    fixture = _make_d36_fixture()
+    failure = LookupError(f"injected D36 {phase} failure")
+    draft_selector = D36RecordingSelector(D36_PROPOSAL)
+    target_selector = D36RecordingSelector(D36_PROPOSAL)
+    original_decode = fixture.target.decode
+
+    if phase == "draft-selector":
+        selected = iter(D36_PROPOSAL)
+        calls = 0
+
+        def draft_selector(row):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise failure
+            return next(selected)
+
+    elif phase == "target-selector":
+        selected = iter(D36_PROPOSAL)
+        calls = 0
+
+        def target_selector(row):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise failure
+            return next(selected)
+
+    else:
+        target_selector = D36RecordingSelector((D36_PROPOSAL[0], 0))
+        replay_calls = 0
+
+        def failing_replay(token_id, /):
+            nonlocal replay_calls
+            replay_calls += 1
+            if replay_calls == 2:
+                raise failure
+            return original_decode(token_id)
+
+        fixture.target.decode = failing_replay
+
+    try:
+        with pytest.raises(LookupError) as raised:
+            coordinate_speculative_iteration(
+                fixture.draft,
+                fixture.target,
+                D36_CURRENT_TOKEN,
+                proposal_length=D36_PROPOSAL_LENGTH,
+                draft_select_token=draft_selector,
+                target_select_token=target_selector,
+                draft_root_checkpoint=fixture.draft_root,
+                target_root_checkpoint=fixture.target_root,
+            )
+    finally:
+        fixture.target.decode = original_decode
+
+    assert raised.value is failure
+    _assert_d36_root_state(fixture)
+    _run_d36_outcome(fixture, None)
+
+
+def test_d36_terminal_draft_failure_preserves_safe_empty_composition_and_healthy_target():
+    fixture = _make_d36_fixture()
+    injected = RuntimeError("injected D36 terminal draft failure")
+    selected = iter(D36_PROPOSAL)
+
+    def arm_terminal_draft_failure(row):
+        fixture.draft_model.error_after_cache_update = injected
+        return next(selected)
+
+    with pytest.raises(SpeculativeIterationCleanupError) as raised:
+        coordinate_speculative_iteration(
+            fixture.draft,
+            fixture.target,
+            D36_CURRENT_TOKEN,
+            proposal_length=D36_PROPOSAL_LENGTH,
+            draft_select_token=arm_terminal_draft_failure,
+            target_select_token=D36RecordingSelector(D36_PROPOSAL),
+            draft_root_checkpoint=fixture.draft_root,
+            target_root_checkpoint=fixture.target_root,
+        )
+
+    outer = raised.value
+    assert isinstance(outer.original_failure, DraftProposalCleanupError)
+    assert isinstance(outer.original_failure.original_failure, TorchBackendExecutionError)
+    assert outer.original_failure.original_failure.__cause__ is injected
+    assert tuple(operation for operation, _ in outer.original_failure.cleanup_failures) == (
+        "start checkpoint rollback",
+    )
+    assert tuple(operation for operation, _ in outer.cleanup_failures) == ("draft root rollback",)
+    assert fixture.draft._epoch == fixture.draft_epoch + 1
+    assert fixture.draft._cache is None
+    assert fixture.draft.cache_length == 0
+    assert fixture.draft._cache_checkpoints == {}
+    assert_cache_prefix(fixture.target, D36_PROMPT)
+    assert tuple(fixture.target._cache_checkpoints) == (fixture.target_root.allocation_id,)
+    fixture.target.decode(D36_CURRENT_TOKEN)
+    fixture.target.rollback_cache(fixture.target_root)
+    assert_cache_prefix(fixture.target, D36_PROMPT)
+
+
+def test_d36_terminal_target_failure_preserves_safe_empty_composition_and_healthy_draft():
+    fixture = _make_d36_fixture()
+    injected = RuntimeError("injected D36 terminal target failure")
+    fixture.target_model.error_after_cache_update = injected
+
+    with pytest.raises(SpeculativeIterationCleanupError) as raised:
+        coordinate_speculative_iteration(
+            fixture.draft,
+            fixture.target,
+            D36_CURRENT_TOKEN,
+            proposal_length=D36_PROPOSAL_LENGTH,
+            draft_select_token=D36RecordingSelector(D36_PROPOSAL),
+            target_select_token=D36RecordingSelector(D36_PROPOSAL),
+            draft_root_checkpoint=fixture.draft_root,
+            target_root_checkpoint=fixture.target_root,
+        )
+
+    outer = raised.value
+    assert isinstance(outer.original_failure, TorchBackendExecutionError)
+    assert outer.original_failure.__cause__ is injected
+    assert tuple(operation for operation, _ in outer.cleanup_failures) == ("target root rollback",)
+    assert fixture.target._epoch == fixture.target_epoch + 1
+    assert fixture.target._cache is None
+    assert fixture.target.cache_length == 0
+    assert fixture.target._cache_checkpoints == {}
+    assert_cache_prefix(fixture.draft, D36_PROMPT)
+    assert tuple(fixture.draft._cache_checkpoints) == (fixture.draft_root.allocation_id,)
+    fixture.draft.decode(D36_CURRENT_TOKEN)
+    fixture.draft.rollback_cache(fixture.draft_root)
+    assert_cache_prefix(fixture.draft, D36_PROMPT)
+
+
+def test_d36_result_registries_and_selectors_retain_no_transient_rows_or_tensors():
+    class NonRetainingModel(FakeModel):
+        def __init__(self):
+            super().__init__()
+            self.input_refs = []
+
+        def __call__(self, **kwargs):
+            self.input_refs.append(weakref.ref(kwargs["input_ids"]))
+            output = super().__call__(**kwargs)
+            self.calls.clear()
+            return output
+
+    class WeakSelector:
+        def __init__(self, token_ids):
+            self._token_ids = iter(token_ids)
+            self.row_refs = []
+            self.parent_refs = []
+
+        def __call__(self, row):
+            self.row_refs.append(weakref.ref(row))
+            self.parent_refs.append(weakref.ref(row._parent))
+            return next(self._token_ids)
+
+    draft_model = NonRetainingModel()
+    target_model = NonRetainingModel()
+    fixture = _make_d36_fixture(draft_model=draft_model, target_model=target_model)
+    draft_selector = WeakSelector(D36_PROPOSAL)
+    target_selector = WeakSelector(D36_PROPOSAL)
+    selector_refs = (weakref.ref(draft_selector), weakref.ref(target_selector))
+
+    result = coordinate_speculative_iteration(
+        fixture.draft,
+        fixture.target,
+        D36_CURRENT_TOKEN,
+        proposal_length=D36_PROPOSAL_LENGTH,
+        draft_select_token=draft_selector,
+        target_select_token=target_selector,
+        draft_root_checkpoint=fixture.draft_root,
+        target_root_checkpoint=fixture.target_root,
+    )
+    row_refs = (*draft_selector.row_refs, *target_selector.row_refs)
+    parent_refs = (*draft_selector.parent_refs, *target_selector.parent_refs)
+    assert [field.name for field in fields(result)] == [
+        "proposal_token_ids",
+        "accepted_count",
+        "replacement_token_id",
+        "initial_cache_length",
+        "final_cache_length",
+    ]
+    assert not hasattr(result, "__dict__")
+    assert tuple(fixture.draft._cache_checkpoints) == (fixture.draft_root.allocation_id,)
+    assert tuple(fixture.target._cache_checkpoints) == (fixture.target_root.allocation_id,)
+    assert all(reference() is None for reference in draft_model.input_refs)
+    assert all(reference() is None for reference in target_model.input_refs)
+
+    del draft_selector
+    del target_selector
+    gc.collect()
+
+    assert all(reference() is None for reference in selector_refs)
+    assert all(reference() is None for reference in row_refs)
+    assert all(reference() is None for reference in parent_refs)
+    assert_cache_prefix(fixture.draft, (*D36_PROMPT, D36_CURRENT_TOKEN, *D36_PROPOSAL))
+    assert_cache_prefix(fixture.target, (*D36_PROMPT, D36_CURRENT_TOKEN, *D36_PROPOSAL))
+
+
+def test_d36_one_hundred_root_restored_transactions_keep_dual_backend_state_bounded():
+    class CountingNonRetainingModel(FakeModel):
+        def __init__(self):
+            super().__init__()
+            self.forward_count = 0
+            self.input_refs = []
+
+        def __call__(self, **kwargs):
+            self.forward_count += 1
+            self.input_refs.append(weakref.ref(kwargs["input_ids"]))
+            output = super().__call__(**kwargs)
+            self.calls.clear()
+            return output
+
+    draft_model = CountingNonRetainingModel()
+    target_model = CountingNonRetainingModel()
+    fixture = _make_d36_fixture(draft_model=draft_model, target_model=target_model)
+    draft_forward_count = draft_model.forward_count
+    target_forward_count = target_model.forward_count
+
+    for cycle in range(100):
+        mismatch_position = (None, 0, 1, 2)[cycle % 4]
+        draft_selector = D36RecordingSelector(D36_PROPOSAL)
+        if mismatch_position is None:
+            target_ids = D36_PROPOSAL
+            accepted_count = D36_PROPOSAL_LENGTH
+            expected_target_forwards = 1
+        else:
+            forced = (D36_PROPOSAL[mismatch_position] + 1) % fixture.target.vocab_size
+            target_ids = (*D36_PROPOSAL[:mismatch_position], forced)
+            accepted_count = mismatch_position
+            expected_target_forwards = accepted_count + 2
+        target_selector = D36RecordingSelector(target_ids)
+        row_refs = []
+
+        result = coordinate_speculative_iteration(
+            fixture.draft,
+            fixture.target,
+            D36_CURRENT_TOKEN,
+            proposal_length=D36_PROPOSAL_LENGTH,
+            draft_select_token=draft_selector,
+            target_select_token=target_selector,
+            draft_root_checkpoint=fixture.draft_root,
+            target_root_checkpoint=fixture.target_root,
+        )
+        row_refs.extend(weakref.ref(row) for row in draft_selector.rows)
+        row_refs.extend(weakref.ref(row) for row in target_selector.rows)
+        draft_selector.rows.clear()
+        target_selector.rows.clear()
+        assert result.accepted_count == accepted_count
+        assert draft_model.forward_count - draft_forward_count == 4
+        assert target_model.forward_count - target_forward_count == expected_target_forwards
+        draft_forward_count = draft_model.forward_count
+        target_forward_count = target_model.forward_count
+        fixture.draft.rollback_cache(fixture.draft_root)
+        fixture.target.rollback_cache(fixture.target_root)
+        _assert_d36_root_state(fixture)
+        gc.collect()
+        assert all(reference() is None for reference in row_refs)
+        assert all(reference() is None for reference in draft_model.input_refs)
+        assert all(reference() is None for reference in target_model.input_refs)
+        draft_model.input_refs.clear()
+        target_model.input_refs.clear()
+
+    assert fixture.draft._next_checkpoint_id == 402
+    assert fixture.target._next_checkpoint_id == 2
+    _assert_d36_root_state(fixture)

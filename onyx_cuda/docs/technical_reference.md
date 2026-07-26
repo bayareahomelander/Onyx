@@ -304,11 +304,68 @@ tuple of every cleanup failure. Terminal backend failure remains honest: a stale
 instead of being hidden by `reset()`, while the healthy peer is still restored and remaining
 cleanup continues.
 
-The current proof uses deterministic dual backends only. It covers every mismatch position, full
+The model-free D35 proof uses deterministic dual backends. It covers every mismatch position, full
 acceptance, exact replay and cache equality, root/handle ownership, selector and row non-retention,
 failure aggregation, bounded reuse, repeated epochs, and optional-runtime-free import. D35 adds no
 production model pair, loader, iterative loop, grammar-state policy, stops, streaming, speculative
 metrics, fixed `gamma`, bonus/final-row policy, offload, operating limit, or API behavior.
+
+### Pinned dual-backend one-iteration qualification
+
+D36 qualifies the unchanged D35 signature and transaction through two independent calls to
+`load_torch_cuda_target(DEFAULT_TARGET_PROFILE, device_index=0, local_files_only=True)`. One loaded
+backend is assigned the draft role and the other the target role for the fixture. They have separate
+backend/model/tokenizer objects, tokenizer runtime objects, owner IDs, sequence epochs, checkpoint
+allocation state and registries, caller roots, `DynamicCache` objects, layer lists, all 24 layer
+objects, and every active key/value tensor. Cross-role root use fails before mutation.
+
+The fixed prompt has `P = 9`, the common uncached current token is `4379`, and the genuine greedy
+three-token proposal is `(25, 279, 7162)`. The exact transaction map is:
+
+| Outcome | Accepted | Final cache | Target selector calls | Target forwards after prefill |
+|---|---:|---:|---:|---:|
+| forced mismatch at 0 | 0 | `P + 1 = 10` | 1 | one four-row batch + 1 replay |
+| forced mismatch at 1 | 1 | `P + 2 = 11` | 2 | one four-row batch + 2 replays |
+| forced mismatch at 2 | 2 | `P + 3 = 12` | 3 | one four-row batch + 3 replays |
+| genuine full acceptance | 3 | `P + 4 = 13` | 3 | one four-row batch, no replay |
+
+Every draft transaction uses four ordinary one-token forwards with `logits_to_keep=1`. Every target
+transaction first uses one forward over `(4379, 25, 279, 7162)` with `logits_to_keep=4`. Mismatch
+replay then uses only `(4379, *proposal[:k])` as ordinary one-token decodes. The full-acceptance
+selector is unmodified `select_cuda_argmax` for both roles. At a forced mismatch, the target wrapper
+first obtains the real greedy decision and requires it to match the proposal, then substitutes the
+deterministic in-range successor only at the chosen position. Selection stops there. Row `r3` is
+never selected, and the replacement remains uncached.
+
+Physical cache validation is role-local. Draft mismatch states equal exact prefix slices of the
+draft's sequential full-acceptance snapshot. Target mismatch states equal independent target-owned
+sequential replay snapshots. Full target state equals its complete native batched result. Both roles
+also retain their original D29 layout signature and exact Python prefix. No cross-role or
+sequential-versus-batched bitwise equality is required because D31 established that those kernels
+can differ numerically while producing the same greedy decisions.
+
+For each transaction, D32 allocates a private checkpoint at `P` followed by rejection checkpoints at
+`P + 1`, `P + 2`, and `P + 3`. Allocation IDs remain monotonic. D32 releases the private checkpoint;
+D35 releases all rejection checkpoints in proposal order, including invalidated suffix handles.
+Neither caller root is released, the target allocates no transaction checkpoint, and both final
+registries contain only their caller root.
+
+Production-backend composition tests use two real `TorchCUDATargetBackend` objects over the pinned
+24-layer fake Torch/Transformers seam. Healthy draft-selector, target-selector, and pre-mutation
+target-replay failures preserve exception identity, restore both roots exactly, settle every owned
+handle, and permit immediate reuse. Post-cache-mutation draft and target failures preserve the typed
+backend error, terminal safe-empty epoch, nested/outer cleanup composition and ordered stale-root
+failure while leaving the healthy peer immediately usable. Weak-reference checks prove that results,
+registries, and scalar-only observers retain no input, row, parent logits, model, cache, or
+checkpoint tensor. A 100-transaction model-free production-backend loop and 100 transactions in
+each live lifecycle keep epochs, roots, cache/layer identities, layouts, call counts and
+outcome-grouped allocator state bounded.
+
+The two live lifecycles close target then draft and draft then target, respectively. After the first
+close, the closed role rejects work and its still-live peer successfully decodes and rolls back
+through its unchanged root. This qualification is production-seam evidence only: using two
+identical 0.5B instances does not select a release pair, select the 0.5B profile as a release draft,
+or demonstrate useful speculative speedup.
 
 ### Tokenizer and text engine
 
@@ -616,6 +673,32 @@ with 1,326 current allocations and 1,326 active allocations. Lifecycle allocated
 544,899,072 and 553,419,776 bytes; reserved peak is 803,209,216 bytes in both. Post-close cleanup
 returns to 8,520,704 allocated / 497,025,024 reserved bytes without second-lifecycle growth.
 
+D36 runs two complete dual-backend lifecycles and 200 total one-iteration transactions, reversing
+close order between lifecycles. The fixed nine-token prompt is
+`(35, 18, 16, 5670, 7162, 291, 2169, 22901, 45060)`, current token is `4379`, and both lifecycles
+produce genuine greedy proposal `(25, 279, 7162)`. Full acceptance finishes at cache length 13.
+Forced mismatch positions 0, 1, and 2 finish at lengths 10, 11, and 12 with uncached replacements
+`26`, `280`, and `7163`. Draft/target selector counts are `3/3`, `3/1`, `3/2`, and `3/3`; forward
+counts are `4/1`, `4/2`, `4/3`, and `4/4` for full, mismatch-0, mismatch-1, and mismatch-2.
+
+First/second loader durations are 1.818356/1.119697 seconds in lifecycle 1 and
+1.065408/1.071617 seconds in lifecycle 2. Simultaneous rooted active state is
+924,817,408 allocated / 1,153,433,600 reserved bytes in lifecycle 1 and
+924,653,568 / 1,157,627,904 bytes in lifecycle 2. The higher transaction peak is 937,167,360
+allocated and 1,157,627,904 reserved bytes. After warmup, each outcome stabilizes as a bounded
+periodic allocator pattern with 2,696 current and active allocations. Stable median transaction
+times across the two lifecycles are 0.228409/0.235699 seconds for full acceptance,
+0.286878/0.268526 for mismatch-0, 0.334574/0.317441 for mismatch-1, and
+0.365808/0.372571 for mismatch-2.
+
+Closing target first leaves the draft at 466,800,128 allocated / 803,209,216 reserved bytes.
+Closing draft first leaves the target at 466,742,784 / 861,929,472 bytes. Each surviving peer is
+immediately usable. First/second close durations are 0.095263/0.094136 seconds in lifecycle 1 and
+0.086036/0.087953 seconds in lifecycle 2; cleanup takes 0.071058 and 0.066571 seconds. Both completed
+lifecycles clean up to the identical 8,668,160 allocated / 501,219,328 reserved-byte state, with no
+second-lifecycle retained growth. The figures are qualification evidence, not supported memory
+limits or a speedup claim.
+
 These measurements do not establish final release context, output, concurrency, or speculative
 `gamma` limits.
 
@@ -660,8 +743,8 @@ path, source, package, or import dependency on the root Rust crate.
 The current Windows package does not yet provide:
 
 - a selected two-model draft/target pair or a separate production draft engine;
-- a cache-coordinated iterative speculative loop, production evidence pairing, iterative
-  full-acceptance handoff, or final-row/bonus policy;
+- a cache-coordinated iterative speculative loop, iterative full-acceptance handoff, or
+  final-row/bonus policy;
 - grammar-state speculation;
 - speculative streaming or acceptance metrics;
 - fixed or adaptive `gamma`;
@@ -672,7 +755,7 @@ The current Windows package does not yet provide:
 - a complete public `NativeGrammarCompiler`;
 - native valid-token caching or a persistent CUDA mask workspace.
 
-Those capabilities remain separately sized roadmap work. The model-free one-iteration coordinator
-proves exact dual-cache transaction semantics, but production rollback/proposal/verification
-primitives and the isolated production proposal-role qualification do not form user-visible
-speculative decoding without a selected pair and a separately owned iterative engine.
+Those capabilities remain separately sized roadmap work. D36 proves the unchanged one-iteration
+coordinator through two independently owned pinned production backends, but the same-profile
+qualification does not form user-visible speculative decoding without a selected pair and a
+separately owned iterative engine.
