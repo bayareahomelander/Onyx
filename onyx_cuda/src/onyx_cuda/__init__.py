@@ -24,6 +24,12 @@ from .acceptance import (
     MatchReplaceAcceptanceResult,
     decide_match_replace_acceptance,
 )
+from .continuation import (
+    PostIterationContinuationError,
+    PostIterationContinuationInvariantError,
+    PostIterationContinuationResult,
+    decide_post_iteration_continuation,
+)
 from .speculative_iteration import (
     SpeculativeIterationCleanupError,
     SpeculativeIterationError,
@@ -261,6 +267,9 @@ __all__ = [
     "ProductionEngineLoadError",
     "ProductionTargetTextEngine",
     "ProductionTargetTextStream",
+    "PostIterationContinuationError",
+    "PostIterationContinuationInvariantError",
+    "PostIterationContinuationResult",
     "JsonSchemaGrammar",
     "MatchReplaceAcceptanceError",
     "MatchReplaceAcceptanceInvariantError",
@@ -337,6 +346,7 @@ __all__ = [
     "build_qwen_grammar_vocabulary",
     "coordinate_speculative_iteration",
     "decide_match_replace_acceptance",
+    "decide_post_iteration_continuation",
     "discover_nvidia_devices",
     "generate_greedy",
     "generate_constrained_target",

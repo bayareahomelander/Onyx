@@ -32,6 +32,9 @@ Transformers instead of the Apple MLX runtime used by the macOS package.
   and acceptance over two already-prefilled checkpointable roles. A mismatch restores both caches
   to the exact accepted prefix and leaves the target replacement uncached; full acceptance keeps
   both complete proposal suffixes cached without selecting a bonus token.
+- A pure, framework-neutral post-iteration continuation decision over exact proposal, verification,
+  and acceptance evidence. A mismatch reuses the already-selected replacement without another
+  selector call; full acceptance selects exactly one uncached bonus token from the final target row.
 - Bounded one-iteration production qualification over two independently loaded pinned 0.5B
   backends on `cuda:0`, covering genuine greedy full acceptance, test-forced mismatch at every
   three-token fixture position, exact role-local cache reconciliation, independent close order, and
@@ -219,7 +222,7 @@ The Windows package does not yet provide:
 
 - a selected two-model draft/target pair or a separate production draft engine;
 - a cache-coordinated iterative speculative engine or user-visible speculative decoding;
-- an iterative full-acceptance handoff or a final-row/bonus-token policy;
+- integration of the pure continuation decision into D35 or a production iterative handoff;
 - grammar-state speculation or speculative metrics;
 - final context, output, concurrency, or fixed-`gamma` operating limits;
 - CPU offload;

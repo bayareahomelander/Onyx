@@ -62,6 +62,15 @@ def test_package_identifies_the_windows_cuda_variant():
         exported = getattr(onyx_cuda, acceptance_symbol)
         assert exported.__module__ == "onyx_cuda.acceptance"
         assert acceptance_symbol in onyx_cuda.__all__
+    for continuation_symbol in (
+        "PostIterationContinuationError",
+        "PostIterationContinuationInvariantError",
+        "PostIterationContinuationResult",
+        "decide_post_iteration_continuation",
+    ):
+        exported = getattr(onyx_cuda, continuation_symbol)
+        assert exported.__module__ == "onyx_cuda.continuation"
+        assert continuation_symbol in onyx_cuda.__all__
     for iteration_symbol in (
         "SpeculativeIterationCleanupError",
         "SpeculativeIterationError",

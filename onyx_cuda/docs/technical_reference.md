@@ -310,6 +310,97 @@ failure aggregation, bounded reuse, repeated epochs, and optional-runtime-free i
 production model pair, loader, iterative loop, grammar-state policy, stops, streaming, speculative
 metrics, fixed `gamma`, bonus/final-row policy, offload, operating limit, or API behavior.
 
+### Post-iteration continuation decision
+
+`decide_post_iteration_continuation(...)` is the separate D37 decision that derives exactly one
+uncached continuation token from an exact proposal, the complete D30 target-row tuple, and the
+corresponding D33 acceptance result:
+
+```python
+decide_post_iteration_continuation(
+    proposal_token_ids,
+    target_logit_rows,
+    acceptance_result,
+    *,
+    vocab_size,
+    select_token,
+)
+```
+
+The package exports `PostIterationContinuationError`, its
+`PostIterationContinuationInvariantError` subclass, and the frozen, slotted
+`PostIterationContinuationResult`. The result has exactly two fields:
+`output_token_ids` and `uncached_next_token_id`. The output is the complete sequence newly emitted
+for the accepted proposal outcome, and its final element is always the one uncached token handed to
+a later iteration. The previously generated current token is never emitted again.
+
+The result constructor requires an exact, nonempty built-in output tuple of non-Boolean,
+nonnegative integers and a non-Boolean, nonnegative uncached token equal to the tuple's final
+element. It retains no proposal, acceptance count, replacement/bonus distinction, vocabulary
+bound, target row, acceptance object, selector or RNG, backend, checkpoint, cache length, model,
+tensor, grammar state, metric, or mutable collection. Because the result deliberately retains no
+vocabulary bound, direct construction can enforce nonnegativity but not an upper bound.
+
+The decision accepts an explicit positive integer `vocab_size`. D30 rows are opaque and D33 results
+do not carry a vocabulary upper bound, so D37 does not infer one from `len(row)` or change either
+earlier contract. The scalar bound validates proposal IDs, a mismatch replacement, and a selected
+full-acceptance bonus against `[0, vocab_size)`; it is not retained and proves numeric range only,
+not semantic tokenizer compatibility.
+
+Before any new selector call, D37 validates:
+
+- an exact, nonempty built-in proposal tuple containing only non-Boolean integers in range;
+- a positive, non-Boolean integer vocabulary size;
+- an exact built-in target-row tuple containing exactly `n + 1` entries;
+- a `MatchReplaceAcceptanceResult` whose raw proposal tuple equals the supplied proposal;
+- a raw accepted count within `[0, n]` and the exact replacement relationship for that outcome; and
+- a callable borrowed selector, including on a mismatch where it will not be invoked.
+
+D37 recomputes those relationships from D33's three stored fields rather than trusting derived
+properties. Full acceptance requires no replacement. A mismatch requires one in-range,
+non-Boolean integer replacement different from the rejected proposal token. Primitive caller-shape
+and scalar failures use `TypeError` or `ValueError`; impossible row-count, mixed-evidence,
+acceptance, and result relationships use `PostIterationContinuationInvariantError`.
+
+The outcome map is:
+
+| Outcome | D33 output | D37 selected row | New calls | D37 output | Uncached token |
+|---|---|---|---:|---|---|
+| Mismatch at `k` | `proposal[:k] + (replacement,)` | none | 0 | unchanged D33 output | `replacement` |
+| Full acceptance | `proposal` | only `r[n]` | 1 | `proposal + (bonus,)` | `bonus` |
+
+On mismatch, D37 does not access, inspect, compare, copy, or pass any row element. It reuses the
+validated D33 replacement and returns the exact accepted proposal prefix plus that token. On full
+acceptance, it passes `target_logit_rows[-1]` directly and by identity to the borrowed selector
+exactly once. Decision rows `r0` through `r[n-1]` are never selected again, and a bonus equal to the
+last proposal token remains valid.
+
+The caller owns one selector/RNG session across D33 and D37. D37 does not create, seed, clone,
+snapshot, reset, or rewind it. A final-row selector exception propagates as the same exception
+object. A Boolean, non-integer, negative, or out-of-range return fails after that one draw, and
+result-construction failure likewise propagates after the required call. D33 deliberately retains
+no selector identity, so supplying the same session to both operations is a caller responsibility
+rather than a runtime-detectable relationship.
+
+D37 rejects detectable evidence mixing: unequal proposal values, malformed acceptance fields,
+invalid row count, and token evidence outside the configured numeric domain. It cannot distinguish
+rows from a different D30 call with the same proposal length, an acceptance result from another
+call with identical token values, or semantically incompatible tokenizers. Adding call provenance
+would require a separate D30/D33 contract change.
+
+The operation invokes no backend and performs no cache, checkpoint, grammar, metric, model, tensor,
+or lifecycle work. Fake-backend composition proves that real D30 rows and D33 results produce every
+mismatch and full-acceptance outcome while cache tokens, length, script cursor, epoch, checkpoint
+registry, and allocation counter remain unchanged. The proof also covers selector state ownership,
+failure consumption, weak-reference non-retention, bounded reuse, and isolated optional-runtime-
+free imports.
+
+D35 remains behaviorally unchanged: it still has its eight-parameter signature and five-field
+result, reconciles mismatch caches exactly as before, leaves a mismatch replacement uncached, and
+returns no uncached continuation after full acceptance while never selecting `r[n]`. D37 is not
+called by D35, does not insert the bonus into either cache, and is not an iterative speculative
+engine or user-visible speculative decoding.
+
 ### Pinned dual-backend one-iteration qualification
 
 D36 qualifies the unchanged D35 signature and transaction through two independent calls to
@@ -743,8 +834,8 @@ path, source, package, or import dependency on the root Rust crate.
 The current Windows package does not yet provide:
 
 - a selected two-model draft/target pair or a separate production draft engine;
-- a cache-coordinated iterative speculative loop, iterative full-acceptance handoff, or
-  final-row/bonus policy;
+- integration of the cache-neutral continuation decision into D35 or a cache-coordinated iterative
+  speculative loop;
 - grammar-state speculation;
 - speculative streaming or acceptance metrics;
 - fixed or adaptive `gamma`;
@@ -756,6 +847,6 @@ The current Windows package does not yet provide:
 - native valid-token caching or a persistent CUDA mask workspace.
 
 Those capabilities remain separately sized roadmap work. D36 proves the unchanged one-iteration
-coordinator through two independently owned pinned production backends, but the same-profile
-qualification does not form user-visible speculative decoding without a selected pair and a
-separately owned iterative engine.
+coordinator through two independently owned pinned production backends. D37 now defines the pure
+post-iteration token handoff, but neither deliverable forms user-visible speculative decoding
+without integration, a selected pair, and a separately owned iterative engine.
