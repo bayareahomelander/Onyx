@@ -12,6 +12,10 @@ from .acceptance import (
 )
 from .backend import BackendError, ModelStep
 from .cache import CacheCheckpoint, CheckpointableAutoregressiveBackend
+from .continuation import (
+    PostIterationContinuationResult,
+    decide_post_iteration_continuation,
+)
 from .draft import DraftProposalResult, generate_draft_proposal
 from .verification import (
     BatchedTargetVerificationBackend,
@@ -149,6 +153,108 @@ class SpeculativeIterationResult:
         return self.replacement_token_id
 
 
+@dataclass(frozen=True, slots=True)
+class ContinuationAwareSpeculativeIterationResult:
+    """Immutable emitted-token outcome and cache lengths for one transaction."""
+
+    proposal_token_ids: tuple[int, ...]
+    accepted_count: int
+    replacement_token_id: int | None
+    initial_cache_length: int
+    final_cache_length: int
+    uncached_next_token_id: int
+
+    def __post_init__(self) -> None:
+        _validate_proposal_token_ids(self.proposal_token_ids)
+
+        if isinstance(self.accepted_count, bool) or not isinstance(self.accepted_count, int):
+            raise TypeError("accepted_count must be an integer")
+        proposal_length = len(self.proposal_token_ids)
+        if self.accepted_count < 0 or self.accepted_count > proposal_length:
+            raise SpeculativeIterationInvariantError(
+                f"accepted_count must be within [0, {proposal_length}]"
+            )
+
+        if self.accepted_count == proposal_length:
+            if self.replacement_token_id is not None:
+                raise SpeculativeIterationInvariantError(
+                    "fully accepted result cannot contain a replacement token"
+                )
+        else:
+            if self.replacement_token_id is None:
+                raise SpeculativeIterationInvariantError(
+                    "partially accepted result must contain a replacement token"
+                )
+            _validate_nonnegative_token_id(
+                self.replacement_token_id,
+                label="replacement_token_id",
+            )
+            if self.replacement_token_id == self.proposal_token_ids[self.accepted_count]:
+                raise SpeculativeIterationInvariantError(
+                    "replacement_token_id must differ from the rejected proposal token"
+                )
+
+        _validate_nonnegative_token_id(
+            self.uncached_next_token_id,
+            label="uncached_next_token_id",
+        )
+        if (
+            not self.fully_accepted
+            and self.uncached_next_token_id != self.replacement_token_id
+        ):
+            raise SpeculativeIterationInvariantError(
+                "mismatch uncached_next_token_id must equal replacement_token_id"
+            )
+
+        initial_cache_length = _validate_cache_length_metadata(
+            self.initial_cache_length,
+            label="initial_cache_length",
+        )
+        if initial_cache_length == 0:
+            raise SpeculativeIterationInvariantError(
+                "initial_cache_length must be greater than zero"
+            )
+        final_cache_length = _validate_cache_length_metadata(
+            self.final_cache_length,
+            label="final_cache_length",
+        )
+        expected_final_length = (
+            initial_cache_length + proposal_length + 1
+            if self.fully_accepted
+            else initial_cache_length + self.accepted_count + 1
+        )
+        if final_cache_length != expected_final_length:
+            raise SpeculativeIterationInvariantError(
+                f"final_cache_length is {final_cache_length}; expected {expected_final_length}"
+            )
+
+    @property
+    def fully_accepted(self) -> bool:
+        """Whether every proposal token matched its target decision row."""
+
+        return self.accepted_count == len(self.proposal_token_ids)
+
+    @property
+    def accepted_token_ids(self) -> tuple[int, ...]:
+        """Return the exact accepted proposal prefix."""
+
+        return self.proposal_token_ids[: self.accepted_count]
+
+    @property
+    def rejected_proposal_token_id(self) -> int | None:
+        """Return the first rejected proposal token, if one exists."""
+
+        if self.fully_accepted:
+            return None
+        return self.proposal_token_ids[self.accepted_count]
+
+    @property
+    def output_token_ids(self) -> tuple[int, ...]:
+        """Return every token newly emitted by this transaction."""
+
+        return self.accepted_token_ids + (self.uncached_next_token_id,)
+
+
 def coordinate_speculative_iteration(
     draft_backend: CheckpointableAutoregressiveBackend[
         DraftLogitsT,
@@ -267,6 +373,170 @@ def coordinate_speculative_iteration(
             replacement_token_id=replacement_token_id,
             initial_cache_length=initial_cache_length,
             final_cache_length=final_cache_length,
+        )
+
+        for checkpoint in owned_checkpoints:
+            draft_backend.release_cache_checkpoint(checkpoint)
+
+        _validate_backend_cache_length(
+            draft_backend,
+            final_cache_length,
+            role="draft",
+        )
+        _validate_backend_cache_length(
+            target_backend,
+            final_cache_length,
+            role="target",
+        )
+        return result
+    except BaseException as failure:
+        cleanup_failures = _cleanup_failed_iteration(
+            draft_backend,
+            target_backend,
+            draft_root_checkpoint=draft_root_checkpoint,
+            target_root_checkpoint=target_root_checkpoint,
+            owned_checkpoints=owned_checkpoints,
+            initial_cache_length=initial_cache_length,
+        )
+        if cleanup_failures:
+            raise SpeculativeIterationCleanupError(failure, cleanup_failures) from failure
+        raise
+
+
+def coordinate_continuation_aware_speculative_iteration(
+    draft_backend: CheckpointableAutoregressiveBackend[
+        DraftLogitsT,
+        DraftCheckpointT,
+    ],
+    target_backend: CheckpointableAutoregressiveBackend[
+        TargetLogitsT,
+        TargetCheckpointT,
+    ],
+    current_token_id: int,
+    *,
+    proposal_length: int,
+    draft_select_token: Callable[[DraftLogitsT], int],
+    target_select_token: Callable[[TargetLogitsT], int],
+    draft_root_checkpoint: DraftCheckpointT,
+    target_root_checkpoint: TargetCheckpointT,
+) -> ContinuationAwareSpeculativeIterationResult:
+    """Coordinate one cache transaction and derive its uncached continuation token."""
+
+    initial_cache_length, vocab_size = _validate_iteration_inputs(
+        draft_backend,
+        target_backend,
+        current_token_id,
+        proposal_length=proposal_length,
+        draft_select_token=draft_select_token,
+        target_select_token=target_select_token,
+        draft_root_checkpoint=draft_root_checkpoint,
+        target_root_checkpoint=target_root_checkpoint,
+    )
+    target_verifier = cast(
+        BatchedTargetVerificationBackend[TargetLogitsT],
+        target_backend,
+    )
+    owned_checkpoints: tuple[DraftCheckpointT, ...] = ()
+
+    try:
+        proposal = generate_draft_proposal(
+            draft_backend,
+            current_token_id,
+            proposal_length=proposal_length,
+            select_token=draft_select_token,
+        )
+        if not isinstance(proposal, DraftProposalResult):
+            raise SpeculativeIterationInvariantError(
+                "draft proposal operation must return a DraftProposalResult"
+            )
+
+        raw_owned_checkpoints = proposal.rollback_checkpoints
+        if type(raw_owned_checkpoints) is tuple:
+            owned_checkpoints = raw_owned_checkpoints
+        else:
+            try:
+                owned_checkpoints = tuple(raw_owned_checkpoints)
+            except (TypeError, ValueError) as exc:
+                raise SpeculativeIterationInvariantError(
+                    "draft proposal rollback_checkpoints could not be acquired"
+                ) from exc
+
+        proposal_token_ids = _validate_draft_proposal(
+            draft_backend,
+            proposal,
+            proposal_length=proposal_length,
+            initial_cache_length=initial_cache_length,
+            vocab_size=vocab_size,
+        )
+
+        verification = target_verifier.verify_proposal(
+            current_token_id,
+            proposal_token_ids,
+        )
+        target_logit_rows = _validate_target_verification(
+            target_backend,
+            verification,
+            proposal_length=proposal_length,
+            initial_cache_length=initial_cache_length,
+        )
+
+        decision = decide_match_replace_acceptance(
+            proposal_token_ids,
+            target_logit_rows,
+            select_token=target_select_token,
+        )
+        accepted_count, replacement_token_id = _validate_acceptance_decision(
+            decision,
+            proposal_token_ids=proposal_token_ids,
+            vocab_size=vocab_size,
+        )
+
+        if accepted_count == proposal_length:
+            final_cache_length = initial_cache_length + proposal_length + 1
+            _validate_backend_cache_length(
+                draft_backend,
+                final_cache_length,
+                role="draft",
+            )
+            _validate_backend_cache_length(
+                target_backend,
+                final_cache_length,
+                role="target",
+            )
+        else:
+            final_cache_length = _reconcile_mismatch(
+                draft_backend,
+                target_backend,
+                current_token_id,
+                proposal_token_ids=proposal_token_ids,
+                accepted_count=accepted_count,
+                initial_cache_length=initial_cache_length,
+                draft_rollback_checkpoint=owned_checkpoints[accepted_count],
+                target_root_checkpoint=target_root_checkpoint,
+            )
+
+        continuation = decide_post_iteration_continuation(
+            proposal_token_ids,
+            target_logit_rows,
+            decision,
+            vocab_size=vocab_size,
+            select_token=target_select_token,
+        )
+        uncached_next_token_id = _validate_continuation_decision(
+            continuation,
+            proposal_token_ids=proposal_token_ids,
+            accepted_count=accepted_count,
+            replacement_token_id=replacement_token_id,
+            vocab_size=vocab_size,
+        )
+
+        result = ContinuationAwareSpeculativeIterationResult(
+            proposal_token_ids=proposal_token_ids,
+            accepted_count=accepted_count,
+            replacement_token_id=replacement_token_id,
+            initial_cache_length=initial_cache_length,
+            final_cache_length=final_cache_length,
+            uncached_next_token_id=uncached_next_token_id,
         )
 
         for checkpoint in owned_checkpoints:
@@ -540,6 +810,84 @@ def _validate_acceptance_decision(
     return accepted_count, replacement_token_id
 
 
+def _validate_continuation_decision(
+    continuation: object,
+    *,
+    proposal_token_ids: tuple[int, ...],
+    accepted_count: int,
+    replacement_token_id: int | None,
+    vocab_size: int,
+) -> int:
+    if not isinstance(continuation, PostIterationContinuationResult):
+        raise SpeculativeIterationInvariantError(
+            "continuation operation must return a PostIterationContinuationResult"
+        )
+
+    try:
+        output_token_ids = continuation.output_token_ids
+        uncached_next_token_id = continuation.uncached_next_token_id
+    except Exception as exc:
+        raise SpeculativeIterationInvariantError(
+            "continuation result fields are unavailable"
+        ) from exc
+    if type(output_token_ids) is not tuple:
+        raise SpeculativeIterationInvariantError(
+            "continuation result output_token_ids must be an exact tuple"
+        )
+    if not output_token_ids:
+        raise SpeculativeIterationInvariantError(
+            "continuation result output_token_ids cannot be empty"
+        )
+    for position, token_id in enumerate(output_token_ids):
+        try:
+            _validate_token_id(
+                token_id,
+                vocab_size,
+                label=f"continuation output token at position {position}",
+            )
+        except (TypeError, ValueError) as exc:
+            raise SpeculativeIterationInvariantError(str(exc)) from exc
+
+    try:
+        _validate_token_id(
+            uncached_next_token_id,
+            vocab_size,
+            label="continuation uncached_next_token_id",
+        )
+    except (TypeError, ValueError) as exc:
+        raise SpeculativeIterationInvariantError(str(exc)) from exc
+    if uncached_next_token_id != output_token_ids[-1]:
+        raise SpeculativeIterationInvariantError(
+            "continuation uncached_next_token_id must equal the final output token"
+        )
+
+    if accepted_count < len(proposal_token_ids):
+        expected_output = proposal_token_ids[:accepted_count] + (
+            cast(int, replacement_token_id),
+        )
+        if output_token_ids != expected_output:
+            raise SpeculativeIterationInvariantError(
+                "mismatch continuation output disagrees with the acceptance decision"
+            )
+        if uncached_next_token_id != replacement_token_id:
+            raise SpeculativeIterationInvariantError(
+                "mismatch continuation token disagrees with the replacement token"
+            )
+    else:
+        expected_output_length = len(proposal_token_ids) + 1
+        if len(output_token_ids) != expected_output_length:
+            raise SpeculativeIterationInvariantError(
+                f"fully accepted continuation contains {len(output_token_ids)} tokens; "
+                f"expected {expected_output_length}"
+            )
+        if output_token_ids[:-1] != proposal_token_ids:
+            raise SpeculativeIterationInvariantError(
+                "fully accepted continuation output must begin with the exact proposal"
+            )
+
+    return cast(int, uncached_next_token_id)
+
+
 def _reconcile_mismatch(
     draft_backend: CheckpointableAutoregressiveBackend[
         DraftLogitsT,
@@ -793,9 +1141,11 @@ def _validate_nonnegative_token_id(token_id: object, *, label: str) -> None:
 
 
 __all__ = [
+    "ContinuationAwareSpeculativeIterationResult",
     "SpeculativeIterationCleanupError",
     "SpeculativeIterationError",
     "SpeculativeIterationInvariantError",
     "SpeculativeIterationResult",
+    "coordinate_continuation_aware_speculative_iteration",
     "coordinate_speculative_iteration",
 ]

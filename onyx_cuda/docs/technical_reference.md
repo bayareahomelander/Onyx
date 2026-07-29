@@ -401,6 +401,97 @@ returns no uncached continuation after full acceptance while never selecting `r[
 called by D35, does not insert the bonus into either cache, and is not an iterative speculative
 engine or user-visible speculative decoding.
 
+### Continuation-aware one-transaction coordination
+
+`coordinate_continuation_aware_speculative_iteration(...)` is the additive D38 integration of D32
+proposal, D30 verification, D33 acceptance, the D35 cache-outcome rules, and the D37 continuation
+decision. It operates once over two distinct, already-prefilled checkpointable roles:
+
+```python
+coordinate_continuation_aware_speculative_iteration(
+    draft_backend,
+    target_backend,
+    current_token_id,
+    *,
+    proposal_length,
+    draft_select_token,
+    target_select_token,
+    draft_root_checkpoint,
+    target_root_checkpoint,
+)
+```
+
+The inputs, root qualification, and shared numeric-vocabulary requirement are identical to D35.
+Both roles must begin at the same positive cache length `P`, report the same positive vocabulary
+size, and accept the current token in that range. The roots must identify the current state of
+their respective backend. Same-position draft-then-target rollback proves their owner, epoch,
+allocation, canonical state, and lifetime before proposal work begins. Semantic tokenizer identity
+remains a later production-pair responsibility.
+
+The transaction order is fixed:
+
+1. D32 produces the exact proposal and transfers its rejection handles.
+2. D30 verifies `(current_token_id, *proposal)` once and returns exactly `n + 1` opaque rows.
+3. D33 selects decision rows in order through the borrowed target-selector session.
+4. The coordinator completes and validates the D35 cache outcome.
+5. D37 receives the exact proposal, row tuple, D33 result, shared vocabulary size, and the same
+   target-selector object.
+6. The coordinator validates the composed D37 evidence, constructs its minimal result, releases
+   the D32 handles in proposal order, and revalidates both final cache lengths.
+
+Cache reconciliation deliberately precedes D37. A cache rollback, replay, or final-length failure
+therefore cannot consume the full-acceptance bonus draw. The coordinator never inspects, converts,
+stacks, copies, infers a vocabulary from, or retains an individual target row. D33 and D37 alone
+pass the applicable exact row objects to the selector.
+
+The outcome map is:
+
+| Outcome | Target-selector rows | Target replay | Final common cache | Newly emitted output | Only uncached token |
+|---|---|---|---|---|---|
+| Mismatch after `k` accepted | D33 uses `r0..rk`; D37 adds no call | `(current, *proposal[:k])` | `P + 1 + k` | `proposal[:k] + (replacement,)` | replacement |
+| Full acceptance | D33 uses `r0..r[n-1]`; D37 then uses only `r[n]` | none | `P + n + 1` | `proposal + (bonus,)` | bonus |
+
+The current token is consumed into both caches but is not emitted again. On mismatch, the draft
+rolls through D32 checkpoint `k`; the target rolls to its caller root and replays the exact accepted
+prefix. The replacement remains outside both caches. On full acceptance, both complete proposal
+suffixes remain cached and the bonus remains outside both caches. A bonus equal to the final
+proposal token is valid: only its newly emitted occurrence is uncached.
+
+The frozen, slotted `ContinuationAwareSpeculativeIterationResult` has exactly six fields:
+
+- `proposal_token_ids`;
+- `accepted_count`;
+- `replacement_token_id`;
+- `initial_cache_length`;
+- `final_cache_length`; and
+- `uncached_next_token_id`.
+
+It derives `fully_accepted`, `accepted_token_ids`, `rejected_proposal_token_id`, and
+`output_token_ids`. The output always ends with `uncached_next_token_id`; on mismatch that token
+must equal the replacement, while on full acceptance it is the bonus. Direct construction enforces
+exact built-in tuple and scalar relationships, nonnegative token IDs, positive initial length, and
+the exact outcome-specific final length. The result does not retain a vocabulary bound, so only the
+coordinator enforces the operation-time upper bound. It retains no backend, checkpoint, target row,
+verification/acceptance/continuation result, selector/RNG, model, tensor, grammar state, metric, or
+mutable collection.
+
+The caller continues to own both roots; D38 never releases them or creates the next iteration's
+roots. It assumes ownership of every D32 rejection handle and releases those handles in proposal
+order on success. Once D32 begins, verification, acceptance, reconciliation, D37 selection or
+validation, result construction, handle release, and final cache validation all share one failure
+domain. Cleanup attempts draft-root rollback, target-root rollback, and every acquired D32-handle
+release in that deterministic order. Healthy cleanup re-raises the exact original exception.
+`SpeculativeIterationCleanupError` preserves the original failure and every ordered cleanup
+failure when restoration is incomplete. D38 never calls `reset()`, retries D37, or restores
+selector/RNG state; a failed or invalid final-row draw remains consumed.
+
+This coordinator and its tests are model-free and import without MLX, PyTorch, Transformers, the
+native grammar extension, CUDA initialization, tokenizer assets, or network access. D38 does not
+run a second speculative iteration, rotate roots, own prompt prefill or model lifecycles, select a
+release pair, choose `gamma`, branch grammar state, apply stop/completion/length policy, stream,
+cancel, add speculative metrics, or expose API behavior. Those remain separate production and
+iterative-engine work.
+
 ### Pinned dual-backend one-iteration qualification
 
 D36 qualifies the unchanged D35 signature and transaction through two independent calls to
@@ -834,10 +925,10 @@ path, source, package, or import dependency on the root Rust crate.
 The current Windows package does not yet provide:
 
 - a selected two-model draft/target pair or a separate production draft engine;
-- integration of the cache-neutral continuation decision into D35 or a cache-coordinated iterative
+- next-iteration root rotation, an iterative handoff owner, or a cache-coordinated multi-iteration
   speculative loop;
 - grammar-state speculation;
-- speculative streaming or acceptance metrics;
+- speculative stops, streaming, cancellation, or acceptance metrics;
 - fixed or adaptive `gamma`;
 - final prompt, output, context, concurrency, or 6 GiB operating limits;
 - CPU offload;
@@ -848,5 +939,6 @@ The current Windows package does not yet provide:
 
 Those capabilities remain separately sized roadmap work. D36 proves the unchanged one-iteration
 coordinator through two independently owned pinned production backends. D37 now defines the pure
-post-iteration token handoff, but neither deliverable forms user-visible speculative decoding
-without integration, a selected pair, and a separately owned iterative engine.
+post-iteration token handoff, and D38 integrates it into one additive framework-neutral
+transaction. These deliverables still do not form user-visible speculative decoding without a
+selected pair and a separately owned iterative engine.

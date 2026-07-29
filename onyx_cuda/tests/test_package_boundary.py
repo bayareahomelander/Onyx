@@ -72,10 +72,12 @@ def test_package_identifies_the_windows_cuda_variant():
         assert exported.__module__ == "onyx_cuda.continuation"
         assert continuation_symbol in onyx_cuda.__all__
     for iteration_symbol in (
+        "ContinuationAwareSpeculativeIterationResult",
         "SpeculativeIterationCleanupError",
         "SpeculativeIterationError",
         "SpeculativeIterationInvariantError",
         "SpeculativeIterationResult",
+        "coordinate_continuation_aware_speculative_iteration",
         "coordinate_speculative_iteration",
     ):
         exported = getattr(onyx_cuda, iteration_symbol)

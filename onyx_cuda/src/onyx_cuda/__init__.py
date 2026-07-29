@@ -31,10 +31,12 @@ from .continuation import (
     decide_post_iteration_continuation,
 )
 from .speculative_iteration import (
+    ContinuationAwareSpeculativeIterationResult,
     SpeculativeIterationCleanupError,
     SpeculativeIterationError,
     SpeculativeIterationInvariantError,
     SpeculativeIterationResult,
+    coordinate_continuation_aware_speculative_iteration,
     coordinate_speculative_iteration,
 )
 from .verification import (
@@ -219,6 +221,7 @@ __all__ = [
     "ConstrainedGenerationCleanupError",
     "ConstrainedGenerationError",
     "ConstrainedGenerationInvariantError",
+    "ContinuationAwareSpeculativeIterationResult",
     "DEFAULT_TARGET_PROFILE",
     "DraftProposalCleanupError",
     "DraftProposalError",
@@ -344,6 +347,7 @@ __all__ = [
     "compile_native_regex",
     "compile_native_json_schema",
     "build_qwen_grammar_vocabulary",
+    "coordinate_continuation_aware_speculative_iteration",
     "coordinate_speculative_iteration",
     "decide_match_replace_acceptance",
     "decide_post_iteration_continuation",

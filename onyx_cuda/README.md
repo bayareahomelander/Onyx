@@ -35,6 +35,10 @@ Transformers instead of the Apple MLX runtime used by the macOS package.
 - A pure, framework-neutral post-iteration continuation decision over exact proposal, verification,
   and acceptance evidence. A mismatch reuses the already-selected replacement without another
   selector call; full acceptance selects exactly one uncached bonus token from the final target row.
+- An additive, framework-neutral continuation-aware transaction that applies the existing
+  one-iteration cache outcome before that continuation decision. Mismatch returns the uncached
+  replacement with no extra target-selector call; full acceptance uses only the final target row
+  for one uncached bonus. Neither continuation token is inserted into either aligned cache.
 - Bounded one-iteration production qualification over two independently loaded pinned 0.5B
   backends on `cuda:0`, covering genuine greedy full acceptance, test-forced mismatch at every
   three-token fixture position, exact role-local cache reconciliation, independent close order, and
@@ -222,9 +226,10 @@ The Windows package does not yet provide:
 
 - a selected two-model draft/target pair or a separate production draft engine;
 - a cache-coordinated iterative speculative engine or user-visible speculative decoding;
-- integration of the pure continuation decision into D35 or a production iterative handoff;
+- next-iteration root rotation, an iterative handoff owner, or a fixed `gamma`;
 - grammar-state speculation or speculative metrics;
-- final context, output, concurrency, or fixed-`gamma` operating limits;
+- speculative stop, streaming, cancellation, or API integration;
+- final context, output, or concurrency operating limits;
 - CPU offload;
 - implicit chat-template formatting;
 - a CLI or FastAPI/OpenAI-compatible server;
