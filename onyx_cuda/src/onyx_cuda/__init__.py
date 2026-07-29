@@ -39,6 +39,13 @@ from .speculative_iteration import (
     coordinate_continuation_aware_speculative_iteration,
     coordinate_speculative_iteration,
 )
+from .speculative_handoff import (
+    SpeculativeHandoffCleanupError,
+    SpeculativeHandoffError,
+    SpeculativeHandoffInvariantError,
+    TwoIterationSpeculativeHandoffResult,
+    coordinate_two_iteration_speculative_handoff,
+)
 from .verification import (
     BatchedTargetVerificationBackend,
     BatchedTargetVerificationResult,
@@ -337,7 +344,11 @@ __all__ = [
     "SpeculativeIterationError",
     "SpeculativeIterationInvariantError",
     "SpeculativeIterationResult",
+    "SpeculativeHandoffCleanupError",
+    "SpeculativeHandoffError",
+    "SpeculativeHandoffInvariantError",
     "TemperatureTopPSelection",
+    "TwoIterationSpeculativeHandoffResult",
     "create_cuda_sampler",
     "create_cuda_grammar_logit_mask",
     "create_grammar_timing_session",
@@ -349,6 +360,7 @@ __all__ = [
     "build_qwen_grammar_vocabulary",
     "coordinate_continuation_aware_speculative_iteration",
     "coordinate_speculative_iteration",
+    "coordinate_two_iteration_speculative_handoff",
     "decide_match_replace_acceptance",
     "decide_post_iteration_continuation",
     "discover_nvidia_devices",

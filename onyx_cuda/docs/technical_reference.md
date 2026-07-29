@@ -492,6 +492,101 @@ release pair, choose `gamma`, branch grammar state, apply stop/completion/length
 cancel, add speculative metrics, or expose API behavior. Those remain separate production and
 iterative-engine work.
 
+### Bounded two-iteration handoff
+
+`onyx_cuda.speculative_handoff` adds the five D39 public symbols
+`SpeculativeHandoffError`, `SpeculativeHandoffInvariantError`,
+`SpeculativeHandoffCleanupError`, `TwoIterationSpeculativeHandoffResult`, and:
+
+```python
+coordinate_two_iteration_speculative_handoff(
+    draft_backend,
+    target_backend,
+    current_token_id,
+    *,
+    proposal_length,
+    draft_select_token,
+    target_select_token,
+    draft_root_checkpoint,
+    target_root_checkpoint,
+)
+```
+
+The operation has the same eight-parameter shape as D38. It uses the exact same two already-
+prefilled backend objects, caller-owned selector sessions, and positive caller-selected proposal
+length for both calls. It is deliberately two calls rather than an iteration-count abstraction and
+does not choose a release `gamma`.
+
+Let `P` be the common caller-root length, `C0` the initial uncached current token, and `n` the
+proposal length. For accepted counts `A1` and `A2`, define the first proposal and uncached output as
+`D1` and `H1`, and the second as `D2` and `H2`:
+
+```text
+Q1 = P  + 1 + A1
+Q2 = Q1 + 1 + A2
+
+first output  = D1[:A1] + (H1,)
+second output = D2[:A2] + (H2,)
+combined      = first output + second output
+
+final caches  = prompt + (C0,) + D1[:A1] + (H1,) + D2[:A2]
+```
+
+After the first D38 success, both caches end at `Q1` and `H1` is still uncached. D39 creates one
+draft and then one target intermediate checkpoint at that exact prefix. Its second D38 call borrows
+those roots and receives `H1` as its current token. D38 consumes that token into each cache but does
+not emit a second current-token occurrence. `H1` therefore appears in the combined output exactly
+where the first result emitted it; a later naturally selected token with the same numeric ID remains
+valid. After the second success both caches end at `Q2`, and only `H2` remains uncached.
+
+All four outcome categories follow the same formulas:
+
+| First transaction | Second transaction | Intermediate length | Final length | Final uncached token |
+|---|---|---:|---:|---|
+| mismatch at `A1` | mismatch at `A2` | `P + 1 + A1` | `P + 2 + A1 + A2` | second replacement |
+| mismatch at `A1` | full acceptance | `P + 1 + A1` | `P + 2 + A1 + n` | second bonus |
+| full acceptance | mismatch at `A2` | `P + 1 + n` | `P + 2 + n + A2` | second replacement |
+| full acceptance | full acceptance | `P + 1 + n` | `P + 2 + 2n` | second bonus |
+
+One successful handoff makes exactly two D38 calls, `2n` draft-selector calls,
+`2(n + 1)` draft decodes, two batched target verifications, and `A1 + A2 + 2`
+target-selector calls. D39 directly creates and releases exactly one checkpoint per role and creates
+no final or third-iteration root. Each D38 call continues to own and settle its own D32 checkpoint
+group.
+
+`TwoIterationSpeculativeHandoffResult` is frozen and slotted and stores exactly
+`first_iteration` and `second_iteration`, both genuine immutable D38 results. It derives
+`handoff_token_id`, exact concatenated `output_token_ids`, `uncached_next_token_id`,
+`initial_cache_length`, `intermediate_cache_length`, and `final_cache_length`. Construction
+requires equal positive proposal lengths, cache continuity, exact nonempty per-iteration outputs,
+and each result's final output/uncached-token relationship. The result retains no backend,
+checkpoint, selector, row, model, tensor, grammar state, metric session, or mutable collection.
+
+The caller owns both initial roots throughout and D39 never releases them. D39 owns each
+intermediate handle as soon as its creation call returns, before inspecting its metadata. On
+success it releases the draft intermediate, validates both final cache lengths, releases the target
+intermediate, and validates both lengths again. Any failure after the first D38 return starts outer
+cleanup in this fixed order:
+
+1. restore and validate the draft caller root;
+2. restore and validate the target caller root;
+3. settle the acquired draft intermediate root;
+4. settle the acquired target intermediate root.
+
+Failures inside the first D38 call remain solely in D38's transaction domain and propagate without
+duplicate outer rollback. A later failure is re-raised as the exact object when outer cleanup is
+healthy. If outer restoration or settlement also fails, `SpeculativeHandoffCleanupError` retains
+the original failure as its cause plus the ordered immutable cleanup evidence. A nested
+`SpeculativeIterationCleanupError` remains one unflattened original failure. D39 never calls
+`reset()`, retries a transaction, or rewinds caller-owned selector/RNG state.
+
+The module and deterministic proof are framework-neutral, model-free, and import without MLX,
+PyTorch, Transformers, Tokenizers, Hugging Face Hub, bitsandbytes, Accelerate, ONNX Runtime,
+psutil, the native grammar extension, CUDA initialization, assets, or network access. D39 is not a
+variable-count or production engine and does not own prompt prefill, third-iteration roots,
+termination or output budgets, grammar/stop/streaming/cancellation/metric policy, pair loading,
+release models or quantization, fixed `gamma`, offload, operating limits, or API behavior.
+
 ### Pinned dual-backend one-iteration qualification
 
 D36 qualifies the unchanged D35 signature and transaction through two independent calls to
@@ -925,8 +1020,8 @@ path, source, package, or import dependency on the root Rust crate.
 The current Windows package does not yet provide:
 
 - a selected two-model draft/target pair or a separate production draft engine;
-- next-iteration root rotation, an iterative handoff owner, or a cache-coordinated multi-iteration
-  speculative loop;
+- third-and-later root rotation, a variable-count or production iterative engine, or termination
+  and output-budget policy;
 - grammar-state speculation;
 - speculative stops, streaming, cancellation, or acceptance metrics;
 - fixed or adaptive `gamma`;
@@ -938,7 +1033,8 @@ The current Windows package does not yet provide:
 - native valid-token caching or a persistent CUDA mask workspace.
 
 Those capabilities remain separately sized roadmap work. D36 proves the unchanged one-iteration
-coordinator through two independently owned pinned production backends. D37 now defines the pure
-post-iteration token handoff, and D38 integrates it into one additive framework-neutral
-transaction. These deliverables still do not form user-visible speculative decoding without a
-selected pair and a separately owned iterative engine.
+coordinator through two independently owned pinned production backends. D37 defines the pure
+post-iteration token handoff, D38 integrates it into one additive framework-neutral transaction,
+and D39 proves one exact transition between two such transactions with a settled intermediate root
+pair. These deliverables still do not form user-visible speculative decoding without a selected
+pair and a separately owned production iterative engine.

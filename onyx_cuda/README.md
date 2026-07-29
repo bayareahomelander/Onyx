@@ -39,6 +39,10 @@ Transformers instead of the Apple MLX runtime used by the macOS package.
   one-iteration cache outcome before that continuation decision. Mismatch returns the uncached
   replacement with no extra target-selector call; full acceptance uses only the final target row
   for one uncached bonus. Neither continuation token is inserted into either aligned cache.
+- A bounded, framework-neutral two-iteration handoff over exactly two continuation-aware
+  transactions. It passes the first uncached token as the second current token, owns one
+  intermediate root per role, and concatenates both output tuples without adding another handoff
+  occurrence. Both caches finish aligned while the second result's final token remains uncached.
 - Bounded one-iteration production qualification over two independently loaded pinned 0.5B
   backends on `cuda:0`, covering genuine greedy full acceptance, test-forced mismatch at every
   three-token fixture position, exact role-local cache reconciliation, independent close order, and
@@ -225,8 +229,9 @@ and CUDA mask-application totals in `metrics.grammar_timing`.
 The Windows package does not yet provide:
 
 - a selected two-model draft/target pair or a separate production draft engine;
-- a cache-coordinated iterative speculative engine or user-visible speculative decoding;
-- next-iteration root rotation, an iterative handoff owner, or a fixed `gamma`;
+- a variable-count or production iterative speculative engine, or user-visible speculative
+  decoding;
+- third-and-later root rotation, termination or output-budget policy, or a fixed `gamma`;
 - grammar-state speculation or speculative metrics;
 - speculative stop, streaming, cancellation, or API integration;
 - final context, output, or concurrency operating limits;
