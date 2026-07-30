@@ -48,6 +48,9 @@ Transformers instead of the Apple MLX runtime used by the macOS package.
   becomes the next current token, current/next intermediate roots rotate with bounded ownership,
   and exact per-iteration outputs accumulate without another handoff-token insertion. Both caches
   finish aligned while only the last result's final token remains uncached.
+- Pure, framework-neutral post-D38 grammar-state reconciliation that independently replays the
+  complete proposal and committed-output branches, releases the discarded draft branch and
+  committed ancestors, and transfers one final committed state to the caller.
 - Bounded one-iteration production qualification over two independently loaded pinned 0.5B
   backends on `cuda:0`, covering genuine greedy full acceptance, test-forced mismatch at every
   three-token fixture position, exact role-local cache reconciliation, independent close order, and
@@ -236,8 +239,11 @@ The Windows package does not yet provide:
 - a selected two-model draft/target pair or a separate production draft engine;
 - a policy-driven production iterative speculative engine or user-visible speculative decoding;
 - termination or output-budget policy, or a fixed `gamma`;
-- grammar-state speculation or speculative metrics;
-- speculative stop, streaming, cancellation, or API integration;
+- live grammar masks during draft or target speculative selection, grammar-driven early proposal
+  termination, or multi-iteration grammar-state policy;
+- speculative EOS, grammar-completion, stop, output-budget, streaming, cancellation, or API
+  integration, and a production/user-visible grammar-aware speculative engine;
+- speculative metrics;
 - final context, output, or concurrency operating limits;
 - CPU offload;
 - implicit chat-template formatting;

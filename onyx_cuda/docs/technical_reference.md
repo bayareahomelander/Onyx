@@ -716,6 +716,118 @@ does not own prompt or model lifecycles, select or load a release pair, choose f
 truncate output, branch grammar state, stream, cancel, add speculative metrics, enable offload, or
 expose API behavior.
 
+### One-iteration speculative grammar-state reconciliation
+
+D41 adds the pure `onyx_cuda.speculative_grammar` module and exactly five public symbols:
+
+```python
+SpeculativeGrammarReconciliationCleanupError
+SpeculativeGrammarReconciliationError
+SpeculativeGrammarReconciliationInvariantError
+SpeculativeGrammarReconciliationResult
+reconcile_speculative_grammar_state
+```
+
+The base error derives from `GrammarError`; the invariant and cleanup errors derive from the D41
+base. The operation has this exact signature:
+
+```python
+reconcile_speculative_grammar_state(
+    constraint,
+    starting_state,
+    iteration_result,
+    *,
+    vocab_size,
+)
+```
+
+`constraint`, `starting_state`, and the completed D38 `iteration_result` are borrowed. The required
+positive, non-Boolean integer `vocab_size` must equal `constraint.vocab_size`; it supplies the
+numeric range used to validate all proposal and output tokens because D38 results do not retain a
+vocabulary bound. That equality does not prove tokenizer-byte compatibility or producer
+provenance.
+
+The starting state is already after D38's current token. D41 accepts no current-token parameter and
+does not advance that token again. Let:
+
+- `S` be the caller-owned starting state;
+- `D = (d0, ..., d[n-1])` be the nonempty proposal;
+- `A` be the accepted count;
+- `H` be the uncached next token;
+- `O = D[:A] + (H,)` be the exact committed output; and
+- `m = len(O) = A + 1`.
+
+The two branches are independently allocated from the same borrowed `S`:
+
+```text
+Sd[-1] = S
+Sd[i]  = advance_state(Sd[i-1], D[i])   for 0 <= i < n
+
+Sc[-1] = S
+Sc[j]  = advance_state(Sc[j-1], O[j])   for 0 <= j < m
+```
+
+On mismatch, `A < n`, `H` equals the replacement and differs from `D[A]`; the committed branch is
+the accepted prefix plus that replacement. On full acceptance, `A == n`, the committed branch
+independently replays every proposal and then advances the bonus `H`. Equal numeric token IDs never
+authorize state reuse. D41 compares opaque state handles only by object identity and rejects a
+child that aliases `S`, its parent, an earlier same-branch child, or any child in the other branch.
+
+A successful operation performs:
+
+```text
+draft advances               = n
+committed advances           = m = A + 1
+total advances               = n + A + 1
+draft states released        = n
+committed ancestors released = m - 1 = A
+transferred states           = 1
+D41-owned peak states        = n + m
+```
+
+Every child is D41-owned as soon as `advance_state(...)` returns. D41 validates every returned
+child with `is_dead_state(...)`. A regex dead child is permitted only on the discard-only draft
+branch and can continue producing dead children. A dead committed child is an invariant failure.
+An invalid JSON transition instead propagates the original `GrammarStateError`; no child is
+invented for a transition that raised.
+
+Before releasing anything, D41 proves the borrowed start is unchanged and the final committed
+state is live, then records the final match Boolean. Success releases every draft child in proposal
+order, releases every nonfinal committed child in output order, and revalidates both retained
+states. It then returns the frozen, slotted two-field result:
+
+```python
+@dataclass(frozen=True, slots=True)
+class SpeculativeGrammarReconciliationResult:
+    committed_state: StateT
+    is_match: bool
+```
+
+The result transfers exactly the final committed state and retains no constraint, start, D38
+evidence, draft child, committed ancestor, backend, selector, row, checkpoint, model, tensor,
+metric session, cleanup history, or mutable collection. The caller retains ownership of `S` and
+becomes responsible for releasing `result.committed_state`.
+
+Any failure after acquisition attempts every still-owned unique state in this exact order:
+
+1. remaining draft children in proposal order;
+2. remaining committed children in output order, including the final child unless transferred.
+
+The zero-based cleanup labels are `draft state release at position {i}` and
+`committed state release at position {j}`. A success-path release that raises remains owned and is
+retried once by failure cleanup, relying on the grammar contract's idempotent release behavior.
+Cleanup continues after every exception. Healthy cleanup re-raises the exact original failure.
+Incomplete cleanup raises `SpeculativeGrammarReconciliationCleanupError` with ordered immutable
+evidence, exact exception identities, and the original failure as its cause. The borrowed start is
+never released, and D41 never bulk-releases states, resets the constraint, or retries a transition.
+
+D41 calls no valid-token scan, grammar mask, selector, backend, cache, checkpoint, model, metric, or
+D38 operation. It is model-free and imports without optional native, CUDA, model, or Mac runtimes.
+Live speculative grammar masks, grammar-driven early proposal termination, multi-iteration grammar
+policy, EOS/grammar/stop/output-budget/streaming/cancellation integration, production pair
+lifecycle, release model and `gamma` selection, operating limits, offload, metrics, and API behavior
+remain separate work.
+
 ### Pinned dual-backend one-iteration qualification
 
 D36 qualifies the unchanged D35 signature and transaction through two independent calls to
@@ -1150,7 +1262,9 @@ The current Windows package does not yet provide:
 
 - a selected two-model draft/target pair or a separate production draft engine;
 - a policy-driven production iterative engine or termination and output-budget policy;
-- grammar-state speculation;
+- live speculative grammar masking, grammar-driven proposal termination, or multi-iteration
+  grammar-state policy;
+- a production/user-visible grammar-aware speculative engine;
 - speculative stops, streaming, cancellation, or acceptance metrics;
 - fixed or adaptive `gamma`;
 - final prompt, output, context, concurrency, or 6 GiB operating limits;
@@ -1165,5 +1279,7 @@ coordinator through two independently owned pinned production backends. D37 defi
 post-iteration token handoff, D38 integrates it into one additive framework-neutral transaction,
 and D39 proves one exact transition between two such transactions with a settled intermediate root
 pair. D40 generalizes that mechanical handoff to a positive caller count with bounded root
-rotation. These deliverables still do not form user-visible speculative decoding without a
-selected pair and a separately owned production iterative engine.
+rotation, and D41 independently reconciles one completed D38 result into a transferred committed
+grammar state. These deliverables still do not form user-visible speculative decoding without a
+selected pair, live speculative grammar selection, and a separately owned production iterative
+engine.

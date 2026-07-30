@@ -95,6 +95,16 @@ def test_package_identifies_the_windows_cuda_variant():
         exported = getattr(onyx_cuda, handoff_symbol)
         assert exported.__module__ == "onyx_cuda.speculative_handoff"
         assert handoff_symbol in onyx_cuda.__all__
+    for grammar_reconciliation_symbol in (
+        "SpeculativeGrammarReconciliationCleanupError",
+        "SpeculativeGrammarReconciliationError",
+        "SpeculativeGrammarReconciliationInvariantError",
+        "SpeculativeGrammarReconciliationResult",
+        "reconcile_speculative_grammar_state",
+    ):
+        exported = getattr(onyx_cuda, grammar_reconciliation_symbol)
+        assert exported.__module__ == "onyx_cuda.speculative_grammar"
+        assert grammar_reconciliation_symbol in onyx_cuda.__all__
     assert callable(onyx_cuda.build_qwen_grammar_vocabulary)
     assert callable(onyx_cuda.create_cuda_grammar_logit_mask)
     assert callable(onyx_cuda.generate_constrained_target)

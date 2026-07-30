@@ -48,6 +48,13 @@ from .speculative_handoff import (
     coordinate_multi_iteration_speculative_handoff,
     coordinate_two_iteration_speculative_handoff,
 )
+from .speculative_grammar import (
+    SpeculativeGrammarReconciliationCleanupError,
+    SpeculativeGrammarReconciliationError,
+    SpeculativeGrammarReconciliationInvariantError,
+    SpeculativeGrammarReconciliationResult,
+    reconcile_speculative_grammar_state,
+)
 from .verification import (
     BatchedTargetVerificationBackend,
     BatchedTargetVerificationResult,
@@ -350,6 +357,10 @@ __all__ = [
     "SpeculativeHandoffCleanupError",
     "SpeculativeHandoffError",
     "SpeculativeHandoffInvariantError",
+    "SpeculativeGrammarReconciliationCleanupError",
+    "SpeculativeGrammarReconciliationError",
+    "SpeculativeGrammarReconciliationInvariantError",
+    "SpeculativeGrammarReconciliationResult",
     "TemperatureTopPSelection",
     "TwoIterationSpeculativeHandoffResult",
     "create_cuda_sampler",
@@ -379,6 +390,7 @@ __all__ = [
     "probe_torch_cuda",
     "probe_quantized_target",
     "qualify_qwen_3b_candidate",
+    "reconcile_speculative_grammar_state",
     "select_highest_logit",
     "select_cuda_argmax",
     "validate_selection_policy",
