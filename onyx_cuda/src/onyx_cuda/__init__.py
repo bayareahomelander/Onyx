@@ -87,6 +87,12 @@ from .constrained_generation import (
     RegexGrammar,
     generate_constrained_target,
 )
+from .grammar_selection import (
+    GrammarMaskedSelectionError,
+    GrammarMaskedSelectionInvariantError,
+    GrammarMaskedSelectionResult,
+    select_grammar_masked_token,
+)
 from .grammar import (
     GrammarCompilationError,
     GrammarCompiler,
@@ -254,6 +260,9 @@ __all__ = [
     "GrammarError",
     "GrammarGenerationContext",
     "GrammarLogitMask",
+    "GrammarMaskedSelectionError",
+    "GrammarMaskedSelectionInvariantError",
+    "GrammarMaskedSelectionResult",
     "GrammarNoContinuationError",
     "GrammarSpecification",
     "GrammarRuntimeCompatibilityError",
@@ -392,6 +401,7 @@ __all__ = [
     "qualify_qwen_3b_candidate",
     "reconcile_speculative_grammar_state",
     "select_highest_logit",
+    "select_grammar_masked_token",
     "select_cuda_argmax",
     "validate_selection_policy",
 ]

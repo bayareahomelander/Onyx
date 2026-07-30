@@ -105,6 +105,20 @@ def test_package_identifies_the_windows_cuda_variant():
         exported = getattr(onyx_cuda, grammar_reconciliation_symbol)
         assert exported.__module__ == "onyx_cuda.speculative_grammar"
         assert grammar_reconciliation_symbol in onyx_cuda.__all__
+    for grammar_selection_symbol in (
+        "GrammarMaskedSelectionError",
+        "GrammarMaskedSelectionInvariantError",
+        "GrammarMaskedSelectionResult",
+        "select_grammar_masked_token",
+    ):
+        exported = getattr(onyx_cuda, grammar_selection_symbol)
+        assert exported.__module__ == "onyx_cuda.grammar_selection"
+        assert grammar_selection_symbol in onyx_cuda.__all__
+    assert issubclass(onyx_cuda.GrammarMaskedSelectionError, onyx_cuda.GrammarError)
+    assert issubclass(
+        onyx_cuda.GrammarMaskedSelectionInvariantError,
+        onyx_cuda.GrammarMaskedSelectionError,
+    )
     assert callable(onyx_cuda.build_qwen_grammar_vocabulary)
     assert callable(onyx_cuda.create_cuda_grammar_logit_mask)
     assert callable(onyx_cuda.generate_constrained_target)

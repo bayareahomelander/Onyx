@@ -828,6 +828,91 @@ policy, EOS/grammar/stop/output-budget/streaming/cancellation integration, produ
 lifecycle, release model and `gamma` selection, operating limits, offload, metrics, and API behavior
 remain separate work.
 
+### One-row grammar-support masked selection
+
+D42 adds the pure `onyx_cuda.grammar_selection` module and exactly four public symbols:
+
+```python
+GrammarMaskedSelectionError
+GrammarMaskedSelectionInvariantError
+GrammarMaskedSelectionResult
+select_grammar_masked_token
+```
+
+Both errors derive from `GrammarError`, with the invariant error beneath the D42 base. The operation
+has this exact signature:
+
+```python
+select_grammar_masked_token(
+    constraint,
+    state,
+    logits,
+    logit_mask,
+    *,
+    vocab_size,
+    select_token,
+)
+```
+
+The constraint, live state, backend-native logits row, stateless mask, and selector session are all
+borrowed. The required `vocab_size` is a positive, non-Boolean built-in integer. It must equal the
+positive built-in integer `vocab_size` reported by both the constraint and mask. This agreement
+establishes only one numeric token domain; it does not prove tokenizer bytes, model provenance, or
+release-pair compatibility. The constraint must report exactly `"regex"` or `"json_schema"`.
+
+After validating all components and metadata, D42 calls `is_dead_state(state)`,
+`is_match_state(state)`, and `get_valid_token_ids(state)` exactly once each in that order. The
+borrowed state must be live, both status queries must return exact Booleans, and native support must
+be an exact tuple of strictly increasing, unique, in-range built-in Python integers. D42 preserves
+that tuple by identity: it does not materialize an iterable, sort, deduplicate, filter, or inject
+EOS.
+
+Empty support returns the explicit successful no-selection result without calling the mask or
+selector:
+
+```python
+GrammarMaskedSelectionResult(
+    valid_token_ids=valid_token_ids,
+    is_match=is_match,
+    selected_token_id=None,
+)
+```
+
+This branch is the same for matching and nonmatching live states. It records facts only and does not
+classify completion, failure, or another terminal reason.
+
+For nonempty support, D42 calls `logit_mask.apply(logits, valid_token_ids)` exactly once, preserving
+the input-row and support-tuple identities, then calls `select_token(masked_logits)` exactly once
+with the exact returned row. It uses only the ordinary untimed mask operation and treats both rows
+as opaque backend-native evidence. The selected token must be an exact built-in integer in
+`[0, vocab_size)` and a member of the same native support tuple used for masking.
+
+The frozen, slotted result contains exactly these fields in this order:
+
+```python
+valid_token_ids: tuple[int, ...]
+is_match: bool
+selected_token_id: int | None
+```
+
+Direct construction enforces exact tuple and scalar types, nonnegative strictly increasing unique
+support, no selection for empty support, and one nonnegative in-support integer for nonempty
+support. The operation enforces the upper vocabulary bound before construction. The result retains
+no constraint, state, logits row, masked row, mask, selector or RNG session, backend, model, cache,
+checkpoint, tensor, native runtime, timing metadata, or mutable history.
+
+D42 never initializes, advances, releases, bulk-releases, or resets grammar state. Component query,
+mask, and selector execution failures propagate as the exact original exceptions, without retry or
+cleanup, because the operation acquires no resource. Selector/RNG consumption remains
+caller-owned. The module and package-root exports remain usable without native, model, CUDA, or Mac
+runtimes.
+
+This isolated primitive is not integrated into proposal, acceptance, continuation, D38
+coordination, D41 reconciliation, or multi-iteration handoff. State advancement, grammar-driven
+proposal termination, EOS/completion/stop/output-budget policy, production pair lifecycle, release
+model and `gamma` selection, live qualification, operating limits, streaming, cancellation,
+metrics, offload, and API behavior remain separate work.
+
 ### Pinned dual-backend one-iteration qualification
 
 D36 qualifies the unchanged D35 signature and transaction through two independent calls to
@@ -1262,8 +1347,9 @@ The current Windows package does not yet provide:
 
 - a selected two-model draft/target pair or a separate production draft engine;
 - a policy-driven production iterative engine or termination and output-budget policy;
-- live speculative grammar masking, grammar-driven proposal termination, or multi-iteration
-  grammar-state policy;
+- integration of the isolated one-row grammar-support masked-selection primitive into live
+  speculative selection, grammar-driven proposal termination, or multi-iteration grammar-state
+  policy;
 - a production/user-visible grammar-aware speculative engine;
 - speculative stops, streaming, cancellation, or acceptance metrics;
 - fixed or adaptive `gamma`;
@@ -1280,6 +1366,7 @@ post-iteration token handoff, D38 integrates it into one additive framework-neut
 and D39 proves one exact transition between two such transactions with a settled intermediate root
 pair. D40 generalizes that mechanical handoff to a positive caller count with bounded root
 rotation, and D41 independently reconciles one completed D38 result into a transferred committed
-grammar state. These deliverables still do not form user-visible speculative decoding without a
-selected pair, live speculative grammar selection, and a separately owned production iterative
-engine.
+grammar state. D42 supplies one isolated borrowed-state, one-row grammar-support masked-selection
+primitive. These deliverables still do not form user-visible speculative decoding without a
+selected pair, live integration of that selection primitive, and a separately owned production
+iterative engine.
