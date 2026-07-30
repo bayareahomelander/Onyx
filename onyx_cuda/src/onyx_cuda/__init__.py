@@ -40,10 +40,12 @@ from .speculative_iteration import (
     coordinate_speculative_iteration,
 )
 from .speculative_handoff import (
+    MultiIterationSpeculativeHandoffResult,
     SpeculativeHandoffCleanupError,
     SpeculativeHandoffError,
     SpeculativeHandoffInvariantError,
     TwoIterationSpeculativeHandoffResult,
+    coordinate_multi_iteration_speculative_handoff,
     coordinate_two_iteration_speculative_handoff,
 )
 from .verification import (
@@ -336,6 +338,7 @@ __all__ = [
     "UnknownTextTokenError",
     "VocabularyMismatchError",
     "ModelStep",
+    "MultiIterationSpeculativeHandoffResult",
     "MAX_SAMPLING_SEED",
     "SamplingDistributionError",
     "SelectionError",
@@ -359,6 +362,7 @@ __all__ = [
     "compile_native_json_schema",
     "build_qwen_grammar_vocabulary",
     "coordinate_continuation_aware_speculative_iteration",
+    "coordinate_multi_iteration_speculative_handoff",
     "coordinate_speculative_iteration",
     "coordinate_two_iteration_speculative_handoff",
     "decide_match_replace_acceptance",

@@ -89,6 +89,8 @@ def test_package_identifies_the_windows_cuda_variant():
         "SpeculativeHandoffInvariantError",
         "TwoIterationSpeculativeHandoffResult",
         "coordinate_two_iteration_speculative_handoff",
+        "MultiIterationSpeculativeHandoffResult",
+        "coordinate_multi_iteration_speculative_handoff",
     ):
         exported = getattr(onyx_cuda, handoff_symbol)
         assert exported.__module__ == "onyx_cuda.speculative_handoff"

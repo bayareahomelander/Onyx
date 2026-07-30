@@ -587,6 +587,135 @@ variable-count or production engine and does not own prompt prefill, third-itera
 termination or output budgets, grammar/stop/streaming/cancellation/metric policy, pair loading,
 release models or quantization, fixed `gamma`, offload, operating limits, or API behavior.
 
+### Caller-bounded multi-iteration root rotation
+
+D40 extends `onyx_cuda.speculative_handoff` with
+`MultiIterationSpeculativeHandoffResult` and:
+
+```python
+coordinate_multi_iteration_speculative_handoff(
+    draft_backend,
+    target_backend,
+    current_token_id,
+    *,
+    iteration_count,
+    proposal_length,
+    draft_select_token,
+    target_select_token,
+    draft_root_checkpoint,
+    target_root_checkpoint,
+)
+```
+
+`iteration_count` is a required positive, non-Boolean integer. The coordinator calls D38 exactly
+that many times using the exact same two already-prefilled backends, the exact same caller-owned
+selector sessions, and one unchanged positive proposal length. It neither selects a release
+`gamma` nor stops before the requested count.
+
+Let `m` be the iteration count, `P` the common caller-root length, `n` the proposal length, `Ci`
+the current token for call `i`, `Di` its proposal, `Ai` its accepted count, `Hi` its uncached next
+token, `Oi` its output, and `Qi` the common cache length after that call. With one-based iteration
+indices:
+
+```text
+Q0 = P
+Qi = Q(i-1) + 1 + Ai
+
+C1 = caller current token
+Ci = H(i-1) for i > 1
+
+Oi = Di[:Ai] + (Hi,)
+
+combined output = O1 + O2 + ... + Om
+final length    = P + m + sum(Ai for i in 1..m)
+```
+
+After all calls, both caches contain:
+
+```text
+prompt
++ (C1,) + D1[:A1]
++ (H1,) + D2[:A2]
++ ...
++ (H(m-1),) + Dm[:Am]
+```
+
+Every nonfinal `Hi` already appears once at the end of its producing output. The following D38
+call consumes it into both caches as its current token; D40 does not append it again. A naturally
+selected later token may have the same numeric ID without being coordinator duplication. Only
+`Hm`, the last combined-output token, remains outside both final caches.
+
+`MultiIterationSpeculativeHandoffResult` is frozen and slotted and stores exactly one field:
+
+```python
+iterations: tuple[ContinuationAwareSpeculativeIterationResult, ...]
+```
+
+The tuple must be an exact, nonempty built-in tuple of genuine structurally valid D38 results.
+Every item uses the same positive proposal length, and adjacent final/initial cache lengths must be
+continuous. The result derives only `output_token_ids`, `uncached_next_token_id`,
+`initial_cache_length`, and `final_cache_length`. It retains the exact completed D38 result objects
+in order, but no backend, selector, checkpoint, target row, model, tensor, grammar state, metric
+session, or mutable collection.
+
+Count one wraps one direct D38 outcome and allocates no D40 intermediate root. Count two calls D38
+directly twice and is observationally equivalent to D39 for current-token handoff, selector
+consumption, output, cache state, root ownership, release order, and cleanup. D39 remains an
+unchanged independent regression boundary.
+
+After every nonfinal success D40 creates a draft next root, validates its metadata and both cache
+lengths, then creates and validates the target next root. If a prior D40 pair exists, it releases
+the prior draft root and then the prior target root, validating both caches after each release,
+before promoting the new pair. D40 tracks only one current pair and one transient next pair. Thus
+stable state owns at most one D40 pair and rotation transiently owns at most two, regardless of
+`m`. The caller's initial roots stay active and are never released. After the final result is
+composed and validated, the last current pair is released draft then target; count one has no such
+settlement.
+
+For accepted counts `A1...Am`, one successful operation performs:
+
+```text
+D38 calls                  = m
+draft selector calls       = m * n
+target selector calls      = m + sum(Ai)
+target batched verifies    = m
+D40 roots created/released = m - 1 per role
+draft allocation growth    = m * (n + 1) + (m - 1)
+target allocation growth   = m - 1
+```
+
+Each target mismatch replays `Ai + 1` tokens; full acceptance requires no target replay. The
+allocation formulas include D38's `n + 1` draft checkpoints per transaction but not the already
+existing caller roots.
+
+The first D38 call remains wholly in D38's transaction domain. If it fails, D40 owns no
+intermediate root and performs no duplicate cleanup. The D40 outer domain begins as soon as that
+first call returns, before trusting its result. Any later validation, creation, rotation, D38,
+composition, final-release, or cache-validation failure attempts cleanup in this order:
+
+1. restore and validate the draft caller root;
+2. restore and validate the target caller root;
+3. settle the current draft intermediate root;
+4. settle the current target intermediate root;
+5. settle a distinct transient next draft root;
+6. settle a distinct transient next target root.
+
+The corresponding cleanup labels are `draft initial root rollback`,
+`target initial root rollback`, `draft intermediate root release`,
+`target intermediate root release`, `draft next intermediate root release`, and
+`target next intermediate root release`. A sole partially acquired first pair uses the two
+non-`next` release labels. Cleanup continues after every failure. Healthy cleanup re-raises the
+exact original exception; incomplete cleanup raises `SpeculativeHandoffCleanupError` with ordered
+immutable evidence and the original as its cause. Nested D38 cleanup errors remain unflattened.
+D40 never calls `reset()`, retries a transaction, or rewinds caller-owned selector/RNG state.
+
+D40 is framework-neutral, model-free, and imports without optional model, CUDA, native, or Mac
+runtimes. It is fixed-count mechanical orchestration, not a production speculative engine. It
+does not own prompt or model lifecycles, select or load a release pair, choose fixed or adaptive
+`gamma`, impose iteration or operating limits, terminate on EOS/grammar/stops/output budgets,
+truncate output, branch grammar state, stream, cancel, add speculative metrics, enable offload, or
+expose API behavior.
+
 ### Pinned dual-backend one-iteration qualification
 
 D36 qualifies the unchanged D35 signature and transaction through two independent calls to
@@ -1020,8 +1149,7 @@ path, source, package, or import dependency on the root Rust crate.
 The current Windows package does not yet provide:
 
 - a selected two-model draft/target pair or a separate production draft engine;
-- third-and-later root rotation, a variable-count or production iterative engine, or termination
-  and output-budget policy;
+- a policy-driven production iterative engine or termination and output-budget policy;
 - grammar-state speculation;
 - speculative stops, streaming, cancellation, or acceptance metrics;
 - fixed or adaptive `gamma`;
@@ -1036,5 +1164,6 @@ Those capabilities remain separately sized roadmap work. D36 proves the unchange
 coordinator through two independently owned pinned production backends. D37 defines the pure
 post-iteration token handoff, D38 integrates it into one additive framework-neutral transaction,
 and D39 proves one exact transition between two such transactions with a settled intermediate root
-pair. These deliverables still do not form user-visible speculative decoding without a selected
-pair and a separately owned production iterative engine.
+pair. D40 generalizes that mechanical handoff to a positive caller count with bounded root
+rotation. These deliverables still do not form user-visible speculative decoding without a
+selected pair and a separately owned production iterative engine.

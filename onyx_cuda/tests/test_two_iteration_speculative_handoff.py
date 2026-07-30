@@ -307,6 +307,8 @@ def test_public_surface_and_exact_signature():
         "SpeculativeHandoffInvariantError",
         "TwoIterationSpeculativeHandoffResult",
         "coordinate_two_iteration_speculative_handoff",
+        "MultiIterationSpeculativeHandoffResult",
+        "coordinate_multi_iteration_speculative_handoff",
     )
     assert tuple(current_module.__all__) == public_names
     for name in public_names:

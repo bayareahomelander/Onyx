@@ -43,6 +43,11 @@ Transformers instead of the Apple MLX runtime used by the macOS package.
   transactions. It passes the first uncached token as the second current token, owns one
   intermediate root per role, and concatenates both output tuples without adding another handoff
   occurrence. Both caches finish aligned while the second result's final token remains uncached.
+- A caller-bounded, framework-neutral multi-iteration handoff that repeats the same
+  continuation-aware transaction a positive requested number of times. Each prior uncached token
+  becomes the next current token, current/next intermediate roots rotate with bounded ownership,
+  and exact per-iteration outputs accumulate without another handoff-token insertion. Both caches
+  finish aligned while only the last result's final token remains uncached.
 - Bounded one-iteration production qualification over two independently loaded pinned 0.5B
   backends on `cuda:0`, covering genuine greedy full acceptance, test-forced mismatch at every
   three-token fixture position, exact role-local cache reconciliation, independent close order, and
@@ -229,9 +234,8 @@ and CUDA mask-application totals in `metrics.grammar_timing`.
 The Windows package does not yet provide:
 
 - a selected two-model draft/target pair or a separate production draft engine;
-- a variable-count or production iterative speculative engine, or user-visible speculative
-  decoding;
-- third-and-later root rotation, termination or output-budget policy, or a fixed `gamma`;
+- a policy-driven production iterative speculative engine or user-visible speculative decoding;
+- termination or output-budget policy, or a fixed `gamma`;
 - grammar-state speculation or speculative metrics;
 - speculative stop, streaming, cancellation, or API integration;
 - final context, output, or concurrency operating limits;
