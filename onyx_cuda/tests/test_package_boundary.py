@@ -53,6 +53,28 @@ def test_package_identifies_the_windows_cuda_variant():
         exported = getattr(onyx_cuda, draft_symbol)
         assert exported.__module__ == "onyx_cuda.draft"
         assert draft_symbol in onyx_cuda.__all__
+    for grammar_draft_symbol in (
+        "GrammarMaskedDraftProposalCleanupError",
+        "GrammarMaskedDraftProposalError",
+        "GrammarMaskedDraftProposalInvariantError",
+        "GrammarMaskedDraftProposalResult",
+        "generate_grammar_masked_draft_proposal",
+    ):
+        exported = getattr(onyx_cuda, grammar_draft_symbol)
+        assert exported.__module__ == "onyx_cuda.grammar_draft"
+        assert grammar_draft_symbol in onyx_cuda.__all__
+    assert issubclass(
+        onyx_cuda.GrammarMaskedDraftProposalError,
+        onyx_cuda.DraftProposalError,
+    )
+    assert issubclass(
+        onyx_cuda.GrammarMaskedDraftProposalInvariantError,
+        onyx_cuda.GrammarMaskedDraftProposalError,
+    )
+    assert issubclass(
+        onyx_cuda.GrammarMaskedDraftProposalCleanupError,
+        onyx_cuda.GrammarMaskedDraftProposalError,
+    )
     for acceptance_symbol in (
         "MatchReplaceAcceptanceError",
         "MatchReplaceAcceptanceInvariantError",

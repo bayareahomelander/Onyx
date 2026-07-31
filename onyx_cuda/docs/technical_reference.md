@@ -1009,6 +1009,130 @@ reconcile D41 branches, mutate caches, select or load models, choose `gamma`, ad
 cancellation, metrics, offload, operating limits, or API behavior. It remains model-free and
 imports without optional native, CUDA, model, or Mac runtimes.
 
+### Grammar-masked bounded draft proposal
+
+D44 adds the pure `onyx_cuda.grammar_draft` module and these five public symbols:
+
+```python
+GrammarMaskedDraftProposalCleanupError
+GrammarMaskedDraftProposalError
+GrammarMaskedDraftProposalInvariantError
+GrammarMaskedDraftProposalResult
+generate_grammar_masked_draft_proposal
+```
+
+The base error derives from `DraftProposalError`; the invariant and cleanup errors derive from the
+D44 base. The operation has this exact signature:
+
+```python
+generate_grammar_masked_draft_proposal(
+    backend,
+    current_token_id,
+    constraint,
+    starting_state,
+    logit_mask,
+    *,
+    proposal_bound,
+    select_token,
+)
+```
+
+The backend is already prefilled at cache length `P`, and `current_token_id` is the next uncached
+token. The borrowed `starting_state` is already positioned after that current token; D44 neither
+initializes grammar state nor advances the current token through the grammar again. The required
+`proposal_bound` is a positive, non-Boolean integer. D44 obtains the positive vocabulary size from
+the checkpointable backend and supplies that exact value to every unchanged public
+`select_and_advance_grammar_state(...)` call. Constraint and mask protocol checks, grammar type and
+vocabulary agreement, parent status, native support, masking, selection, and the actual grammar
+transition remain D43/D42 responsibilities.
+
+The frozen, slotted, checkpoint-generic result has exactly five stored fields and one derived
+property:
+
+```python
+proposal_token_ids: tuple[int, ...]
+rollback_checkpoints: tuple[CheckpointT, ...]
+initial_cache_length: int
+final_cache_length: int
+shortening_selection: GrammarMaskedSelectionResult | None
+
+shortened: bool
+```
+
+There is one rollback checkpoint per produced token. For `k` produced tokens, checkpoint `i`
+records `P + 1 + i`, and `final_cache_length` is exactly `P + 1 + k`. A result without shortening
+evidence contains exactly `proposal_bound` tokens and is therefore nonempty. A shortened result
+contains fewer than the bound and retains by identity the terminal D43 selection: its native
+support tuple is empty, its selected token is `None`, and its exact Boolean `is_match` remains
+available for a later policy layer. This shape deliberately permits a zero-token result. It does
+not classify empty support as completion, failure, EOS, stop, or another finish reason.
+
+For a full-bound result of size `B`, D44 calls D43, the mask, and the selector exactly `B` times,
+performs `B` grammar transitions and `B + 1` backend decodes, and returns `B` checkpoints. The
+backend consumes `(current_token_id, *proposal_token_ids)` and finishes at `P + B + 1`. As in D32,
+the final decode validates the post-proposal row but does not pass that row to D43, mask it, select
+from it, retain it, or classify it.
+
+If the first empty-support row is position `k`, where `0 <= k < B`, D44 makes `k + 1` D43 calls,
+`k` transitions, mask calls, and selector calls, and `k + 1` decodes. The cache ends at
+`P + k + 1`. D44 creates the inspected-row checkpoint before the terminal D43 call, preserving
+D32's checkpoint-before-selection timing, but releases that shortening-only checkpoint before
+return. No decode follows the no-transition result. At `k == 0`, only the current token has been
+decoded, and both returned tuples are empty.
+
+Validation and mutation occur in a fixed order. D44 first validates the bound, selector,
+checkpointable-backend capability, backend vocabulary metadata, current token, and active cache.
+It then creates and validates a private checkpoint at `P`, decodes the current token, and validates
+both the returned and live cache lengths. At every inspected position it creates and validates the
+row checkpoint before making exactly one D43 call with the exact current state, native logits row,
+constraint, mask, backend vocabulary size, and caller selector.
+
+A genuine transitioned D43 result transfers its child to D44 even when the opaque child value is
+`None`. D44 rejects by identity a child that aliases the caller start, its current parent, or any
+earlier child in the proposal. It retains identity history even after a child is released, so a
+malformed implementation cannot recycle an opaque handle later in the same branch. After the
+selected token is appended and its backend decode and cache validation succeed, D44 releases the
+superseded D44-owned parent. Thus the normal live peak is two D44-owned children. The remaining
+final draft child is released internally because no target acceptance decision has committed this
+branch. No grammar state is transferred in the result, and the borrowed start is never released.
+
+Before result construction, D44 validates the final cache and full/shortened relation and
+revalidates the caller's starting state as live with the match fact recorded by the first D43
+selection. It constructs and checks the exact result field identities, releases the final draft
+child, and revalidates the borrowed start again. It then releases any shortening-only checkpoint
+and the private start checkpoint. Only the token-corresponding rollback checkpoints transfer to
+the caller.
+
+Any failure after the private checkpoint is returned enters one cleanup domain. With ordinary
+cleanup success, the exact original exception object is re-raised. Cleanup continues after each
+ordinary exception and attempts operations once in this global order:
+
+1. roll back the validated private start checkpoint to `P`;
+2. release acquired inspected-row checkpoints in increasing position;
+3. release the private start checkpoint; and
+4. release each still-owned unique grammar child in increasing proposal position.
+
+Checkpoint labels distinguish ordinary rollback handles from the terminal shortening-only handle.
+Cleanup deduplicates resources by identity, never compares or hashes opaque states, never releases
+the borrowed start, and retries only a success-path release that raised and therefore remained
+owned. It does not retry D43, selection, grammar advancement, backend decode, checkpoint creation,
+rollback, or any cleanup attempt, and it never calls a backend or grammar reset. If cleanup also
+fails, `GrammarMaskedDraftProposalCleanupError` retains the exact original failure, exposes it as
+the cause, and stores a nonempty exact tuple of `(operation_label, exception)` pairs in attempt
+order. A nested D43 cleanup error remains the original failure rather than being flattened.
+
+The result retains only its token tuple, caller-owned checkpoint tuple, two cache lengths, and
+optional terminal selection. It retains no backend, constraint, grammar state, D43 result,
+nonterminal selection or support, logits or masked row, mask, selector/RNG, model, native runtime,
+private checkpoint, policy, metric, or mutable history. D44 is framework-neutral and adds no
+optional-runtime dependency.
+
+D44 does not perform target verification, target-side grammar masking, match/replace acceptance,
+committed-state reconciliation, speculative-loop coordination, completion/EOS/stop/output-budget
+policy, production model loading or pair selection, fixed `gamma`, live qualification, streaming,
+cancellation, metrics, offload, operating-limit, API, native, dependency, or packaging work. Those
+remain separate deliverables.
+
 ### Pinned dual-backend one-iteration qualification
 
 D36 qualifies the unchanged D35 signature and transaction through two independent calls to

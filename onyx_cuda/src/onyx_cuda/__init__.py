@@ -18,6 +18,13 @@ from .draft import (
     DraftProposalResult,
     generate_draft_proposal,
 )
+from .grammar_draft import (
+    GrammarMaskedDraftProposalCleanupError,
+    GrammarMaskedDraftProposalError,
+    GrammarMaskedDraftProposalInvariantError,
+    GrammarMaskedDraftProposalResult,
+    generate_grammar_masked_draft_proposal,
+)
 from .acceptance import (
     MatchReplaceAcceptanceError,
     MatchReplaceAcceptanceInvariantError,
@@ -270,6 +277,10 @@ __all__ = [
     "GrammarMaskedSelectionError",
     "GrammarMaskedSelectionInvariantError",
     "GrammarMaskedSelectionResult",
+    "GrammarMaskedDraftProposalCleanupError",
+    "GrammarMaskedDraftProposalError",
+    "GrammarMaskedDraftProposalInvariantError",
+    "GrammarMaskedDraftProposalResult",
     "GrammarMaskedTransitionCleanupError",
     "GrammarMaskedTransitionError",
     "GrammarMaskedTransitionInvariantError",
@@ -400,6 +411,7 @@ __all__ = [
     "decide_post_iteration_continuation",
     "discover_nvidia_devices",
     "generate_greedy",
+    "generate_grammar_masked_draft_proposal",
     "generate_constrained_target",
     "generate_draft_proposal",
     "generate_target",
