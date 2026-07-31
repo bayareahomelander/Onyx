@@ -913,6 +913,102 @@ proposal termination, EOS/completion/stop/output-budget policy, production pair 
 model and `gamma` selection, live qualification, operating limits, streaming, cancellation,
 metrics, offload, and API behavior remain separate work.
 
+### One-step grammar-masked selection and child-state transfer
+
+D43 adds the pure `onyx_cuda.grammar_transition` module and exactly five public symbols:
+
+```python
+GrammarMaskedTransitionCleanupError
+GrammarMaskedTransitionError
+GrammarMaskedTransitionInvariantError
+GrammarMaskedTransitionResult
+select_and_advance_grammar_state
+```
+
+The base error derives from `GrammarError`; the invariant and cleanup errors derive from the D43
+base. The operation has the exact D42 argument shape:
+
+```python
+select_and_advance_grammar_state(
+    constraint,
+    state,
+    logits,
+    logit_mask,
+    *,
+    vocab_size,
+    select_token,
+)
+```
+
+All inputs are borrowed. D43 calls the unchanged public `select_grammar_masked_token(...)` exactly
+once with the exact incoming objects and values. D42 remains solely responsible for component
+protocol and metadata checks, the initial `is_dead_state`, `is_match_state`,
+`get_valid_token_ids` query sequence, masking, and selector validation. D43 neither reads mask
+metadata nor requests native support again.
+
+Before advancing, D43 requires the returned value to be a genuine
+`GrammarMaskedSelectionResult`; reads `valid_token_ids`, `is_match`, and `selected_token_id` in
+that order; and revalidates their exact types, support ordering and uniqueness, the supplied upper
+vocabulary bound, empty/nonempty consistency, and selected-token membership. It then revalidates
+the borrowed parent with `is_dead_state` followed by `is_match_state`, requiring the parent to
+remain live with D42's exact match flag.
+
+Empty support returns without advancing or releasing any state:
+
+```python
+GrammarMaskedTransitionResult(
+    selection=selection,
+    child_state=None,
+    child_is_match=None,
+)
+```
+
+For a selected token, D43 calls `advance_state(state, selected_token_id)` exactly once. The returned
+candidate is immediately D43-owned, including when its opaque value is `None`. A candidate that is
+the borrowed parent by identity is rejected without releasing that alias. An independent child
+must report exact `False` from `is_dead_state` and an exact Boolean from `is_match_state`. D43 then
+revalidates the parent again in dead/match order before constructing and validating the result.
+Only after exact selection identity, child identity, match evidence, and the derived transition
+flag are confirmed is ownership of the child transferred to the caller.
+
+The frozen, slotted result has exactly three stored fields:
+
+```python
+selection: GrammarMaskedSelectionResult
+child_state: StateT | None
+child_is_match: bool | None
+```
+
+Its derived `transitioned` property is true exactly when the nested D42 result contains a selected
+token. Callers must use that property rather than `child_state is not None`, because `None` is a
+legal opaque child-state value. The nested D42 result and its support tuple are retained directly,
+so their identities and D42's parent-match evidence are preserved without flattening.
+
+D42 failures, malformed D42 evidence, post-selection parent failures, and an
+`advance_state(...)` exception occur before D43 owns a distinct child and therefore propagate
+without cleanup. Once an independent child has returned, every later failure attempts exactly one
+`release_state(child)`. Successful cleanup re-raises the exact original failure. If release also
+fails, `GrammarMaskedTransitionCleanupError` retains the exact original exception and the immutable
+single-entry cleanup evidence:
+
+```python
+(("child state release", cleanup_exception),)
+```
+
+The original failure is also the cleanup error's cause. D43 never releases the borrowed parent,
+bulk-releases, resets, retries advancement, retries release, or owns/rewinds the selector session.
+An advertised-valid regex token producing a dead child is an invariant failure and that child is
+released. A JSON invalid-transition `GrammarStateError` propagates unchanged with no invented
+child; a malformed JSON implementation that returns a dead child is rejected under the same
+post-acquisition rule.
+
+D43 records state facts only. A matching parent or child does not inject EOS or terminate
+generation, and empty support is not classified as completion or failure. The operation does not
+loop over tokens, integrate with proposal/acceptance/continuation/speculative coordination,
+reconcile D41 branches, mutate caches, select or load models, choose `gamma`, add streaming,
+cancellation, metrics, offload, operating limits, or API behavior. It remains model-free and
+imports without optional native, CUDA, model, or Mac runtimes.
+
 ### Pinned dual-backend one-iteration qualification
 
 D36 qualifies the unchanged D35 signature and transaction through two independent calls to

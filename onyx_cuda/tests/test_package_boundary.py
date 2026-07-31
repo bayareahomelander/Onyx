@@ -119,6 +119,28 @@ def test_package_identifies_the_windows_cuda_variant():
         onyx_cuda.GrammarMaskedSelectionInvariantError,
         onyx_cuda.GrammarMaskedSelectionError,
     )
+    for grammar_transition_symbol in (
+        "GrammarMaskedTransitionCleanupError",
+        "GrammarMaskedTransitionError",
+        "GrammarMaskedTransitionInvariantError",
+        "GrammarMaskedTransitionResult",
+        "select_and_advance_grammar_state",
+    ):
+        exported = getattr(onyx_cuda, grammar_transition_symbol)
+        assert exported.__module__ == "onyx_cuda.grammar_transition"
+        assert grammar_transition_symbol in onyx_cuda.__all__
+    assert issubclass(
+        onyx_cuda.GrammarMaskedTransitionError,
+        onyx_cuda.GrammarError,
+    )
+    assert issubclass(
+        onyx_cuda.GrammarMaskedTransitionInvariantError,
+        onyx_cuda.GrammarMaskedTransitionError,
+    )
+    assert issubclass(
+        onyx_cuda.GrammarMaskedTransitionCleanupError,
+        onyx_cuda.GrammarMaskedTransitionError,
+    )
     assert callable(onyx_cuda.build_qwen_grammar_vocabulary)
     assert callable(onyx_cuda.create_cuda_grammar_logit_mask)
     assert callable(onyx_cuda.generate_constrained_target)

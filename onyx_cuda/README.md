@@ -53,6 +53,9 @@ Transformers instead of the Apple MLX runtime used by the macOS package.
   committed ancestors, and transfers one final committed state to the caller.
 - A framework-neutral, model-free one-row grammar-support masked-selection primitive with an
   explicit empty-support outcome and borrowed-state semantics.
+- A framework-neutral one-step composition that preserves the exact masked-selection evidence,
+  returns explicit no-transition evidence for empty support, or advances once and transfers one
+  validated independent live grammar child while preserving the caller-owned parent.
 - Bounded one-iteration production qualification over two independently loaded pinned 0.5B
   backends on `cuda:0`, covering genuine greedy full acceptance, test-forced mismatch at every
   three-token fixture position, exact role-local cache reconciliation, independent close order, and
@@ -241,9 +244,9 @@ The Windows package does not yet provide:
 - a selected two-model draft/target pair or a separate production draft engine;
 - a policy-driven production iterative speculative engine or user-visible speculative decoding;
 - termination or output-budget policy, or a fixed `gamma`;
-- integration of the isolated grammar-support masked-selection primitive into live draft or target
-  speculative selection, grammar-driven early proposal termination, or multi-iteration
-  grammar-state policy;
+- integration of the isolated grammar-support selection/one-step transition primitives into live
+  draft or target speculative selection, grammar-driven early proposal termination, or
+  multi-iteration grammar-state policy;
 - speculative EOS, grammar-completion, stop, output-budget, streaming, cancellation, or API
   integration, and a production/user-visible grammar-aware speculative engine;
 - speculative metrics;

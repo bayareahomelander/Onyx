@@ -93,6 +93,13 @@ from .grammar_selection import (
     GrammarMaskedSelectionResult,
     select_grammar_masked_token,
 )
+from .grammar_transition import (
+    GrammarMaskedTransitionCleanupError,
+    GrammarMaskedTransitionError,
+    GrammarMaskedTransitionInvariantError,
+    GrammarMaskedTransitionResult,
+    select_and_advance_grammar_state,
+)
 from .grammar import (
     GrammarCompilationError,
     GrammarCompiler,
@@ -263,6 +270,10 @@ __all__ = [
     "GrammarMaskedSelectionError",
     "GrammarMaskedSelectionInvariantError",
     "GrammarMaskedSelectionResult",
+    "GrammarMaskedTransitionCleanupError",
+    "GrammarMaskedTransitionError",
+    "GrammarMaskedTransitionInvariantError",
+    "GrammarMaskedTransitionResult",
     "GrammarNoContinuationError",
     "GrammarSpecification",
     "GrammarRuntimeCompatibilityError",
@@ -400,6 +411,7 @@ __all__ = [
     "probe_quantized_target",
     "qualify_qwen_3b_candidate",
     "reconcile_speculative_grammar_state",
+    "select_and_advance_grammar_state",
     "select_highest_logit",
     "select_grammar_masked_token",
     "select_cuda_argmax",
