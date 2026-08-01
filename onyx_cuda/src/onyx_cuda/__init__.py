@@ -31,6 +31,13 @@ from .acceptance import (
     MatchReplaceAcceptanceResult,
     decide_match_replace_acceptance,
 )
+from .grammar_acceptance import (
+    GrammarMaskedTargetAcceptanceCleanupError,
+    GrammarMaskedTargetAcceptanceError,
+    GrammarMaskedTargetAcceptanceInvariantError,
+    GrammarMaskedTargetAcceptanceResult,
+    decide_grammar_masked_target_acceptance,
+)
 from .continuation import (
     PostIterationContinuationError,
     PostIterationContinuationInvariantError,
@@ -281,6 +288,10 @@ __all__ = [
     "GrammarMaskedDraftProposalError",
     "GrammarMaskedDraftProposalInvariantError",
     "GrammarMaskedDraftProposalResult",
+    "GrammarMaskedTargetAcceptanceCleanupError",
+    "GrammarMaskedTargetAcceptanceError",
+    "GrammarMaskedTargetAcceptanceInvariantError",
+    "GrammarMaskedTargetAcceptanceResult",
     "GrammarMaskedTransitionCleanupError",
     "GrammarMaskedTransitionError",
     "GrammarMaskedTransitionInvariantError",
@@ -407,6 +418,7 @@ __all__ = [
     "coordinate_multi_iteration_speculative_handoff",
     "coordinate_speculative_iteration",
     "coordinate_two_iteration_speculative_handoff",
+    "decide_grammar_masked_target_acceptance",
     "decide_match_replace_acceptance",
     "decide_post_iteration_continuation",
     "discover_nvidia_devices",

@@ -84,6 +84,28 @@ def test_package_identifies_the_windows_cuda_variant():
         exported = getattr(onyx_cuda, acceptance_symbol)
         assert exported.__module__ == "onyx_cuda.acceptance"
         assert acceptance_symbol in onyx_cuda.__all__
+    for grammar_acceptance_symbol in (
+        "GrammarMaskedTargetAcceptanceCleanupError",
+        "GrammarMaskedTargetAcceptanceError",
+        "GrammarMaskedTargetAcceptanceInvariantError",
+        "GrammarMaskedTargetAcceptanceResult",
+        "decide_grammar_masked_target_acceptance",
+    ):
+        exported = getattr(onyx_cuda, grammar_acceptance_symbol)
+        assert exported.__module__ == "onyx_cuda.grammar_acceptance"
+        assert grammar_acceptance_symbol in onyx_cuda.__all__
+    assert issubclass(
+        onyx_cuda.GrammarMaskedTargetAcceptanceError,
+        onyx_cuda.MatchReplaceAcceptanceError,
+    )
+    assert issubclass(
+        onyx_cuda.GrammarMaskedTargetAcceptanceInvariantError,
+        onyx_cuda.GrammarMaskedTargetAcceptanceError,
+    )
+    assert issubclass(
+        onyx_cuda.GrammarMaskedTargetAcceptanceCleanupError,
+        onyx_cuda.GrammarMaskedTargetAcceptanceError,
+    )
     for continuation_symbol in (
         "PostIterationContinuationError",
         "PostIterationContinuationInvariantError",

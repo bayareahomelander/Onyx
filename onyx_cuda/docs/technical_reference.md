@@ -1127,11 +1127,116 @@ nonterminal selection or support, logits or masked row, mask, selector/RNG, mode
 private checkpoint, policy, metric, or mutable history. D44 is framework-neutral and adds no
 optional-runtime dependency.
 
-D44 does not perform target verification, target-side grammar masking, match/replace acceptance,
-committed-state reconciliation, speculative-loop coordination, completion/EOS/stop/output-budget
-policy, production model loading or pair selection, fixed `gamma`, live qualification, streaming,
-cancellation, metrics, offload, operating-limit, API, native, dependency, or packaging work. Those
-remain separate deliverables.
+D44 itself does not perform target verification, target-side grammar masking, match/replace
+acceptance, committed-state reconciliation, speculative-loop coordination,
+completion/EOS/stop/output-budget policy, production model loading or pair selection, fixed
+`gamma`, live qualification, streaming, cancellation, metrics, offload, operating-limit, API,
+native, dependency, or packaging work. D45 separately supplies the target-side decision described
+below; integrating either primitive with caches and policy remains later work.
+
+### Grammar-masked target match/replace acceptance
+
+D45 adds the pure `onyx_cuda.grammar_acceptance` module and these five public symbols:
+
+```python
+GrammarMaskedTargetAcceptanceCleanupError
+GrammarMaskedTargetAcceptanceError
+GrammarMaskedTargetAcceptanceInvariantError
+GrammarMaskedTargetAcceptanceResult
+decide_grammar_masked_target_acceptance
+```
+
+The base error derives from `MatchReplaceAcceptanceError`; the invariant and cleanup errors derive
+from the D45 base. The operation has this exact signature:
+
+```python
+decide_grammar_masked_target_acceptance(
+    proposal_token_ids,
+    target_logit_rows,
+    constraint,
+    starting_state,
+    logit_mask,
+    *,
+    vocab_size,
+    select_token,
+)
+```
+
+The exact nonempty proposal and complete `n + 1` D30/D31 target-row tuple are already produced.
+The borrowed `starting_state` is already positioned after the uncached current token. D45 neither
+initializes grammar state nor invokes a backend, verification, cache, checkpoint, or selector
+session constructor. It validates the positive built-in vocabulary size, every in-range proposal
+token, the exact row count, and selector callability before any grammar work. Rows remain opaque.
+
+D45 calls unchanged `select_and_advance_grammar_state(...)` exactly once for each inspected
+proposal-aligned row. A target-selected token equal to proposal token `d[i]` accepts that token and
+continues from the transferred child. The first differing selected token is the replacement and its
+child becomes the final committed state. Full acceptance stops after `n` transitions. The required
+post-proposal row `r[n]` is never read or passed to D43, including after full acceptance, and every
+row after an earlier mismatch or no-decision is untouched.
+
+The frozen, slotted, state-generic result stores exactly these fields:
+
+```python
+proposal_token_ids: tuple[int, ...]
+accepted_count: int
+replacement_token_id: int | None
+no_decision_selection: GrammarMaskedSelectionResult | None
+committed_state: StateT | None
+committed_state_is_match: bool | None
+```
+
+It derives `decision_made`, `fully_accepted`, `accepted_token_ids`, `committed_token_ids`, and
+`committed_state_transferred` without duplicate stored evidence. Decided outcomes mirror D33's
+proposal, accepted-count, and replacement relationships, but D45 does not call or retain D33 and
+does not perform a second unmasked selector draw. `committed_token_ids` describes branch progress;
+it is not a complete speculative-iteration output.
+
+| Outcome | Accepted | Replacement | Committed tokens | State transfer |
+|---|---:|---|---|---|
+| mismatch at `k` | `k` | selected `t != d[k]` | `D[:k] + (t,)` | child after `t` |
+| full acceptance | `n` | none | `D` | child after `d[n-1]` |
+| empty support at `k > 0` | `k` | none | `D[:k]` | child after `d[k-1]` |
+| empty support at `0` | `0` | none | empty | none |
+
+Empty support retains the exact terminal D42 selection with its empty native support, `None`
+selected token, and unclassified parent-match fact. It does not fabricate a replacement or label
+the outcome completion, failure, EOS, stop, or another terminal reason. At a later position, the
+accepted-prefix child transfers with that terminal parent-match fact. At position zero, the result
+does not retain or transfer the borrowed start.
+
+A mismatch at `k` makes `k + 1` D43, mask, selector, and transition calls. Full acceptance makes
+`n` of each. Empty support at `k` makes `k + 1` D43 calls but only `k` mask, selector, and transition
+calls. D45 adds no selector draw and never retries or rewinds caller-owned selector/RNG state.
+
+Every returned child must be identity-independent from the borrowed start, its current parent, and
+all earlier children, including released ancestors. D45 records ownership before validating the
+remaining transitioned evidence, settles superseded ancestors in increasing proposal order, and
+normally owns at most the old and new child simultaneously. Before transfer it revalidates the
+borrowed start and final child as live with their recorded match facts, checks the complete result
+and ownership evidence, and transfers exactly one final child when required. An opaque `None` is a
+legal child; callers use `committed_state_transferred`, not a `None` check, to determine ownership.
+The caller always retains the unchanged starting state and must release a transferred final child.
+
+On failure, every still-owned unique child is released once in increasing proposal position with
+labels `target state release at position {i}`. A failed success-path ancestor release remains owned
+and receives its sole retry during failure cleanup. Successful cleanup re-raises the exact original
+failure. If cleanup also fails, `GrammarMaskedTargetAcceptanceCleanupError` retains the exact
+original object, stores the ordered immutable `(operation_label, exception)` tuple, and exposes the
+original as its cause. Nested D43 cleanup evidence is never flattened. D45 never bulk-releases or
+resets the constraint.
+
+The result retains only the exact proposal tuple, scalar outcome metadata, the terminal
+empty-support selection when present, and the transferred final child and match fact when present.
+It retains no rows, masked rows, constraint, mask, selector, D43 result, nonterminal selection,
+released ancestor, identity history, backend, cache, checkpoint, model, native-runtime, timing, or
+mutable collection. D45 remains optional-runtime-free and framework-neutral.
+
+D45 does not route D44's valid zero-token outcome, select or grammar-mask the final target row,
+coordinate or reconcile caches, choose continuation or terminal policy, manage multiple grammar
+iterations, inject EOS, apply stops or output budgets, load or select a production pair, choose
+release `gamma`, add streaming/cancellation/metrics, qualify live CUDA behavior, set operating
+limits, enable offload, or add API behavior. Those remain separately sized later work.
 
 ### Pinned dual-backend one-iteration qualification
 
@@ -1567,9 +1672,9 @@ The current Windows package does not yet provide:
 
 - a selected two-model draft/target pair or a separate production draft engine;
 - a policy-driven production iterative engine or termination and output-budget policy;
-- integration of the isolated one-row grammar-support masked-selection primitive into live
-  speculative selection, grammar-driven proposal termination, or multi-iteration grammar-state
-  policy;
+- zero-proposal routing, final-row grammar-masked continuation, cache and continuation integration
+  of the grammar-masked proposal and target-decision primitives, empty-support terminal policy, or
+  multi-iteration grammar-state policy;
 - a production/user-visible grammar-aware speculative engine;
 - speculative stops, streaming, cancellation, or acceptance metrics;
 - fixed or adaptive `gamma`;
@@ -1586,7 +1691,8 @@ post-iteration token handoff, D38 integrates it into one additive framework-neut
 and D39 proves one exact transition between two such transactions with a settled intermediate root
 pair. D40 generalizes that mechanical handoff to a positive caller count with bounded root
 rotation, and D41 independently reconciles one completed D38 result into a transferred committed
-grammar state. D42 supplies one isolated borrowed-state, one-row grammar-support masked-selection
-primitive. These deliverables still do not form user-visible speculative decoding without a
-selected pair, live integration of that selection primitive, and a separately owned production
-iterative engine.
+grammar state. D42 supplies borrowed-state grammar-supported row selection, D43 adds one validated
+child transition, D44 applies it to a bounded draft proposal, and D45 applies it to
+proposal-aligned target rows for match/replace acceptance and a committed target branch. These
+deliverables still do not form user-visible speculative decoding without routing, final-row and
+cache/policy integration, a selected pair, and a separately owned production iterative engine.
