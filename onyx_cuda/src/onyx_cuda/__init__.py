@@ -38,6 +38,13 @@ from .grammar_acceptance import (
     GrammarMaskedTargetAcceptanceResult,
     decide_grammar_masked_target_acceptance,
 )
+from .grammar_continuation import (
+    GrammarMaskedPostAcceptanceContinuationCleanupError,
+    GrammarMaskedPostAcceptanceContinuationError,
+    GrammarMaskedPostAcceptanceContinuationInvariantError,
+    GrammarMaskedPostAcceptanceContinuationResult,
+    decide_grammar_masked_post_acceptance_continuation,
+)
 from .continuation import (
     PostIterationContinuationError,
     PostIterationContinuationInvariantError,
@@ -288,6 +295,10 @@ __all__ = [
     "GrammarMaskedDraftProposalError",
     "GrammarMaskedDraftProposalInvariantError",
     "GrammarMaskedDraftProposalResult",
+    "GrammarMaskedPostAcceptanceContinuationCleanupError",
+    "GrammarMaskedPostAcceptanceContinuationError",
+    "GrammarMaskedPostAcceptanceContinuationInvariantError",
+    "GrammarMaskedPostAcceptanceContinuationResult",
     "GrammarMaskedTargetAcceptanceCleanupError",
     "GrammarMaskedTargetAcceptanceError",
     "GrammarMaskedTargetAcceptanceInvariantError",
@@ -418,6 +429,7 @@ __all__ = [
     "coordinate_multi_iteration_speculative_handoff",
     "coordinate_speculative_iteration",
     "coordinate_two_iteration_speculative_handoff",
+    "decide_grammar_masked_post_acceptance_continuation",
     "decide_grammar_masked_target_acceptance",
     "decide_match_replace_acceptance",
     "decide_post_iteration_continuation",

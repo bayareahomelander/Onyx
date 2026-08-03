@@ -106,6 +106,28 @@ def test_package_identifies_the_windows_cuda_variant():
         onyx_cuda.GrammarMaskedTargetAcceptanceCleanupError,
         onyx_cuda.GrammarMaskedTargetAcceptanceError,
     )
+    for grammar_continuation_symbol in (
+        "GrammarMaskedPostAcceptanceContinuationCleanupError",
+        "GrammarMaskedPostAcceptanceContinuationError",
+        "GrammarMaskedPostAcceptanceContinuationInvariantError",
+        "GrammarMaskedPostAcceptanceContinuationResult",
+        "decide_grammar_masked_post_acceptance_continuation",
+    ):
+        exported = getattr(onyx_cuda, grammar_continuation_symbol)
+        assert exported.__module__ == "onyx_cuda.grammar_continuation"
+        assert grammar_continuation_symbol in onyx_cuda.__all__
+    assert issubclass(
+        onyx_cuda.GrammarMaskedPostAcceptanceContinuationError,
+        onyx_cuda.PostIterationContinuationError,
+    )
+    assert issubclass(
+        onyx_cuda.GrammarMaskedPostAcceptanceContinuationInvariantError,
+        onyx_cuda.GrammarMaskedPostAcceptanceContinuationError,
+    )
+    assert issubclass(
+        onyx_cuda.GrammarMaskedPostAcceptanceContinuationCleanupError,
+        onyx_cuda.GrammarMaskedPostAcceptanceContinuationError,
+    )
     for continuation_symbol in (
         "PostIterationContinuationError",
         "PostIterationContinuationInvariantError",
