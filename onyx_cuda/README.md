@@ -67,6 +67,12 @@ Transformers instead of the Apple MLX runtime used by the macOS package.
   mismatch reuses the existing replacement and committed branch with no new selection; full
   acceptance grammar-masks only the post-proposal row for one bonus child or explicit unclassified
   empty-support evidence, without touching either cache.
+- A framework-neutral grammar-masked speculative transaction that composes the bounded draft,
+  batched target verification, target acceptance, exact cache reconciliation, and continuation
+  primitives for one iteration. Zero-token draft shortening aligns the target through one current-
+  token decode, target no-decision aligns both caches to the accepted prefix without continuation,
+  and final-row empty support retains the fully accepted cache pair without fabricating a token.
+  Each success transfers exactly one live caller-owned grammar state.
 - Bounded one-iteration production qualification over two independently loaded pinned 0.5B
   backends on `cuda:0`, covering genuine greedy full acceptance, test-forced mismatch at every
   three-token fixture position, exact role-local cache reconciliation, independent close order, and
@@ -255,9 +261,8 @@ The Windows package does not yet provide:
 - a selected two-model draft/target pair or a separate production draft engine;
 - a policy-driven production iterative speculative engine or user-visible speculative decoding;
 - termination or output-budget policy, or a fixed `gamma`;
-- routing for a zero-token grammar-masked proposal, cache/continuation integration of the isolated
-  grammar-masked draft, target, and final-row decisions, semantic termination decisions for empty
-  support, or multi-iteration grammar-state policy;
+- semantic termination decisions for grammar empty support or multi-iteration grammar-state
+  policy;
 - speculative EOS, grammar-completion, stop, output-budget, streaming, cancellation, or API
   integration, and a production/user-visible grammar-aware speculative engine;
 - speculative metrics;

@@ -45,6 +45,13 @@ from .grammar_continuation import (
     GrammarMaskedPostAcceptanceContinuationResult,
     decide_grammar_masked_post_acceptance_continuation,
 )
+from .grammar_speculative_iteration import (
+    GrammarMaskedSpeculativeIterationCleanupError,
+    GrammarMaskedSpeculativeIterationError,
+    GrammarMaskedSpeculativeIterationInvariantError,
+    GrammarMaskedSpeculativeIterationResult,
+    coordinate_grammar_masked_speculative_iteration,
+)
 from .continuation import (
     PostIterationContinuationError,
     PostIterationContinuationInvariantError,
@@ -299,6 +306,10 @@ __all__ = [
     "GrammarMaskedPostAcceptanceContinuationError",
     "GrammarMaskedPostAcceptanceContinuationInvariantError",
     "GrammarMaskedPostAcceptanceContinuationResult",
+    "GrammarMaskedSpeculativeIterationCleanupError",
+    "GrammarMaskedSpeculativeIterationError",
+    "GrammarMaskedSpeculativeIterationInvariantError",
+    "GrammarMaskedSpeculativeIterationResult",
     "GrammarMaskedTargetAcceptanceCleanupError",
     "GrammarMaskedTargetAcceptanceError",
     "GrammarMaskedTargetAcceptanceInvariantError",
@@ -426,6 +437,7 @@ __all__ = [
     "compile_native_json_schema",
     "build_qwen_grammar_vocabulary",
     "coordinate_continuation_aware_speculative_iteration",
+    "coordinate_grammar_masked_speculative_iteration",
     "coordinate_multi_iteration_speculative_handoff",
     "coordinate_speculative_iteration",
     "coordinate_two_iteration_speculative_handoff",

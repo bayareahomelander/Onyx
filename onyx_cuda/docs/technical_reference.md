@@ -1132,7 +1132,7 @@ acceptance, committed-state reconciliation, speculative-loop coordination,
 completion/EOS/stop/output-budget policy, production model loading or pair selection, fixed
 `gamma`, live qualification, streaming, cancellation, metrics, offload, operating-limit, API,
 native, dependency, or packaging work. D45 separately supplies the target-side decision described
-below; integrating either primitive with caches and policy remains later work.
+below, and D47 integrates both primitives with caches for one policy-neutral transaction.
 
 ### Grammar-masked target match/replace acceptance
 
@@ -1236,7 +1236,8 @@ D45 does not route D44's valid zero-token outcome, select or grammar-mask the fi
 coordinate or reconcile caches, choose continuation or terminal policy, manage multiple grammar
 iterations, inject EOS, apply stops or output budgets, load or select a production pair, choose
 release `gamma`, add streaming/cancellation/metrics, qualify live CUDA behavior, set operating
-limits, enable offload, or add API behavior. Those remain separately sized later work.
+limits, enable offload, or add API behavior. D46 supplies the final-row decision and D47 supplies
+one cache-integrated transaction; the remaining policy and production work stays separately sized.
 
 ### Grammar-masked post-acceptance continuation
 
@@ -1351,7 +1352,173 @@ apply stops or output budgets, integrate D44-D46 with cache coordination or comp
 iterations, define grammar-state termination policy, select or load a production pair, choose fixed
 `gamma`, add streaming/cancellation/metrics, qualify live CUDA behavior, set operating limits,
 enable offload, add API behavior, change dependencies or native ABI, or modify Mac behavior. Those
-remain separately sized later work.
+are outside D46. D47 supplies only the one-transaction routing and cache integration; the policy,
+multi-iteration, production, and user-visible boundaries remain later work.
+
+### Grammar-masked one-iteration speculative transaction
+
+D47 adds the pure `onyx_cuda.grammar_speculative_iteration` module and these five public symbols:
+
+```python
+GrammarMaskedSpeculativeIterationCleanupError
+GrammarMaskedSpeculativeIterationError
+GrammarMaskedSpeculativeIterationInvariantError
+GrammarMaskedSpeculativeIterationResult
+coordinate_grammar_masked_speculative_iteration
+```
+
+The base error derives from `SpeculativeIterationError`; the invariant and cleanup errors derive
+from the D47 base. The operation has this exact signature:
+
+```python
+coordinate_grammar_masked_speculative_iteration(
+    draft_backend,
+    target_backend,
+    current_token_id,
+    constraint,
+    starting_state,
+    draft_logit_mask,
+    target_logit_mask,
+    *,
+    proposal_bound,
+    draft_select_token,
+    target_select_token,
+    draft_root_checkpoint,
+    target_root_checkpoint,
+)
+```
+
+Both distinct backends are already prefilled at the same positive cache length `P`, and each
+caller root records that exact position. The draft role is checkpointable; the target role is both
+checkpointable and batched-verification capable. Both roles and the shared constraint have one
+positive equal numeric vocabulary size, and `current_token_id` belongs to that common domain. This
+value-level agreement does not establish tokenizer-byte compatibility or producer provenance.
+
+`proposal_bound` is a positive non-Boolean caller bound. Draft and target masks are separate, and
+the caller supplies separate selector sessions because their native row types may differ. The
+target selector object is shared unchanged between D45 and D46. D47 neither supplies a release
+default nor calls the bound `gamma`.
+
+Preflight is non-consuming. D47 validates caller shape, capabilities, common vocabulary and cache
+metadata, current token, both root protocols and lengths, constraint vocabulary and exact grammar
+type, and the starting state's live/match facts. It then qualifies the actual roots in draft-then-
+target order by rolling each role to `P` and revalidates the unchanged starting state. Root owner,
+epoch, allocation, and lifetime checks remain backend responsibilities exercised by those real
+rollbacks. A preflight failure leaves the state and both roots caller-owned.
+
+Immediately before D44 is invoked, D47 consumes `starting_state`. From that point every successful
+result transfers exactly one live `committed_state`, and callers must not release the input state
+separately. Opaque `None` is a valid state value; explicit route and ownership flags, plus identity
+comparisons, distinguish a transferred `None` from absence of a transfer.
+
+The frozen, slotted, state-generic result stores exactly these fields:
+
+```python
+proposal_token_ids: tuple[int, ...]
+accepted_count: int
+replacement_token_id: int | None
+initial_cache_length: int
+final_cache_length: int
+uncached_next_token_id: int | None
+shortening_selection: GrammarMaskedSelectionResult | None
+acceptance_no_decision_selection: GrammarMaskedSelectionResult | None
+final_row_no_decision_selection: GrammarMaskedSelectionResult | None
+committed_state: StateT
+committed_state_is_match: bool
+```
+
+It derives `shortened`, `acceptance_decision_made`, `fully_accepted`, `accepted_token_ids`,
+`rejected_proposal_token_id`, and `output_token_ids`. A zero-token D44 result is not full
+acceptance. D45 no-decision is not rejection, so `rejected_proposal_token_id` is present only when
+a decided mismatch also supplies a replacement. Direct construction validates exact tuple,
+Boolean, nonnegative-token, cache-formula, and route relationships, but it has neither a proposal
+bound nor vocabulary upper bound to validate; the operation validates both.
+
+Each optional selection retains the exact originating empty-support evidence by identity. The
+D44 shortening selection may coexist with a later target outcome when a nonzero proposal was
+shortened. D45 and D46 no-decision selections are mutually exclusive. Each contains the exact
+empty support tuple, an exact Boolean parent-match fact, and no selected token.
+
+| Route | Output | Uncached token | Final common cache | Transferred state |
+|---|---|---|---:|---|
+| D44 zero-token shortening | empty | none | `P + 1` | unchanged consumed input |
+| D45 no-decision at `A < n` | `D[:A]` | none | `P + 1 + A` | input at `A = 0`; otherwise D45 accepted-prefix child |
+| D45 mismatch at `A < n` | `D[:A] + (replacement,)` | replacement | `P + 1 + A` | exact D45/D46 replacement child |
+| full acceptance plus bonus | `D + (bonus,)` | bonus | `P + 1 + n` | D46 bonus child |
+| full acceptance plus empty support | `D` | none | `P + 1 + n` | unchanged D45 proposal child |
+
+D47 calls D44 exactly once and defensively acquires its token-corresponding rollback checkpoint
+tuple before trusting the remaining composed evidence. It validates the variable proposal length
+`0..proposal_bound`, every token, cache formula, checkpoint count and `P + 1 + i` positions,
+shortening/full-bound relationship, exact terminal selection, live draft cache, and unchanged
+common vocabulary metadata. D44's private checkpoints and draft grammar children remain internal
+to D44.
+
+A zero-token proposal skips batched verification, D45, and D46. The target performs exactly one
+ordinary `decode(current_token_id)`, whose `ModelStep` and `P + 1` returned/live length are
+validated while its logits are ignored. The draft is already at `P + 1`, so both roles finish at
+the prompt plus current-token prefix. The exact D44 selection and unchanged consumed input state
+transfer through the result with the selection's match fact.
+
+For a nonempty proposal `D` of length `n`, target verification consumes
+`(current_token_id, *D)` exactly once and must return one genuine result with an exact `n + 1` row
+tuple and cache length `P + n + 1`. Rows remain opaque to D47. D45 then receives the exact proposal
+and row tuples, shared constraint and input state, target mask, common vocabulary size, and target
+selector. D47 validates all raw D45 outcome, selection, state-transfer, identity, match, and token
+evidence before composing it.
+
+Mismatch and D45 no-decision reconcile caches before any possible D46 work. The draft rolls to
+D44 checkpoint `A`. The target rolls to its caller root and ordinarily decodes exactly
+`(current_token_id, *D[:A])`, validating every `ModelStep` and intermediate length. Both roles then
+hold `P + 1 + A` tokens. Full acceptance performs no rollback or replay and leaves both full
+proposal suffixes intact.
+
+D45 no-decision skips D46 and returns only `D[:A]`, no uncached token, and the exact terminal
+selection. At position zero the unchanged input state transfers back; after an accepted prefix the
+exact D45 child transfers. Empty support remains unclassified.
+
+For decided D45 outcomes, unchanged D46 runs exactly once after cache reconciliation. Mismatch
+reuses the replacement, state, and match fact without reading a row or selecting again. Full
+acceptance alone may pass `r[n]` through D43: a selected bonus rotates to one new child, while empty
+support returns no token and retains the already accepted parent. D46 does not mutate either cache.
+
+Selector consumption is deterministic: zero-token D44 consumes no draft or target draws; D45
+no-decision at `A` consumes `A` target draws; mismatch at `A` consumes `A + 1`; full acceptance
+with a bonus consumes `n + 1`; and full acceptance with final-row empty support consumes `n`.
+D47 never seeds, clones, retries, resets, or rewinds either selector. Only D45 receives
+`r[0]..r[n-1]`, and only full-acceptance D46 may receive `r[n]`.
+
+On success, D47 constructs and revalidates the result while it still owns the final state, releases
+all D44 token checkpoints in proposal order, revalidates both final cache lengths, validates the
+input and final state lifetimes and match facts, releases the input exactly once when superseded,
+and transfers the single final state. Caller roots remain active and borrowed. An uncached
+replacement or bonus is represented by output and grammar state but is absent from both caches.
+
+Every post-preflight failure enters one outer cleanup domain. Cleanup continues after ordinary
+cleanup exceptions and attempts operations once in this order:
+
+1. draft caller-root rollback and `P` validation;
+2. target caller-root rollback and `P` validation;
+3. each still-owned D44 checkpoint release in proposal order;
+4. consumed starting-state release when still owned; and
+5. latest distinct downstream-state release when still owned.
+
+Resources are deduplicated only by identity. Caller roots are never released, backend or grammar
+`reset()` is never called, and proposal, verification, decision, selection, replay, or ordinary
+cleanup work is never retried. A failed success-path release remains owned for its one outer
+cleanup attempt. Healthy cleanup re-raises the exact original exception. Incomplete cleanup raises
+`GrammarMaskedSpeculativeIterationCleanupError`, retaining the original by identity and as its
+cause plus only D47's nonempty immutable ordered `(operation_label, exception)` tuple. Nested
+D44-D46 cleanup errors remain the original failure and are not flattened.
+
+The result retains no backend, root or proposal checkpoint, target row, primitive result,
+constraint, mask, selector/RNG, released ancestor, mutable registry, model, tensor, native runtime,
+or metric. D47 is pure Python, framework-neutral, model-free, and optional-runtime-free.
+
+D47 deliberately does not classify empty support, inject EOS, apply grammar-completion, stop,
+length, or output-budget policy, run a second iteration, rotate roots, choose a production model
+pair, select fixed or adaptive `gamma`, stream, cancel, add speculative metrics, define operating
+limits, enable offload, expose API behavior, or alter native ABI, dependencies, or Mac behavior.
 
 ### Pinned dual-backend one-iteration qualification
 
@@ -1787,8 +1954,7 @@ The current Windows package does not yet provide:
 
 - a selected two-model draft/target pair or a separate production draft engine;
 - a policy-driven production iterative engine or termination and output-budget policy;
-- zero-proposal routing, cache and continuation integration of the grammar-masked proposal, target,
-  and final-row decisions, empty-support terminal policy, or multi-iteration grammar-state policy;
+- empty-support terminal policy or multi-iteration grammar-state policy;
 - a production/user-visible grammar-aware speculative engine;
 - speculative stops, streaming, cancellation, or acceptance metrics;
 - fixed or adaptive `gamma`;
@@ -1808,6 +1974,8 @@ rotation, and D41 independently reconciles one completed D38 result into a trans
 grammar state. D42 supplies borrowed-state grammar-supported row selection, D43 adds one validated
 child transition, D44 applies it to a bounded draft proposal, D45 applies it to proposal-aligned
 target rows for match/replace acceptance and a committed target branch, and D46 supplies the
-cache-neutral grammar-masked final-row continuation for decided D45 outcomes. These deliverables
-still do not form user-visible speculative decoding without zero/empty-support routing,
-cache/policy integration, a selected pair, and a separately owned production iterative engine.
+cache-neutral grammar-masked final-row continuation for decided D45 outcomes. D47 composes those
+primitives with target verification and exact cache reconciliation for one policy-neutral
+transaction, including zero/no-decision routing. These deliverables still do not form user-visible
+speculative decoding without empty-support terminal policy, multi-iteration grammar-state policy,
+a selected pair, and a separately owned production iterative engine.
