@@ -73,6 +73,12 @@ Transformers instead of the Apple MLX runtime used by the macOS package.
   token decode, target no-decision aligns both caches to the accepted prefix without continuation,
   and final-row empty support retains the fully accepted cache pair without fabricating a token.
   Each success transfers exactly one live caller-owned grammar state.
+- A pure, framework-neutral classifier over one completed grammar-masked speculative transaction.
+  It fully revalidates the five stored route shapes, reports an uncached replacement or bonus as
+  `handoff_available`, matching terminal empty support as `grammar_complete`, and nonmatching
+  terminal empty support as `grammar_no_continuation`. It borrows and retains no transaction
+  evidence and does not emit a token, inject EOS, publish a finish reason, or choose another
+  iteration.
 - Bounded one-iteration production qualification over two independently loaded pinned 0.5B
   backends on `cuda:0`, covering genuine greedy full acceptance, test-forced mismatch at every
   three-token fixture position, exact role-local cache reconciliation, independent close order, and
@@ -261,8 +267,8 @@ The Windows package does not yet provide:
 - a selected two-model draft/target pair or a separate production draft engine;
 - a policy-driven production iterative speculative engine or user-visible speculative decoding;
 - termination or output-budget policy, or a fixed `gamma`;
-- semantic termination decisions for grammar empty support or multi-iteration grammar-state
-  policy;
+- EOS, no-continuation, finish-reason, and output policy for classified grammar empty-support
+  outcomes, or multi-iteration grammar-state policy;
 - speculative EOS, grammar-completion, stop, output-budget, streaming, cancellation, or API
   integration, and a production/user-visible grammar-aware speculative engine;
 - speculative metrics;

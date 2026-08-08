@@ -1515,10 +1515,86 @@ The result retains no backend, root or proposal checkpoint, target row, primitiv
 constraint, mask, selector/RNG, released ancestor, mutable registry, model, tensor, native runtime,
 or metric. D47 is pure Python, framework-neutral, model-free, and optional-runtime-free.
 
-D47 deliberately does not classify empty support, inject EOS, apply grammar-completion, stop,
-length, or output-budget policy, run a second iteration, rotate roots, choose a production model
-pair, select fixed or adaptive `gamma`, stream, cancel, add speculative metrics, define operating
-limits, enable offload, expose API behavior, or alter native ABI, dependencies, or Mac behavior.
+D47 itself deliberately does not classify empty support, inject EOS, apply grammar-completion,
+stop, length, or output-budget policy, run a second iteration, rotate roots, choose a production
+model pair, select fixed or adaptive `gamma`, stream, cancel, add speculative metrics, define
+operating limits, enable offload, expose API behavior, or alter native ABI, dependencies, or Mac
+behavior. D48 adds only the isolated classification layer described next.
+
+### Grammar-masked speculative outcome classification
+
+D48 adds the pure `onyx_cuda.grammar_speculative_outcome` module and these four public symbols:
+
+```python
+GrammarMaskedSpeculativeOutcomeError
+GrammarMaskedSpeculativeOutcomeInvariantError
+GrammarMaskedSpeculativeOutcomeResult
+classify_grammar_masked_speculative_outcome
+```
+
+The base error derives from `GrammarMaskedSpeculativeIterationError`, and the invariant error
+derives from the D48 base. Passing anything other than a D47 result is a `TypeError`. Unreadable,
+tampered, or internally inconsistent stored D47 evidence raises
+`GrammarMaskedSpeculativeOutcomeInvariantError`; unreadable attribute failures retain the original
+exception as their cause. A valid nonmatching terminal route is a successful classification, not
+an exception.
+
+The operation has one required positional-or-keyword parameter and no policy inputs:
+
+```python
+classify_grammar_masked_speculative_outcome(
+    iteration_result: GrammarMaskedSpeculativeIterationResult[StateT],
+) -> GrammarMaskedSpeculativeOutcomeResult
+```
+
+The frozen, slotted result stores exactly one field:
+
+```python
+kind: Literal[
+    "handoff_available",
+    "grammar_complete",
+    "grammar_no_continuation",
+]
+```
+
+Direct construction requires an exact built-in string and accepts only those three lowercase
+literals. The result has no token, finish reason, terminal source, match flag, grammar state,
+cache/backend reference, or mutable collection. Its `kind` is a D48 domain classification;
+`grammar_complete` is not yet a speculative `GenerationResult.finish_reason`.
+
+Before dispatch, D48 reads all eleven stored D47 fields exactly once in dataclass order and
+revalidates their complete value-level contract. This includes the exact nonnegative proposal
+tuple, accepted-count range, positive initial cache length, route-specific final cache formula,
+replacement/handoff relationship, exact Boolean committed match fact, mutually exclusive target
+no-decision evidence, and every optional selection's exact empty support, Boolean match fact, and
+absent selected token. The opaque committed state is read only to establish that the complete
+stored shape is accessible; it is never compared, hashed, invoked, stringified, or otherwise
+inspected. No D47 derived property is used.
+
+| Validated D47 route | Terminal evidence | D48 `kind` |
+|---|---|---|
+| mismatch replacement | none; any D44 shortening evidence is history | `handoff_available` |
+| full acceptance plus bonus | none; any D44 shortening evidence is history | `handoff_available` |
+| zero-token D44 shortening | D44 `shortening_selection` | `grammar_complete` when matching; otherwise `grammar_no_continuation` |
+| D45 no-decision before full acceptance | D45 `acceptance_no_decision_selection` | `grammar_complete` when matching; otherwise `grammar_no_continuation` |
+| full acceptance plus D46 empty support | D46 `final_row_no_decision_selection` | `grammar_complete` when matching; otherwise `grammar_no_continuation` |
+
+A valid uncached token wins over matching committed state and over matching or nonmatching nonzero
+D44 shortening history. On later no-token routes, the exact D45 or D46 terminal selection controls;
+D44 shortening evidence remains nonterminal history. Complete validation still precedes a handoff
+return, so malformed cache, token, selection, or match evidence cannot bypass route checks.
+
+The D47 result and its committed state are borrowed and remain caller-owned. Classification does
+not consume or mutate either object, and the D48 result retains no D47 result, state, selection,
+proposal, or other evidence. It acquires no resource and therefore has no cleanup path. It performs
+no backend, cache, checkpoint, grammar query or transition, mask, selector/RNG, CUDA, model,
+decoding, EOS, streaming, metric, or API work.
+
+D48 does not emit or decode a handoff token, inject or select EOS, raise the target-only
+`GrammarNoContinuationError`, map a public finish reason, decide whether another iteration runs,
+or settle stop/output-budget precedence. Multi-iteration grammar-state coordination, production
+pair selection, user-visible speculative decoding, streaming, metrics, operating limits, and API
+integration remain later policy and production work.
 
 ### Pinned dual-backend one-iteration qualification
 
@@ -1954,7 +2030,8 @@ The current Windows package does not yet provide:
 
 - a selected two-model draft/target pair or a separate production draft engine;
 - a policy-driven production iterative engine or termination and output-budget policy;
-- empty-support terminal policy or multi-iteration grammar-state policy;
+- EOS, no-continuation, finish-reason, and output policy for classified empty-support outcomes, or
+  multi-iteration grammar-state policy;
 - a production/user-visible grammar-aware speculative engine;
 - speculative stops, streaming, cancellation, or acceptance metrics;
 - fixed or adaptive `gamma`;
@@ -1976,6 +2053,8 @@ child transition, D44 applies it to a bounded draft proposal, D45 applies it to 
 target rows for match/replace acceptance and a committed target branch, and D46 supplies the
 cache-neutral grammar-masked final-row continuation for decided D45 outcomes. D47 composes those
 primitives with target verification and exact cache reconciliation for one policy-neutral
-transaction, including zero/no-decision routing. These deliverables still do not form user-visible
-speculative decoding without empty-support terminal policy, multi-iteration grammar-state policy,
-a selected pair, and a separately owned production iterative engine.
+transaction, including zero/no-decision routing. D48 purely classifies the completed D47 route as
+handoff available, grammar complete, or grammar no-continuation. These deliverables still do not
+form user-visible speculative decoding without EOS/no-continuation and output policy,
+multi-iteration grammar-state policy, a selected pair, and a separately owned production iterative
+engine.
