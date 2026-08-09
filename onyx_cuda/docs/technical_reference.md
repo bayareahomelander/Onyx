@@ -1592,9 +1592,153 @@ decoding, EOS, streaming, metric, or API work.
 
 D48 does not emit or decode a handoff token, inject or select EOS, raise the target-only
 `GrammarNoContinuationError`, map a public finish reason, decide whether another iteration runs,
-or settle stop/output-budget precedence. Multi-iteration grammar-state coordination, production
+or settle stop/output-budget precedence. Caller-variable grammar-state iteration, production
 pair selection, user-visible speculative decoding, streaming, metrics, operating limits, and API
 integration remain later policy and production work.
+
+### Bounded grammar-masked speculative handoff
+
+D49 adds the pure `onyx_cuda.grammar_speculative_handoff` module and these five public symbols:
+
+```python
+GrammarMaskedSpeculativeHandoffCleanupError
+GrammarMaskedSpeculativeHandoffError
+GrammarMaskedSpeculativeHandoffInvariantError
+GrammarMaskedSpeculativeHandoffResult
+coordinate_grammar_masked_speculative_handoff
+```
+
+The base error derives from `GrammarMaskedSpeculativeOutcomeError`; the invariant and cleanup
+errors derive from the D49 base. D47 and D48 exceptions are not wrapped when D49 cleanup succeeds.
+The coordinator has the same argument shape as D47 and deliberately has no iteration-count input:
+
+```python
+coordinate_grammar_masked_speculative_handoff(
+    draft_backend,
+    target_backend,
+    current_token_id,
+    constraint,
+    starting_state,
+    draft_logit_mask,
+    target_logit_mask,
+    *,
+    proposal_bound,
+    draft_select_token,
+    target_select_token,
+    draft_root_checkpoint,
+    target_root_checkpoint,
+) -> GrammarMaskedSpeculativeHandoffResult[StateT]
+```
+
+The coordinator always runs one unchanged D47 transaction and classifies its exact result once
+through unchanged D48. `grammar_complete` and `grammar_no_continuation` return immediately, without
+creating an intermediate checkpoint or invoking D47 again. Only `handoff_available` permits a
+second transaction. The second result is classified once and returned regardless of whether its
+classification is another handoff, grammar completion, or grammar no-continuation. D49 never runs a
+third transaction.
+
+The frozen, slotted, state-generic result stores exactly these fields:
+
+```python
+output_token_ids: tuple[int, ...]
+final_iteration: GrammarMaskedSpeculativeIterationResult[StateT]
+final_outcome: GrammarMaskedSpeculativeOutcomeResult
+```
+
+`output_token_ids` is the exact ordered output of the one executed D47 transaction or the exact
+concatenation `O1 + O2` of both executed transactions. It may be empty on a terminal zero-token
+first route. `final_iteration` and `final_outcome` retain the exact last D47 and D48 objects by
+identity. The final live state and its match fact remain solely in
+`final_iteration.committed_state` and `final_iteration.committed_state_is_match`; the D49 result
+does not duplicate ownership evidence. After a handoff it retains no first D47 result, first D48
+result, intermediate state, or temporary root.
+
+Direct result construction requires an exact tuple of nonnegative, non-Boolean built-in integer
+token IDs, genuine final D47 and D48 objects, the final D47 output as an exact suffix, and agreement
+between `handoff_available` and the presence of a final uncached token. It has no vocabulary upper
+bound or runtime evidence. The coordinator additionally validates the current common backend and
+constraint vocabulary, exact initial and final cache formulas, every emitted token against that
+vocabulary, actual cache alignment, exact result/outcome identities, and the final state's live and
+unchanged match facts.
+
+For caller-root length `P`, first accepted count `A1`, and first final length `Q1`:
+
+```text
+Q1 = P + 1 + A1
+```
+
+The route boundary is:
+
+| First D48 kind | D49 action | Returned evidence |
+|---|---|---|
+| `grammar_complete` | stop after the first D47/D48 pair | `O1`, exact first D47, exact first D48 |
+| `grammar_no_continuation` | stop after the first D47/D48 pair | `O1`, exact first D47, exact first D48 |
+| `handoff_available` | create one temporary root per role at `Q1`, then run one more D47/D48 pair | `O1 + O2`, exact second D47, exact second D48 |
+
+On a handoff, `H1` is the first D47 result's one uncached token. It is already present as the final
+token of `O1` and already represented in the first committed grammar state, but it is absent from
+both caches. D49 passes that exact token as the second D47 `current_token_id`, passes the exact first
+committed state as `starting_state`, and reuses the same backends, constraint, masks, selector
+sessions, and proposal bound. It performs no grammar transition for `H1` itself. D47 consumes `H1`
+into both caches as the second transaction's current token and does not emit it again.
+
+For second accepted count `A2` and final length `Q2`:
+
+```text
+Q2 = Q1 + 1 + A2
+
+final caches = prompt
+             + (first current token,)
+             + first proposal[:A1]
+             + (H1,)
+             + second proposal[:A2]
+```
+
+The combined output is only `O1 + O2`. D49 neither inserts a separate `H1` nor deduplicates equal
+numeric values: if a later genuine selection has the same token ID, both occurrences remain. The
+second D48 classification does not trigger EOS insertion, a no-continuation exception, a finish
+reason, or another transaction.
+
+The caller owns both initial roots, both backends, the constraint, both masks, and both selector/RNG
+sessions throughout. The first successful D47 transfers its committed state to D49. On a handoff,
+that exact state becomes the consumed second D47 input; a successful second D47 transfers the final
+state back to D49. D49 uses explicit ownership flags because either intermediate or final state may
+have the opaque value `None`. Exactly the last D47 state transfers to the caller on success through
+`final_iteration`. The caller later releases it through the constraint.
+
+Only the handoff route owns temporary checkpoints. D49 creates the draft root first and the target
+root second at `Q1`, records ownership as soon as each creation returns, and validates its protocol,
+metadata, and both actual caches. After second success it releases draft then target, validating
+both final caches after each release. Caller roots remain borrowed, unreleased, active, and reusable.
+At most one temporary pair exists.
+
+The first D47 call is outside D49's outer failure domain. A failure before it returns remains wholly
+inside D47 ownership and propagates without a D49 rollback or state release. The D49 failure domain
+begins immediately after the first D47 returns. Every later failure attempts all applicable cleanup
+operations once in this order:
+
+1. draft rollback to the caller's initial root and validation at `P`;
+2. target rollback to the caller's initial root and validation at `P`;
+3. draft intermediate-root release, when acquired;
+4. target intermediate-root release, when acquired; and
+5. release of the last known D49-owned committed state, when acquired.
+
+The stable cleanup labels are `draft initial root rollback`, `target initial root rollback`,
+`draft intermediate root release`, `target intermediate root release`, and
+`committed state release`. Cleanup continues after ordinary exceptions. If every cleanup operation
+succeeds, the exact original failure is re-raised. Otherwise
+`GrammarMaskedSpeculativeHandoffCleanupError` retains the original by identity and as its cause,
+plus the nonempty immutable ordered tuple of D49 cleanup failures. Nested D47 cleanup errors remain
+one original failure and are not flattened. A failed success-path checkpoint release remains owned
+for its one cleanup retry. D49 never resets a backend or constraint, retries D47 or D48, or rewinds a
+selector session.
+
+D49 is a framework-neutral, optional-runtime-free mechanical ownership and continuity proof. It
+does not inspect target rows, apply masks, select tokens, rescan grammar support, call D44-D46
+directly, decode text, inject EOS, map finish reasons, choose no-continuation policy, apply stops or
+output budgets, expose caller-variable iteration, load a production pair, select release `gamma`,
+stream, cancel, add speculative metrics, qualify live CUDA/model behavior, define operating limits,
+enable offload, expose API behavior, or change the native grammar ABI or macOS package.
 
 ### Pinned dual-backend one-iteration qualification
 

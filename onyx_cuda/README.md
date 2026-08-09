@@ -79,6 +79,12 @@ Transformers instead of the Apple MLX runtime used by the macOS package.
   terminal empty support as `grammar_no_continuation`. It borrows and retains no transaction
   evidence and does not emit a token, inject EOS, publish a finish reason, or choose another
   iteration.
+- A bounded, framework-neutral grammar-aware handoff coordinator over at most two of those
+  transactions. A terminal first classification returns immediately; a first handoff creates one
+  temporary root per cache role and carries the exact uncached token plus its already-advanced
+  grammar state through exactly one additional transaction. It returns the exact combined token
+  output and final transaction/classification evidence without duplicating the handoff token,
+  advancing its grammar state again, or adding terminal/output policy.
 - Bounded one-iteration production qualification over two independently loaded pinned 0.5B
   backends on `cuda:0`, covering genuine greedy full acceptance, test-forced mismatch at every
   three-token fixture position, exact role-local cache reconciliation, independent close order, and
@@ -268,7 +274,7 @@ The Windows package does not yet provide:
 - a policy-driven production iterative speculative engine or user-visible speculative decoding;
 - termination or output-budget policy, or a fixed `gamma`;
 - EOS, no-continuation, finish-reason, and output policy for classified grammar empty-support
-  outcomes, or multi-iteration grammar-state policy;
+  outcomes, or caller-variable grammar-aware iteration policy;
 - speculative EOS, grammar-completion, stop, output-budget, streaming, cancellation, or API
   integration, and a production/user-visible grammar-aware speculative engine;
 - speculative metrics;

@@ -167,6 +167,28 @@ def test_package_identifies_the_windows_cuda_variant():
         onyx_cuda.GrammarMaskedSpeculativeOutcomeInvariantError,
         onyx_cuda.GrammarMaskedSpeculativeOutcomeError,
     )
+    for grammar_handoff_symbol in (
+        "GrammarMaskedSpeculativeHandoffCleanupError",
+        "GrammarMaskedSpeculativeHandoffError",
+        "GrammarMaskedSpeculativeHandoffInvariantError",
+        "GrammarMaskedSpeculativeHandoffResult",
+        "coordinate_grammar_masked_speculative_handoff",
+    ):
+        exported = getattr(onyx_cuda, grammar_handoff_symbol)
+        assert exported.__module__ == "onyx_cuda.grammar_speculative_handoff"
+        assert grammar_handoff_symbol in onyx_cuda.__all__
+    assert issubclass(
+        onyx_cuda.GrammarMaskedSpeculativeHandoffError,
+        onyx_cuda.GrammarMaskedSpeculativeOutcomeError,
+    )
+    assert issubclass(
+        onyx_cuda.GrammarMaskedSpeculativeHandoffInvariantError,
+        onyx_cuda.GrammarMaskedSpeculativeHandoffError,
+    )
+    assert issubclass(
+        onyx_cuda.GrammarMaskedSpeculativeHandoffCleanupError,
+        onyx_cuda.GrammarMaskedSpeculativeHandoffError,
+    )
     for continuation_symbol in (
         "PostIterationContinuationError",
         "PostIterationContinuationInvariantError",
