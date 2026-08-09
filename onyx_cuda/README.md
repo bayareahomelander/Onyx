@@ -85,6 +85,11 @@ Transformers instead of the Apple MLX runtime used by the macOS package.
   grammar state through exactly one additional transaction. It returns the exact combined token
   output and final transaction/classification evidence without duplicating the handoff token,
   advancing its grammar state again, or adding terminal/output policy.
+- A caller-bounded, framework-neutral grammar-aware coordinator over a positive maximum number of
+  transactions. It classifies every completed transaction once, stops at the first terminal
+  classification or the caller's bound, preserves a final bound-exhausted handoff as handoff
+  evidence, and rotates temporary roots with ownership bounded independently of that maximum. Its
+  result retains only exact accumulated output plus the final transaction/classification evidence.
 - Bounded one-iteration production qualification over two independently loaded pinned 0.5B
   backends on `cuda:0`, covering genuine greedy full acceptance, test-forced mismatch at every
   three-token fixture position, exact role-local cache reconciliation, independent close order, and
@@ -274,7 +279,7 @@ The Windows package does not yet provide:
 - a policy-driven production iterative speculative engine or user-visible speculative decoding;
 - termination or output-budget policy, or a fixed `gamma`;
 - EOS, no-continuation, finish-reason, and output policy for classified grammar empty-support
-  outcomes, or caller-variable grammar-aware iteration policy;
+  outcomes or a bound-exhausted grammar handoff;
 - speculative EOS, grammar-completion, stop, output-budget, streaming, cancellation, or API
   integration, and a production/user-visible grammar-aware speculative engine;
 - speculative metrics;

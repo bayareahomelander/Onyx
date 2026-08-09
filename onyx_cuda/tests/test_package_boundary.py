@@ -173,6 +173,7 @@ def test_package_identifies_the_windows_cuda_variant():
         "GrammarMaskedSpeculativeHandoffInvariantError",
         "GrammarMaskedSpeculativeHandoffResult",
         "coordinate_grammar_masked_speculative_handoff",
+        "coordinate_multi_iteration_grammar_masked_speculative_handoff",
     ):
         exported = getattr(onyx_cuda, grammar_handoff_symbol)
         assert exported.__module__ == "onyx_cuda.grammar_speculative_handoff"

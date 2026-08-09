@@ -64,6 +64,7 @@ from .grammar_speculative_handoff import (
     GrammarMaskedSpeculativeHandoffInvariantError,
     GrammarMaskedSpeculativeHandoffResult,
     coordinate_grammar_masked_speculative_handoff,
+    coordinate_multi_iteration_grammar_masked_speculative_handoff,
 )
 from .continuation import (
     PostIterationContinuationError,
@@ -459,6 +460,7 @@ __all__ = [
     "coordinate_continuation_aware_speculative_iteration",
     "coordinate_grammar_masked_speculative_handoff",
     "coordinate_grammar_masked_speculative_iteration",
+    "coordinate_multi_iteration_grammar_masked_speculative_handoff",
     "classify_grammar_masked_speculative_outcome",
     "coordinate_multi_iteration_speculative_handoff",
     "coordinate_speculative_iteration",

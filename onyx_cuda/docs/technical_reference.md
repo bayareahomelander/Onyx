@@ -1592,9 +1592,9 @@ decoding, EOS, streaming, metric, or API work.
 
 D48 does not emit or decode a handoff token, inject or select EOS, raise the target-only
 `GrammarNoContinuationError`, map a public finish reason, decide whether another iteration runs,
-or settle stop/output-budget precedence. Caller-variable grammar-state iteration, production
-pair selection, user-visible speculative decoding, streaming, metrics, operating limits, and API
-integration remain later policy and production work.
+or settle stop/output-budget precedence. D50 supplies only caller-bounded mechanical routing over
+classified transactions; production grammar-state iteration policy, pair selection, user-visible
+speculative decoding, streaming, metrics, operating limits, and API integration remain later work.
 
 ### Bounded grammar-masked speculative handoff
 
@@ -1738,7 +1738,125 @@ does not inspect target rows, apply masks, select tokens, rescan grammar support
 directly, decode text, inject EOS, map finish reasons, choose no-continuation policy, apply stops or
 output budgets, expose caller-variable iteration, load a production pair, select release `gamma`,
 stream, cancel, add speculative metrics, qualify live CUDA/model behavior, define operating limits,
-enable offload, expose API behavior, or change the native grammar ABI or macOS package.
+enable offload, expose API behavior, or change the native grammar ABI or macOS package. D50 adds a
+separate caller-bounded coordinator without changing this one/two-transaction regression boundary.
+
+### Caller-bounded grammar-masked speculative handoff
+
+D50 adds one public symbol to the unchanged D49 module and package root:
+
+```python
+coordinate_multi_iteration_grammar_masked_speculative_handoff(
+    draft_backend: CheckpointableAutoregressiveBackend[
+        DraftLogitsT, DraftCheckpointT
+    ],
+    target_backend: CheckpointableAutoregressiveBackend[
+        TargetLogitsT, TargetCheckpointT
+    ],
+    current_token_id: int,
+    constraint: GrammarConstraint[StateT],
+    starting_state: StateT,
+    draft_logit_mask: GrammarLogitMask[DraftLogitsT],
+    target_logit_mask: GrammarLogitMask[TargetLogitsT],
+    *,
+    iteration_bound: int,
+    proposal_bound: int,
+    draft_select_token: Callable[[DraftLogitsT], int],
+    target_select_token: Callable[[TargetLogitsT], int],
+    draft_root_checkpoint: DraftCheckpointT,
+    target_root_checkpoint: TargetCheckpointT,
+) -> GrammarMaskedSpeculativeHandoffResult[StateT]
+```
+
+`iteration_bound` is a maximum, not an exact transaction count. It must be an exact built-in,
+non-Boolean integer greater than zero and is validated before root metadata, a backend, grammar
+state, mask, selector, D47, or D48 is observed. `proposal_bound` remains one unchanged D47 bound;
+the realized proposal length may differ between transactions when D44 shortens at different
+grammar states.
+
+For caller bound `B`, caller-root length `Q0 = P`, and `m` executed transactions, D50 guarantees
+`1 <= m <= B`. For one-based transaction `i`, accepted count `Ai`, optional handoff `Hi`, and exact
+D47 output `Oi`:
+
+```text
+Qi = Q(i-1) + 1 + Ai
+C1 = caller current_token_id
+Ci = H(i-1) for i > 1
+Oi = proposal_i[:Ai] + ((Hi,) if Hi exists else ())
+combined output = O1 + O2 + ... + Om
+```
+
+Each genuine completed D47 result is acquired, including its possibly opaque `None` committed
+state and exact Boolean match fact, then classified exactly once through unchanged D48. D50
+revalidates the D47/D48 relationship, the common numeric vocabulary, the initial/final cache
+formula, emitted-token range, actual cache alignment, and live state facts after every completed
+transaction. A `grammar_complete` or `grammar_no_continuation` classification stops immediately.
+A `handoff_available` classification continues only when another transaction remains within `B`.
+At `B`, that exact handoff outcome is returned unchanged; it is not EOS, completion, stop, length,
+no-continuation failure, a finish reason, or another policy result.
+
+Every continuing `Hi` is already the final occurrence in `Oi` and already represented by the
+committed grammar state, while remaining absent from both caches. D50 passes it unchanged as the
+next D47 current token and passes the already-advanced committed state as the next starting state.
+The following D47 consumes the token into both caches. D50 neither advances the token through the
+grammar again nor emits an extra occurrence. A later genuine selection with the same numeric token
+ID remains a distinct output occurrence. The same backend, constraint, masks, selector sessions,
+and proposal-bound objects flow through every call, so selector state is continuous and is never
+seeded, cloned, reset, retried, or rewound.
+
+D50 reuses the frozen three-field `GrammarMaskedSpeculativeHandoffResult` and the existing D49
+error hierarchy. The result contains the exact accumulated immutable token tuple, the exact final
+D47 result by identity, and the exact final D48 result by identity. It adds no iteration count,
+bound, history, terminal reason, or duplicate state field. Only the last live committed state and
+match fact transfer to the caller through `final_iteration`; prior transaction/outcome objects and
+consumed states are not retained.
+
+An operation that executes `m` transactions creates and releases exactly `m - 1` D50-owned roots
+per backend. Terminal-first and bound-one routes create none. Before each continuing transaction,
+D50 creates draft-next and then target-next at `Qi`, recording ownership before validation. If a
+current pair exists, it releases current draft and then current target, validating cache alignment
+after each, before promoting the next pair. On return it settles the final current draft and target
+in that order. Stable operation owns at most one intermediate pair; rotation may transiently own
+one current plus one next pair, independent of `B`. Caller roots remain borrowed, active, reusable,
+and absent from release calls.
+
+The first D47 call remains wholly within D47's failure domain. If it raises before returning, D50
+does no duplicate rollback or state settlement and re-raises that exact exception. D50's outer
+failure domain begins immediately after the first D47 returns and covers every result read,
+classification, validation, accumulation, root acquisition/rotation, later D47 call, result
+construction, success-path settlement, and final cache/state validation. Outer cleanup attempts
+every applicable operation once in this global order:
+
+1. `draft initial root rollback`;
+2. `target initial root rollback`;
+3. `draft intermediate root release`;
+4. `target intermediate root release`;
+5. `draft next intermediate root release`;
+6. `target next intermediate root release`; and
+7. `committed state release`.
+
+When no current pair exists, a partially or fully acquired first next pair uses the ordinary
+intermediate-root labels. A failed success-path release remains owned for one cleanup retry; a
+successfully settled resource is not retried. Cleanup continues after ordinary exceptions. Healthy
+cleanup restores both caller roots, settles all owned intermediate handles and the last-known state,
+and re-raises the original failure by identity. Incomplete cleanup raises the existing
+`GrammarMaskedSpeculativeHandoffCleanupError`, retaining the original by identity and as cause plus
+the nonempty immutable ordered cleanup evidence. Later D47 failures may happen before or after they
+consume the incoming state, so D50 settles the last-known state under the established idempotent
+grammar-release contract without retrying D47 or rewinding selectors. Nested D47 cleanup errors
+remain one unflattened original failure.
+
+With `iteration_bound=1`, D50 is observationally equivalent to D49's terminal-first boundary and
+also permits one returned handoff. With `iteration_bound=2`, it is observationally equivalent to
+D49 for terminal-first and every second-outcome family. D49 itself remains unchanged and always
+stops after its second classification, while D50 may continue.
+
+D50 remains pure Python, framework-neutral, model-free, and importable/executable without MLX,
+PyTorch, Transformers, bitsandbytes, CUDA initialization, the native extension, model assets, or
+network access. It does not add an unbounded or self-selected loop, terminal/output policy, EOS,
+stops, output budgets, text decoding, streaming, cancellation, metrics, production engine/model
+lifecycle, model-pair or tokenizer compatibility, release `gamma`, live CUDA qualification,
+operating limits, offload, API behavior, dependencies, packaging, native ABI, or macOS changes.
 
 ### Pinned dual-backend one-iteration qualification
 
@@ -2175,7 +2293,7 @@ The current Windows package does not yet provide:
 - a selected two-model draft/target pair or a separate production draft engine;
 - a policy-driven production iterative engine or termination and output-budget policy;
 - EOS, no-continuation, finish-reason, and output policy for classified empty-support outcomes, or
-  multi-iteration grammar-state policy;
+  a bound-exhausted grammar handoff;
 - a production/user-visible grammar-aware speculative engine;
 - speculative stops, streaming, cancellation, or acceptance metrics;
 - fixed or adaptive `gamma`;
@@ -2198,7 +2316,8 @@ target rows for match/replace acceptance and a committed target branch, and D46 
 cache-neutral grammar-masked final-row continuation for decided D45 outcomes. D47 composes those
 primitives with target verification and exact cache reconciliation for one policy-neutral
 transaction, including zero/no-decision routing. D48 purely classifies the completed D47 route as
-handoff available, grammar complete, or grammar no-continuation. These deliverables still do not
-form user-visible speculative decoding without EOS/no-continuation and output policy,
-multi-iteration grammar-state policy, a selected pair, and a separately owned production iterative
-engine.
+handoff available, grammar complete, or grammar no-continuation. D49 provides its unchanged
+one/at-most-two classified handoff, and D50 adds positive caller-bounded routing with bounded root
+rotation. These deliverables still do not form user-visible speculative decoding without
+EOS/no-continuation, bound-exhaustion, and output policy, a selected pair, and a separately owned
+production iterative engine.

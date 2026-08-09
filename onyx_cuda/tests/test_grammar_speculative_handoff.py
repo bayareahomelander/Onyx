@@ -636,6 +636,7 @@ def test_public_surface_signature_result_and_error_hierarchy():
         "GrammarMaskedSpeculativeHandoffInvariantError",
         "GrammarMaskedSpeculativeHandoffResult",
         "coordinate_grammar_masked_speculative_handoff",
+        "coordinate_multi_iteration_grammar_masked_speculative_handoff",
     ]
     assert issubclass(
         GrammarMaskedSpeculativeHandoffError,

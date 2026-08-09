@@ -381,6 +381,294 @@ def coordinate_grammar_masked_speculative_handoff(
         raise
 
 
+def coordinate_multi_iteration_grammar_masked_speculative_handoff(
+    draft_backend: CheckpointableAutoregressiveBackend[
+        DraftLogitsT, DraftCheckpointT
+    ],
+    target_backend: CheckpointableAutoregressiveBackend[
+        TargetLogitsT, TargetCheckpointT
+    ],
+    current_token_id: int,
+    constraint: GrammarConstraint[StateT],
+    starting_state: StateT,
+    draft_logit_mask: GrammarLogitMask[DraftLogitsT],
+    target_logit_mask: GrammarLogitMask[TargetLogitsT],
+    *,
+    iteration_bound: int,
+    proposal_bound: int,
+    draft_select_token: Callable[[DraftLogitsT], int],
+    target_select_token: Callable[[TargetLogitsT], int],
+    draft_root_checkpoint: DraftCheckpointT,
+    target_root_checkpoint: TargetCheckpointT,
+) -> GrammarMaskedSpeculativeHandoffResult[StateT]:
+    """Run D47/D48 transactions until terminal evidence or a positive caller bound."""
+
+    _validate_iteration_bound(iteration_bound)
+    initial_cache_length = _validate_initial_root_metadata(
+        draft_root_checkpoint,
+        target_root_checkpoint,
+    )
+
+    iteration = coordinate_grammar_masked_speculative_iteration(
+        draft_backend,
+        target_backend,
+        current_token_id,
+        constraint,
+        starting_state,
+        draft_logit_mask,
+        target_logit_mask,
+        proposal_bound=proposal_bound,
+        draft_select_token=draft_select_token,
+        target_select_token=target_select_token,
+        draft_root_checkpoint=draft_root_checkpoint,
+        target_root_checkpoint=target_root_checkpoint,
+    )
+
+    current_draft: object = None
+    current_target: object = None
+    current_draft_owned = False
+    current_target_owned = False
+    next_draft: object = None
+    next_target: object = None
+    next_draft_owned = False
+    next_target_owned = False
+    owned_state: object = None
+    owned_state_acquired = False
+    owned_state_is_match = False
+
+    try:
+        accumulated_output: list[int] = []
+        expected_initial_cache_length = initial_cache_length
+        vocab_size: int | None = None
+
+        for iteration_number in range(1, iteration_bound + 1):
+            iteration = _require_iteration_result(
+                iteration,
+                label=f"iteration {iteration_number} D47 result",
+                error_type=GrammarMaskedSpeculativeHandoffInvariantError,
+            )
+            owned_state = _read_attribute(
+                iteration,
+                "committed_state",
+                label=f"iteration {iteration_number} D47 result",
+            )
+            owned_state_acquired = True
+            owned_state_is_match = _read_state_match_fact(
+                iteration,
+                label=f"iteration {iteration_number} D47 result",
+            )
+
+            outcome = classify_grammar_masked_speculative_outcome(iteration)
+            outcome = _require_outcome_result(
+                outcome,
+                label=f"iteration {iteration_number} D48 result",
+                error_type=GrammarMaskedSpeculativeHandoffInvariantError,
+            )
+            _validate_outcome_relationship(
+                iteration,
+                outcome,
+                label=f"iteration {iteration_number}",
+            )
+
+            if vocab_size is None:
+                vocab_size = _read_common_vocab_size(
+                    draft_backend,
+                    target_backend,
+                    constraint,
+                )
+            iteration_output, final_cache_length = _validate_completed_iteration(
+                draft_backend,
+                target_backend,
+                constraint,
+                iteration,
+                expected_initial_cache_length=expected_initial_cache_length,
+                vocab_size=vocab_size,
+                acquired_state=owned_state,
+                acquired_state_is_match=owned_state_is_match,
+                label=f"iteration {iteration_number} D47 result",
+            )
+            accumulated_output.extend(iteration_output)
+
+            outcome_kind = _read_outcome_kind(
+                outcome,
+                label=f"iteration {iteration_number} D48 result",
+            )
+            if (
+                outcome_kind != "handoff_available"
+                or iteration_number == iteration_bound
+            ):
+                output_token_ids = tuple(accumulated_output)
+                result = GrammarMaskedSpeculativeHandoffResult(
+                    output_token_ids=output_token_ids,
+                    final_iteration=iteration,
+                    final_outcome=outcome,
+                )
+                _validate_composed_result(
+                    result,
+                    output_token_ids=output_token_ids,
+                    final_iteration=iteration,
+                    final_outcome=outcome,
+                    coordinator_label="D50",
+                )
+
+                if current_draft_owned:
+                    draft_backend.release_cache_checkpoint(
+                        cast(DraftCheckpointT, current_draft)
+                    )
+                    _validate_backend_pair_cache_length(
+                        draft_backend,
+                        target_backend,
+                        final_cache_length,
+                    )
+                    current_draft_owned = False
+                if current_target_owned:
+                    target_backend.release_cache_checkpoint(
+                        cast(TargetCheckpointT, current_target)
+                    )
+                    _validate_backend_pair_cache_length(
+                        draft_backend,
+                        target_backend,
+                        final_cache_length,
+                    )
+                    current_target_owned = False
+
+                _validate_backend_pair_cache_length(
+                    draft_backend,
+                    target_backend,
+                    final_cache_length,
+                )
+                _validate_live_state(
+                    constraint,
+                    cast(StateT, owned_state),
+                    expected_is_match=owned_state_is_match,
+                    label="final committed_state",
+                )
+                owned_state_acquired = False
+                return result
+
+            handoff_token_id = _read_optional_token(
+                iteration,
+                "uncached_next_token_id",
+                vocab_size=vocab_size,
+                label=f"iteration {iteration_number} D47 result",
+            )
+            if handoff_token_id is None:
+                raise GrammarMaskedSpeculativeHandoffInvariantError(
+                    f"iteration {iteration_number} handoff outcome requires one "
+                    "uncached token"
+                )
+            if not iteration_output or iteration_output[-1] != handoff_token_id:
+                raise GrammarMaskedSpeculativeHandoffInvariantError(
+                    f"iteration {iteration_number} handoff token must be the final "
+                    "iteration output token"
+                )
+
+            next_draft = draft_backend.create_cache_checkpoint()
+            next_draft_owned = True
+            _validate_intermediate_checkpoint(
+                next_draft,
+                expected_cache_length=final_cache_length,
+                label="draft next intermediate checkpoint",
+            )
+            _validate_backend_pair_cache_length(
+                draft_backend,
+                target_backend,
+                final_cache_length,
+            )
+
+            next_target = target_backend.create_cache_checkpoint()
+            next_target_owned = True
+            _validate_intermediate_checkpoint(
+                next_target,
+                expected_cache_length=final_cache_length,
+                label="target next intermediate checkpoint",
+            )
+            _validate_backend_pair_cache_length(
+                draft_backend,
+                target_backend,
+                final_cache_length,
+            )
+
+            if current_draft_owned:
+                draft_backend.release_cache_checkpoint(
+                    cast(DraftCheckpointT, current_draft)
+                )
+                _validate_backend_pair_cache_length(
+                    draft_backend,
+                    target_backend,
+                    final_cache_length,
+                )
+                current_draft_owned = False
+            if current_target_owned:
+                target_backend.release_cache_checkpoint(
+                    cast(TargetCheckpointT, current_target)
+                )
+                _validate_backend_pair_cache_length(
+                    draft_backend,
+                    target_backend,
+                    final_cache_length,
+                )
+                current_target_owned = False
+
+            current_draft = next_draft
+            current_target = next_target
+            current_draft_owned = next_draft_owned
+            current_target_owned = next_target_owned
+            next_draft = None
+            next_target = None
+            next_draft_owned = False
+            next_target_owned = False
+
+            expected_initial_cache_length = final_cache_length
+            iteration = coordinate_grammar_masked_speculative_iteration(
+                draft_backend,
+                target_backend,
+                handoff_token_id,
+                constraint,
+                cast(StateT, owned_state),
+                draft_logit_mask,
+                target_logit_mask,
+                proposal_bound=proposal_bound,
+                draft_select_token=draft_select_token,
+                target_select_token=target_select_token,
+                draft_root_checkpoint=cast(DraftCheckpointT, current_draft),
+                target_root_checkpoint=cast(TargetCheckpointT, current_target),
+            )
+    except BaseException as failure:
+        cleanup_failures = _cleanup_failed_multi_iteration_handoff(
+            draft_backend,
+            target_backend,
+            constraint,
+            draft_root_checkpoint=draft_root_checkpoint,
+            target_root_checkpoint=target_root_checkpoint,
+            current_draft=current_draft,
+            current_target=current_target,
+            current_draft_owned=current_draft_owned,
+            current_target_owned=current_target_owned,
+            next_draft=next_draft,
+            next_target=next_target,
+            next_draft_owned=next_draft_owned,
+            next_target_owned=next_target_owned,
+            initial_cache_length=initial_cache_length,
+            owned_state=owned_state,
+            owned_state_acquired=owned_state_acquired,
+        )
+        if cleanup_failures:
+            raise GrammarMaskedSpeculativeHandoffCleanupError(
+                failure,
+                cleanup_failures,
+            ) from failure
+        raise
+
+
+def _validate_iteration_bound(iteration_bound: object) -> int:
+    if type(iteration_bound) is not int:
+        raise TypeError("iteration_bound must be an exact integer")
+    if iteration_bound <= 0:
+        raise ValueError("iteration_bound must be greater than zero")
+    return iteration_bound
+
+
 def _validate_result_output(value: object) -> tuple[int, ...]:
     if type(value) is not tuple:
         raise TypeError("output_token_ids must be an exact tuple")
@@ -797,28 +1085,30 @@ def _validate_composed_result(
     output_token_ids: tuple[int, ...],
     final_iteration: GrammarMaskedSpeculativeIterationResult[object],
     final_outcome: GrammarMaskedSpeculativeOutcomeResult,
+    coordinator_label: str = "D49",
 ) -> None:
     try:
         is_result = isinstance(result, GrammarMaskedSpeculativeHandoffResult)
     except Exception as exc:
         raise GrammarMaskedSpeculativeHandoffInvariantError(
-            "D49 result type could not be determined"
+            f"{coordinator_label} result type could not be determined"
         ) from exc
     if not is_result:
         raise GrammarMaskedSpeculativeHandoffInvariantError(
-            "D49 must return a GrammarMaskedSpeculativeHandoffResult"
+            f"{coordinator_label} must return a GrammarMaskedSpeculativeHandoffResult"
         )
-    if _read_attribute(result, "output_token_ids", label="D49 result") is not output_token_ids:
+    result_label = f"{coordinator_label} result"
+    if _read_attribute(result, "output_token_ids", label=result_label) is not output_token_ids:
         raise GrammarMaskedSpeculativeHandoffInvariantError(
-            "D49 result must retain the exact output_token_ids tuple"
+            f"{result_label} must retain the exact output_token_ids tuple"
         )
-    if _read_attribute(result, "final_iteration", label="D49 result") is not final_iteration:
+    if _read_attribute(result, "final_iteration", label=result_label) is not final_iteration:
         raise GrammarMaskedSpeculativeHandoffInvariantError(
-            "D49 result must retain the exact final D47 result"
+            f"{result_label} must retain the exact final D47 result"
         )
-    if _read_attribute(result, "final_outcome", label="D49 result") is not final_outcome:
+    if _read_attribute(result, "final_outcome", label=result_label) is not final_outcome:
         raise GrammarMaskedSpeculativeHandoffInvariantError(
-            "D49 result must retain the exact final D48 result"
+            f"{result_label} must retain the exact final D48 result"
         )
 
 
@@ -892,6 +1182,122 @@ def _cleanup_failed_handoff(
     return tuple(cleanup_failures)
 
 
+def _cleanup_failed_multi_iteration_handoff(
+    draft_backend: CheckpointableAutoregressiveBackend[
+        DraftLogitsT, DraftCheckpointT
+    ],
+    target_backend: CheckpointableAutoregressiveBackend[
+        TargetLogitsT, TargetCheckpointT
+    ],
+    constraint: GrammarConstraint[StateT],
+    *,
+    draft_root_checkpoint: DraftCheckpointT,
+    target_root_checkpoint: TargetCheckpointT,
+    current_draft: object,
+    current_target: object,
+    current_draft_owned: bool,
+    current_target_owned: bool,
+    next_draft: object,
+    next_target: object,
+    next_draft_owned: bool,
+    next_target_owned: bool,
+    initial_cache_length: int,
+    owned_state: object,
+    owned_state_acquired: bool,
+) -> tuple[tuple[str, Exception], ...]:
+    cleanup_failures: list[tuple[str, Exception]] = []
+
+    try:
+        draft_backend.rollback_cache(draft_root_checkpoint)
+        _validate_backend_cache_length(
+            draft_backend,
+            initial_cache_length,
+            role="draft",
+        )
+    except Exception as cleanup_failure:
+        cleanup_failures.append(("draft initial root rollback", cleanup_failure))
+
+    try:
+        target_backend.rollback_cache(target_root_checkpoint)
+        _validate_backend_cache_length(
+            target_backend,
+            initial_cache_length,
+            role="target",
+        )
+    except Exception as cleanup_failure:
+        cleanup_failures.append(("target initial root rollback", cleanup_failure))
+
+    has_current_pair = current_draft_owned or current_target_owned
+    if has_current_pair:
+        _settle_multi_iteration_checkpoint(
+            draft_backend,
+            current_draft,
+            owned=current_draft_owned,
+            label="draft intermediate root release",
+            cleanup_failures=cleanup_failures,
+        )
+        _settle_multi_iteration_checkpoint(
+            target_backend,
+            current_target,
+            owned=current_target_owned,
+            label="target intermediate root release",
+            cleanup_failures=cleanup_failures,
+        )
+        _settle_multi_iteration_checkpoint(
+            draft_backend,
+            next_draft,
+            owned=next_draft_owned,
+            label="draft next intermediate root release",
+            cleanup_failures=cleanup_failures,
+        )
+        _settle_multi_iteration_checkpoint(
+            target_backend,
+            next_target,
+            owned=next_target_owned,
+            label="target next intermediate root release",
+            cleanup_failures=cleanup_failures,
+        )
+    else:
+        _settle_multi_iteration_checkpoint(
+            draft_backend,
+            next_draft,
+            owned=next_draft_owned,
+            label="draft intermediate root release",
+            cleanup_failures=cleanup_failures,
+        )
+        _settle_multi_iteration_checkpoint(
+            target_backend,
+            next_target,
+            owned=next_target_owned,
+            label="target intermediate root release",
+            cleanup_failures=cleanup_failures,
+        )
+
+    if owned_state_acquired:
+        try:
+            constraint.release_state(cast(StateT, owned_state))
+        except Exception as cleanup_failure:
+            cleanup_failures.append(("committed state release", cleanup_failure))
+
+    return tuple(cleanup_failures)
+
+
+def _settle_multi_iteration_checkpoint(
+    backend: CheckpointableAutoregressiveBackend[object, CacheCheckpoint],
+    checkpoint: object,
+    *,
+    owned: bool,
+    label: str,
+    cleanup_failures: list[tuple[str, Exception]],
+) -> None:
+    if not owned:
+        return
+    try:
+        backend.release_cache_checkpoint(cast(CacheCheckpoint, checkpoint))
+    except Exception as cleanup_failure:
+        cleanup_failures.append((label, cleanup_failure))
+
+
 def _validate_operation_token(
     token_id: object,
     *,
@@ -927,4 +1333,5 @@ __all__ = [
     "GrammarMaskedSpeculativeHandoffInvariantError",
     "GrammarMaskedSpeculativeHandoffResult",
     "coordinate_grammar_masked_speculative_handoff",
+    "coordinate_multi_iteration_grammar_masked_speculative_handoff",
 ]
