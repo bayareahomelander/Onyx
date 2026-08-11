@@ -1858,6 +1858,110 @@ stops, output budgets, text decoding, streaming, cancellation, metrics, producti
 lifecycle, model-pair or tokenizer compatibility, release `gamma`, live CUDA qualification,
 operating limits, offload, API behavior, dependencies, packaging, native ABI, or macOS changes.
 
+### Final grammar-masked speculative outcome policy
+
+D51 adds the pure `onyx_cuda.grammar_speculative_final_outcome` module and these four public
+symbols:
+
+```python
+GrammarMaskedSpeculativeFinalOutcomeError
+GrammarMaskedSpeculativeFinalOutcomeInvariantError
+GrammarMaskedSpeculativeFinalOutcomeResult
+decide_grammar_masked_speculative_final_outcome
+```
+
+The base error derives from `GrammarMaskedSpeculativeHandoffError`, and the invariant error derives
+from the D51 base. D51 has no cleanup-error type because it acquires no runtime resource. Its
+operation has this exact signature:
+
+```python
+decide_grammar_masked_speculative_final_outcome(
+    handoff_result: GrammarMaskedSpeculativeHandoffResult[StateT],
+    *,
+    vocab_size: int,
+    eos_token_id: int,
+) -> GrammarMaskedSpeculativeFinalOutcomeResult[StateT]
+```
+
+Both scalar policy inputs must be exact non-Boolean built-in integers. `vocab_size` must be positive,
+and `eos_token_id` must be in `[0, vocab_size)`. D51 validates both values before observing the D50
+result, so invalid caller policy is deterministic and non-consuming. The explicit numeric domain
+lets D51 validate accumulated output, a final handoff, and completion EOS without importing a
+tokenizer, model, backend, grammar runtime, or native extension.
+
+The frozen, slotted, state-generic result stores exactly these fields:
+
+```python
+output_token_ids: tuple[int, ...]
+final_iteration: GrammarMaskedSpeculativeIterationResult[StateT]
+final_outcome: GrammarMaskedSpeculativeOutcomeResult
+disposition: Literal[
+    "grammar_complete",
+    "grammar_no_continuation",
+    "iteration_bound_exhausted",
+]
+grammar_completion_token_id: int | None
+```
+
+The first three fields retain the exact D50 objects by identity. The authoritative final state,
+match fact, and optional uncached handoff remain only in `final_iteration`; D51 does not duplicate
+them. The result records no iteration bound, executed count, history, generic finish reason,
+backend, constraint, cache, selector, mask, tokenizer, model, metric, or mutable collection.
+
+The final policy table is:
+
+| Retained D48 kind | Required retained D47 fact | D51 disposition | Completion EOS |
+|---|---|---|---|
+| `grammar_complete` | no handoff and matching committed state | `grammar_complete` | caller EOS |
+| `grammar_no_continuation` | no handoff and nonmatching committed state | `grammar_no_continuation` | none |
+| `handoff_available` | one uncached token ending accumulated output | `iteration_bound_exhausted` | none |
+
+A terminal kind takes precedence over the fact that D50 had a finite caller bound. Only a valid
+final handoff maps to `iteration_bound_exhausted`; conflicting stored evidence is an invariant
+failure. Handoff availability still wins over the committed match fact, so a matching state with a
+handoff is bound exhaustion rather than completion.
+
+The result exposes two derived token views. `visible_token_ids` is always the exact accumulated D50
+`output_token_ids` tuple. On grammar completion, `sampled_token_ids` is that tuple plus exactly one
+caller EOS occurrence; on either other disposition, it is the exact accumulated tuple. The
+completion occurrence is metadata only: it is not appended to D50 output, treated as a handoff,
+inserted into either cache, selected from logits, advanced through the grammar, or used to replace
+or release the final state. Numeric equality with an existing last token does not deduplicate the
+new occurrence.
+
+This deliberately shares target-only generation's sampled-versus-visible completion relationship
+without claiming its lifecycle behavior. Target-only generation owns a fresh constraint, lets EOS
+compete with native continuations at matching states, advances the selected empty-byte EOS, and
+settles runtime resources. D51 receives already-completed D50 evidence and leaves its transferred
+state and all runtime ownership untouched.
+
+D51 returns `grammar_no_continuation` as an explicit disposition rather than raising the target-only
+`GrammarNoContinuationError`. A future production engine may map that disposition to an exception
+only after it owns and proves complete role-root, cache, grammar-state, constraint, selector, and
+metrics settlement. Likewise, D51 does not choose whether bound exhaustion should retry, increase a
+bound, fall back to target-only generation, or surface an error.
+
+After validating the D50 wrapper shape and accumulated numeric output, D51 calls unchanged D48
+exactly once on the retained final D47 result. It requires the recomputed kind to equal the exact
+stored D48 kind, then revalidates the final-output suffix, terminal match relationship, and final
+handoff occurrence. The newly computed D48 object is discarded; the result retains the original
+D50 outcome. Unreadable, tampered, or inconsistent evidence raises
+`GrammarMaskedSpeculativeFinalOutcomeInvariantError`, preserving an underlying attribute or D48
+failure as its cause where applicable.
+
+The D50 result and final state are borrowed during validation. Failure performs no release,
+rollback, reset, retry, or mutation and leaves ownership with the input caller. Success transfers
+that ownership only through the exact retained `final_iteration`; callers must settle the one state
+later through its owning constraint. Opaque state values, including `None`, are read only as stored
+shape and are never compared by value, hashed, stringified, queried, copied, or used as ownership
+flags.
+
+D51 proves only a shared numeric vocabulary boundary. It cannot establish D50 producer provenance,
+tokenizer-byte compatibility, release-pair semantics, or that the caller's numeric EOS is the
+production empty-byte token. It adds no speculative transaction, general stop/output-budget
+precedence, text decoding, streaming, cancellation, metrics, pair loading, production engine, API,
+dependency, packaging, native-ABI, CUDA-qualification, or macOS behavior.
+
 ### Pinned dual-backend one-iteration qualification
 
 D36 qualifies the unchanged D35 signature and transaction through two independent calls to

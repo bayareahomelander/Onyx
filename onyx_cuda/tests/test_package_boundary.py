@@ -190,6 +190,25 @@ def test_package_identifies_the_windows_cuda_variant():
         onyx_cuda.GrammarMaskedSpeculativeHandoffCleanupError,
         onyx_cuda.GrammarMaskedSpeculativeHandoffError,
     )
+    for grammar_final_outcome_symbol in (
+        "GrammarMaskedSpeculativeFinalOutcomeError",
+        "GrammarMaskedSpeculativeFinalOutcomeInvariantError",
+        "GrammarMaskedSpeculativeFinalOutcomeResult",
+        "decide_grammar_masked_speculative_final_outcome",
+    ):
+        exported = getattr(onyx_cuda, grammar_final_outcome_symbol)
+        assert exported.__module__ == (
+            "onyx_cuda.grammar_speculative_final_outcome"
+        )
+        assert grammar_final_outcome_symbol in onyx_cuda.__all__
+    assert issubclass(
+        onyx_cuda.GrammarMaskedSpeculativeFinalOutcomeError,
+        onyx_cuda.GrammarMaskedSpeculativeHandoffError,
+    )
+    assert issubclass(
+        onyx_cuda.GrammarMaskedSpeculativeFinalOutcomeInvariantError,
+        onyx_cuda.GrammarMaskedSpeculativeFinalOutcomeError,
+    )
     for continuation_symbol in (
         "PostIterationContinuationError",
         "PostIterationContinuationInvariantError",

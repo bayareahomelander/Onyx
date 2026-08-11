@@ -90,6 +90,11 @@ Transformers instead of the Apple MLX runtime used by the macOS package.
   classification or the caller's bound, preserves a final bound-exhausted handoff as handoff
   evidence, and rotates temporary roots with ownership bounded independently of that maximum. Its
   result retains only exact accumulated output plus the final transaction/classification evidence.
+- A pure, framework-neutral final grammar-outcome policy over one completed caller-bounded result.
+  It maps matching and nonmatching terminal evidence to explicit completion and no-continuation
+  dispositions, maps a final handoff to iteration-bound exhaustion, and adds caller-supplied EOS
+  only to sampled completion metadata. Visible output, final evidence, cache relationships, and
+  transferred grammar-state ownership remain unchanged.
 - Bounded one-iteration production qualification over two independently loaded pinned 0.5B
   backends on `cuda:0`, covering genuine greedy full acceptance, test-forced mismatch at every
   three-token fixture position, exact role-local cache reconciliation, independent close order, and
@@ -277,11 +282,13 @@ The Windows package does not yet provide:
 
 - a selected two-model draft/target pair or a separate production draft engine;
 - a policy-driven production iterative speculative engine or user-visible speculative decoding;
-- termination or output-budget policy, or a fixed `gamma`;
-- EOS, no-continuation, finish-reason, and output policy for classified grammar empty-support
-  outcomes or a bound-exhausted grammar handoff;
-- speculative EOS, grammar-completion, stop, output-budget, streaming, cancellation, or API
-  integration, and a production/user-visible grammar-aware speculative engine;
+- an unbounded or self-selected speculative loop, or a fixed `gamma`;
+- production exception and lifecycle integration for grammar no-continuation, or retry/fallback
+  policy for an iteration-bound-exhausted handoff;
+- production tokenizer/EOS compatibility, EOS competition while a matching grammar still has
+  native continuations, or general speculative finish-reason, stop, and output-budget precedence;
+- speculative grammar-completion lifecycle integration, streaming, cancellation, or API behavior,
+  and a production/user-visible grammar-aware speculative engine;
 - speculative metrics;
 - final context, output, or concurrency operating limits;
 - CPU offload;
