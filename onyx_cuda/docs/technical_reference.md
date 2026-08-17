@@ -1962,6 +1962,126 @@ production empty-byte token. It adds no speculative transaction, general stop/ou
 precedence, text decoding, streaming, cancellation, metrics, pair loading, production engine, API,
 dependency, packaging, native-ABI, CUDA-qualification, or macOS behavior.
 
+### Request-level grammar-masked termination and continuation policy
+
+D52 adds the pure `onyx_cuda.grammar_speculative_request_policy` module and these four public
+symbols:
+
+```python
+GrammarMaskedSpeculativeRequestPolicyError
+GrammarMaskedSpeculativeRequestPolicyInvariantError
+GrammarMaskedSpeculativeRequestPolicyResult
+decide_grammar_masked_speculative_request_policy
+```
+
+The base error derives from `GrammarMaskedSpeculativeFinalOutcomeError`, and the invariant error
+derives from the D52 base. D52 has no cleanup-error type because it acquires no resource and is not
+authorized to release, roll back, reset, retry, or otherwise settle runtime ownership. The operation
+has this exact signature:
+
+```python
+decide_grammar_masked_speculative_request_policy(
+    final_outcome_result: GrammarMaskedSpeculativeFinalOutcomeResult[StateT],
+    *,
+    vocab_size: int,
+    matched_stop_token_ids: tuple[int, ...] | None,
+    matched_stop_is_eligible: bool,
+    available_output_token_budget: int,
+) -> GrammarMaskedSpeculativeRequestPolicyResult[StateT]
+```
+
+All request evidence is explicit. `vocab_size` and `available_output_token_budget` must be positive
+exact non-Boolean built-in integers, and the eligibility flag must be an exact Boolean. A stop
+candidate is either `None` or an exact nonempty tuple of in-range exact integer token IDs. `None`
+requires a false eligibility flag. A nonempty ineligible candidate is valid evidence but does not
+participate in terminal precedence and is not retained.
+
+The stop tuple is caller-attested evidence, not raw stop configuration. The caller owns ordered
+matching against complete request history and the constrained-generation proof that the grammar
+prefix before the complete suffix was matching. A candidate can therefore cross the boundary
+between a prior request-policy slice and the current D51 output; D52 does not require the tuple to
+be wholly contained in the current slice. D52 does not normalize configured stops, choose a winner,
+or reconstruct prior token or grammar-match history.
+
+`available_output_token_budget` is the number of sampled-token occurrences available immediately
+before the D50/D51 slice represented by the input. It is neither a visible-token count nor the
+request's original maximum. The operation computes:
+
+```python
+consumed = len(final_outcome_result.sampled_token_ids)
+remaining = available_output_token_budget - consumed
+```
+
+The hidden D51 grammar-completion EOS consumes one occurrence. Every stop-token occurrence and every
+repeated numeric token ID also consumes one occurrence. If completed D51 work consumed more than
+the supplied budget, D52 raises `GrammarMaskedSpeculativeRequestPolicyInvariantError`; it cannot
+safely truncate completed output, reverse grammar advancement, or rewrite caches. Zero remaining
+budget is valid, but a zero budget on entry is rejected because the caller should not have started
+the represented slice.
+
+After overrun validation, D52 applies this exact precedence:
+
+| Effective stop | D51 disposition | Remaining budget | D52 request disposition |
+|---|---|---:|---|
+| eligible | any valid D51 disposition | zero or positive | `stop` |
+| none or ineligible | `grammar_complete` | zero or positive | `grammar_complete` |
+| none or ineligible | `grammar_no_continuation` | zero | `output_budget_exhausted` |
+| none or ineligible | `iteration_bound_exhausted` | zero | `output_budget_exhausted` |
+| none or ineligible | `grammar_no_continuation` | positive | `grammar_no_continuation` |
+| none or ineligible | `iteration_bound_exhausted` | positive | `continuation_permitted` |
+
+Stop and grammar completion therefore retain the established target-only ordering. Grammar
+completion also wins a collision with exact budget exhaustion, although its hidden EOS still
+consumes the final occurrence. Budget exhaustion wins a collision with grammar no-continuation so
+the pure policy does not force a future production exception after the request independently
+reached its output limit. Only a bound-exhausted handoff with positive remaining budget and no
+eligible stop permits further work.
+
+The frozen, slotted, state-generic result stores exactly these fields:
+
+```python
+final_outcome_result: GrammarMaskedSpeculativeFinalOutcomeResult[StateT]
+request_disposition: Literal[
+    "stop",
+    "grammar_complete",
+    "output_budget_exhausted",
+    "grammar_no_continuation",
+    "continuation_permitted",
+]
+matched_stop_token_ids: tuple[int, ...] | None
+remaining_output_token_budget: int
+```
+
+`final_outcome_result` is the exact input object. An effective eligible stop is retained by exact
+tuple identity only on `stop`; every other disposition stores `None`. The two token properties
+delegate to D51 unchanged: `sampled_token_ids` keeps hidden completion EOS and complete stop-token
+occurrences, while `visible_token_ids` remains D51's exact accumulated output tuple. D52 performs no
+stop trimming because a stop can span slices and final output composition requires complete request
+history. `request_is_terminal` is false only for `continuation_permitted`, and
+`further_generation_permitted` is its exact complement. The result intentionally has no generic
+finish reason because no-continuation and continuation permission are not public response reasons.
+
+D52 revalidates the genuine D51 wrapper, stored output and evidence types, numeric token domain,
+completion-token relationship, D48 kind, terminal match/handoff facts, final handoff occurrence,
+and delegated sampled/visible views without invoking D47, D48, D49, D50, or D51. Invalid caller
+context uses ordinary `TypeError` or `ValueError`; unreadable, tampered, cross-inconsistent, or
+over-budget completed evidence uses `GrammarMaskedSpeculativeRequestPolicyInvariantError`, with an
+underlying attribute failure retained as its cause where applicable.
+
+Validation borrows the D51 result and its final state. Failure performs no cleanup or mutation and
+leaves ownership with the input caller. Success transfers the same ownership only through the exact
+retained D51 object; the old and new references must not be settled independently. A permitted
+continuation still leaves the final uncached handoff exactly once at the end of D51 output, absent
+from both caches and already represented by the committed grammar state. D52 does not emit or
+advance that token again, choose a new bound, retry, fall back, or execute another transaction.
+
+D52 remains a framework-neutral proof rather than a production speculative engine. Construction of
+request-level stop evidence, final stop trimming and text composition, public finish-reason mapping,
+no-continuation exception/lifecycle settlement, terminal handoff settlement, execution after
+continuation permission, budget prevention before a transaction, tokenizer and release-pair
+compatibility, streaming, cancellation, metrics, pair loading, fixed `gamma`, operating limits,
+offload, API integration, and live CUDA/model qualification remain separate work.
+
 ### Pinned dual-backend one-iteration qualification
 
 D36 qualifies the unchanged D35 signature and transaction through two independent calls to
@@ -2395,9 +2515,11 @@ path, source, package, or import dependency on the root Rust crate.
 The current Windows package does not yet provide:
 
 - a selected two-model draft/target pair or a separate production draft engine;
-- a policy-driven production iterative engine or termination and output-budget policy;
-- EOS, no-continuation, finish-reason, and output policy for classified empty-support outcomes, or
-  a bound-exhausted grammar handoff;
+- a policy-driven production iterative engine or user-visible speculative execution;
+- production stop-evidence construction, stop trimming and final output composition, public
+  finish-reason mapping, or terminal lifecycle settlement over D52 outcomes;
+- production exception/lifecycle handling for grammar no-continuation, or retry/fallback execution
+  for a bound-exhausted grammar handoff after D52 permits continuation;
 - a production/user-visible grammar-aware speculative engine;
 - speculative stops, streaming, cancellation, or acceptance metrics;
 - fixed or adaptive `gamma`;
@@ -2422,6 +2544,8 @@ primitives with target verification and exact cache reconciliation for one polic
 transaction, including zero/no-decision routing. D48 purely classifies the completed D47 route as
 handoff available, grammar complete, or grammar no-continuation. D49 provides its unchanged
 one/at-most-two classified handoff, and D50 adds positive caller-bounded routing with bounded root
-rotation. These deliverables still do not form user-visible speculative decoding without
-EOS/no-continuation, bound-exhaustion, and output policy, a selected pair, and a separately owned
-production iterative engine.
+rotation. D51 maps the final D50 evidence to completion, no-continuation, or bound-exhaustion, and
+D52 applies pure request-level stop and sampled-budget precedence while preserving that evidence.
+These deliverables still do not form user-visible speculative decoding without request-wide stop
+evidence and output composition, production lifecycle settlement and iterative execution, a
+selected pair, and a separately owned production engine.

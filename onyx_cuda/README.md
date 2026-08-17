@@ -95,6 +95,10 @@ Transformers instead of the Apple MLX runtime used by the macOS package.
   dispositions, maps a final handoff to iteration-bound exhaustion, and adds caller-supplied EOS
   only to sampled completion metadata. Visible output, final evidence, cache relationships, and
   transferred grammar-state ownership remain unchanged.
+- A pure, framework-neutral request policy over one completed final grammar outcome plus explicit
+  caller stop and sampled-token-budget evidence. It applies stop/completion/budget/no-continuation/
+  continuation precedence, preserves both D51 token views and all retained evidence, and permits
+  more work only for bound exhaustion with budget remaining and no eligible stop.
 - Bounded one-iteration production qualification over two independently loaded pinned 0.5B
   backends on `cuda:0`, covering genuine greedy full acceptance, test-forced mismatch at every
   three-token fixture position, exact role-local cache reconciliation, independent close order, and
@@ -283,10 +287,12 @@ The Windows package does not yet provide:
 - a selected two-model draft/target pair or a separate production draft engine;
 - a policy-driven production iterative speculative engine or user-visible speculative decoding;
 - an unbounded or self-selected speculative loop, or a fixed `gamma`;
+- production construction of request-level stop evidence, stop trimming and final output
+  composition, terminal lifecycle settlement, or execution after D52 permits continuation;
 - production exception and lifecycle integration for grammar no-continuation, or retry/fallback
   policy for an iteration-bound-exhausted handoff;
 - production tokenizer/EOS compatibility, EOS competition while a matching grammar still has
-  native continuations, or general speculative finish-reason, stop, and output-budget precedence;
+  native continuations, or public speculative finish-reason mapping;
 - speculative grammar-completion lifecycle integration, streaming, cancellation, or API behavior,
   and a production/user-visible grammar-aware speculative engine;
 - speculative metrics;

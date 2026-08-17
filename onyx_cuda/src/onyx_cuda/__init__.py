@@ -72,6 +72,12 @@ from .grammar_speculative_final_outcome import (
     GrammarMaskedSpeculativeFinalOutcomeResult,
     decide_grammar_masked_speculative_final_outcome,
 )
+from .grammar_speculative_request_policy import (
+    GrammarMaskedSpeculativeRequestPolicyError,
+    GrammarMaskedSpeculativeRequestPolicyInvariantError,
+    GrammarMaskedSpeculativeRequestPolicyResult,
+    decide_grammar_masked_speculative_request_policy,
+)
 from .continuation import (
     PostIterationContinuationError,
     PostIterationContinuationInvariantError,
@@ -333,6 +339,9 @@ __all__ = [
     "GrammarMaskedSpeculativeFinalOutcomeError",
     "GrammarMaskedSpeculativeFinalOutcomeInvariantError",
     "GrammarMaskedSpeculativeFinalOutcomeResult",
+    "GrammarMaskedSpeculativeRequestPolicyError",
+    "GrammarMaskedSpeculativeRequestPolicyInvariantError",
+    "GrammarMaskedSpeculativeRequestPolicyResult",
     "GrammarMaskedSpeculativeIterationCleanupError",
     "GrammarMaskedSpeculativeIterationError",
     "GrammarMaskedSpeculativeIterationInvariantError",
@@ -471,6 +480,7 @@ __all__ = [
     "coordinate_grammar_masked_speculative_iteration",
     "coordinate_multi_iteration_grammar_masked_speculative_handoff",
     "decide_grammar_masked_speculative_final_outcome",
+    "decide_grammar_masked_speculative_request_policy",
     "classify_grammar_masked_speculative_outcome",
     "coordinate_multi_iteration_speculative_handoff",
     "coordinate_speculative_iteration",

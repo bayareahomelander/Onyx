@@ -209,6 +209,25 @@ def test_package_identifies_the_windows_cuda_variant():
         onyx_cuda.GrammarMaskedSpeculativeFinalOutcomeInvariantError,
         onyx_cuda.GrammarMaskedSpeculativeFinalOutcomeError,
     )
+    for grammar_request_policy_symbol in (
+        "GrammarMaskedSpeculativeRequestPolicyError",
+        "GrammarMaskedSpeculativeRequestPolicyInvariantError",
+        "GrammarMaskedSpeculativeRequestPolicyResult",
+        "decide_grammar_masked_speculative_request_policy",
+    ):
+        exported = getattr(onyx_cuda, grammar_request_policy_symbol)
+        assert exported.__module__ == (
+            "onyx_cuda.grammar_speculative_request_policy"
+        )
+        assert grammar_request_policy_symbol in onyx_cuda.__all__
+    assert issubclass(
+        onyx_cuda.GrammarMaskedSpeculativeRequestPolicyError,
+        onyx_cuda.GrammarMaskedSpeculativeFinalOutcomeError,
+    )
+    assert issubclass(
+        onyx_cuda.GrammarMaskedSpeculativeRequestPolicyInvariantError,
+        onyx_cuda.GrammarMaskedSpeculativeRequestPolicyError,
+    )
     for continuation_symbol in (
         "PostIterationContinuationError",
         "PostIterationContinuationInvariantError",
