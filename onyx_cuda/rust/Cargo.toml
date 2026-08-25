@@ -1,0 +1,8 @@
+[package]
+name = "onyx_cuda_rust"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "_rust"
+crate-type = ["cdylib", "rlib"]
