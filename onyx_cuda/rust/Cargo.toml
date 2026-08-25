@@ -6,3 +6,9 @@ edition = "2021"
 [lib]
 name = "_rust"
 crate-type = ["cdylib", "rlib"]
+
+[features]
+extension-module = ["pyo3/extension-module"]
+
+[dependencies]
+pyo3 = "0.22"

@@ -1,6 +1,6 @@
 [build-system]
-requires = ["setuptools>=69"]
-build-backend = "setuptools.build_meta"
+requires = ["maturin==1.14.1"]
+build-backend = "maturin"
 
 [project]
 name = "onyx-cuda"
@@ -18,8 +18,11 @@ dev = [
     "pytest==9.1.1",
 ]
 
-[tool.setuptools.packages.find]
-where = ["src"]
+[tool.maturin]
+features = ["extension-module"]
+python-source = "src"
+module-name = "onyx_cuda._rust"
+manifest-path = "rust/Cargo.toml"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
