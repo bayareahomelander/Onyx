@@ -29,13 +29,21 @@ result = prefill(loaded.model, prompt.token_ids)
 print(loaded.tokenizer.decode(result.token_id.tolist()))
 print(result.past_key_values.get_seq_length())
 
-generated = generate_greedy(loaded.model, prompt.token_ids, max_tokens=16)
+stop_sequences = [loaded.tokenizer.encode(" Ready", add_special_tokens=False)]
+generated = generate_greedy(
+    loaded.model,
+    prompt.token_ids,
+    max_tokens=16,
+    eos_token_ids=loaded.tokenizer.eos_token_id,
+    stop_sequences=stop_sequences,
+)
 print(loaded.tokenizer.decode(generated.token_ids, skip_special_tokens=True))
+print(generated.finish_reason)
 ```
 
 The Qwen chat template uses `<|im_end|>` (ID 151645) as EOS, `<|endoftext|>` (ID 151643) as padding, and no BOS token. A formatted prompt ends with `<|im_start|>assistant\n` rather than EOS so generation can begin. API request models and fallback prompt formatting are not implemented yet.
 
-The single prefill returns last-position vocabulary logits, a Transformers dynamic KV cache on CUDA, and one greedy CUDA token. The batch-one greedy loop reuses that cache for one-token forwards and stops at a configured model EOS token or `max_tokens`. Stop sequences and sampling are not implemented yet.
+The single prefill returns last-position vocabulary logits, a Transformers dynamic KV cache on CUDA, and one greedy CUDA token. The batch-one greedy loop reuses that cache for one-token forwards and reports `eos`, `stop`, or `length`. Explicit token stop sequences can span tokens; the longest matching suffix is removed before decode. Sampling, text-fragment buffering, and SSE are not implemented yet.
 
 The model is downloaded to the external Hugging Face cache. Loading fails instead of falling back to CPU when CUDA is unavailable.
 

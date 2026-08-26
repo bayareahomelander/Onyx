@@ -24,4 +24,6 @@ def test_prefill_fails_with_cpu_model():
 
 def test_generate_greedy_rejects_nonpositive_limit():
     with pytest.raises(ValueError, match="max_tokens must be at least 1"):
-        generate_greedy(torch.nn.Linear(1, 1), [0], max_tokens=0)
+        generate_greedy(
+            torch.nn.Linear(1, 1), [0], max_tokens=0, eos_token_ids=[]
+        )
