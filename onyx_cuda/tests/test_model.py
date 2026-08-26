@@ -1,6 +1,9 @@
+import gc
+
 import torch
 from transformers.cache_utils import DynamicCache
 
+from onyx_cuda.generation import generate_greedy
 from onyx_cuda.model import load_model
 from onyx_cuda.prefill import prefill
 from onyx_cuda.prompt import format_prompt
@@ -44,7 +47,7 @@ EXPECTED_PROMPT_TOKEN_IDS = [
 ]
 
 
-def test_load_model_prompt_and_prefill_on_cuda():
+def test_load_model_prompt_prefill_and_generation_on_cuda():
     device = torch.device("cuda:0")
     torch.cuda.set_device(device)
     torch.cuda.empty_cache()
@@ -113,9 +116,69 @@ def test_load_model_prompt_and_prefill_on_cuda():
         assert layer.keys.device == layer.values.device == device
         assert layer.keys.dtype == layer.values.dtype == torch.float16
 
+    del result, cache
+    gc.collect()
+    torch.cuda.empty_cache()
+
+    input_ids = torch.tensor([prompt.token_ids], device=device)
+    attention_mask = torch.ones_like(input_ids)
+    with torch.inference_mode():
+        reference = loaded.model.generate(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            do_sample=False,
+            max_new_tokens=16,
+            use_cache=True,
+            pad_token_id=loaded.tokenizer.pad_token_id,
+            temperature=None,
+            top_p=None,
+            top_k=None,
+        )
+        limited_reference = loaded.model.generate(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            do_sample=False,
+            max_new_tokens=2,
+            use_cache=True,
+            pad_token_id=loaded.tokenizer.pad_token_id,
+            temperature=None,
+            top_p=None,
+            top_k=None,
+        )
+
+    expected = reference[0, len(prompt.token_ids) :].tolist()
+    limited_expected = limited_reference[0, len(prompt.token_ids) :].tolist()
+    generated = generate_greedy(loaded.model, prompt.token_ids, max_tokens=16)
+    limited = generate_greedy(loaded.model, prompt.token_ids, max_tokens=2)
+
+    assert generated.token_ids == expected == [80285, 30982, 151645]
+    assert generated.token_ids[-1] in loaded.model.generation_config.eos_token_id
+    assert generated.past_key_values.get_seq_length() == (
+        len(prompt.token_ids) + len(generated.token_ids) - 1
+    )
+    assert limited.token_ids == limited_expected == [80285, 30982]
+    assert len(limited.token_ids) == 2
+    assert limited.past_key_values.get_seq_length() == len(prompt.token_ids) + 1
+
+    del generated, limited, reference, limited_reference
+    gc.collect()
+    torch.cuda.empty_cache()
+    allocation_baseline = torch.cuda.memory_allocated(device)
+    allocations = []
+    for _ in range(3):
+        completed = generate_greedy(loaded.model, prompt.token_ids, max_tokens=16)
+        torch.cuda.synchronize(device)
+        del completed
+        gc.collect()
+        torch.cuda.empty_cache()
+        allocations.append(torch.cuda.memory_allocated(device))
+
+    assert allocations == [allocation_baseline] * 3
     assert torch.cuda.max_memory_allocated(device) < torch.cuda.get_device_properties(device).total_memory
 
     print(f"model_revision={loaded.revision}")
     print(f"prompt_token_count={len(prompt.token_ids)}")
-    print(f"greedy_token={result.token_id.item()}:{loaded.tokenizer.decode(result.token_id.tolist())}")
+    print(f"generated_token_ids={expected}")
+    print(f"generated_text={loaded.tokenizer.decode(expected)!r}")
+    print(f"allocation_baseline_bytes={allocation_baseline}")
     print(f"peak_allocated_bytes={torch.cuda.max_memory_allocated(device)}")

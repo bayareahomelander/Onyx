@@ -7,6 +7,7 @@ Onyx CUDA is the Windows and NVIDIA CUDA edition of Onyx, currently under develo
 The package can load the `Qwen/Qwen2.5-0.5B-Instruct` tokenizer and FP16 causal model on `cuda:0` without CPU offload:
 
 ```python
+from onyx_cuda.generation import generate_greedy
 from onyx_cuda.model import load_model
 from onyx_cuda.prefill import prefill
 from onyx_cuda.prompt import format_prompt
@@ -27,11 +28,14 @@ print(prompt.token_ids)
 result = prefill(loaded.model, prompt.token_ids)
 print(loaded.tokenizer.decode(result.token_id.tolist()))
 print(result.past_key_values.get_seq_length())
+
+generated = generate_greedy(loaded.model, prompt.token_ids, max_tokens=16)
+print(loaded.tokenizer.decode(generated.token_ids, skip_special_tokens=True))
 ```
 
 The Qwen chat template uses `<|im_end|>` (ID 151645) as EOS, `<|endoftext|>` (ID 151643) as padding, and no BOS token. A formatted prompt ends with `<|im_start|>assistant\n` rather than EOS so generation can begin. API request models and fallback prompt formatting are not implemented yet.
 
-The single prefill returns last-position vocabulary logits, a Transformers dynamic KV cache on CUDA, and one greedy CUDA token. A cached generation loop is not implemented yet.
+The single prefill returns last-position vocabulary logits, a Transformers dynamic KV cache on CUDA, and one greedy CUDA token. The batch-one greedy loop reuses that cache for one-token forwards and stops at a configured model EOS token or `max_tokens`. Stop sequences and sampling are not implemented yet.
 
 The model is downloaded to the external Hugging Face cache. Loading fails instead of falling back to CPU when CUDA is unavailable.
 
