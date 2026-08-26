@@ -2,6 +2,19 @@
 
 Onyx CUDA is the Windows and NVIDIA CUDA edition of Onyx, currently under development.
 
+## Current capability
+
+The package can load the `Qwen/Qwen2.5-0.5B-Instruct` tokenizer and FP16 causal model on `cuda:0` without CPU offload:
+
+```python
+from onyx_cuda.model import load_model
+
+loaded = load_model()
+print(loaded.revision)
+```
+
+The model is downloaded to the external Hugging Face cache. Loading fails instead of falling back to CPU when CUDA is unavailable.
+
 ## Windows development setup
 
 Prerequisites are 64-bit Windows, Python 3.12, an NVIDIA GPU and driver, the Rust MSVC toolchain, and Visual Studio Build Tools with the C++ workload.
