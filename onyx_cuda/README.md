@@ -8,10 +8,23 @@ The package can load the `Qwen/Qwen2.5-0.5B-Instruct` tokenizer and FP16 causal 
 
 ```python
 from onyx_cuda.model import load_model
+from onyx_cuda.prompt import format_prompt
 
 loaded = load_model()
 print(loaded.revision)
+
+prompt = format_prompt(
+    loaded.tokenizer,
+    [
+        {"role": "system", "content": "You are a concise assistant."},
+        {"role": "user", "content": "Reply with CUDA ready."},
+    ],
+)
+print(prompt.text)
+print(prompt.token_ids)
 ```
+
+The Qwen chat template uses `<|im_end|>` (ID 151645) as EOS, `<|endoftext|>` (ID 151643) as padding, and no BOS token. A formatted prompt ends with `<|im_start|>assistant\n` rather than EOS so generation can begin. API request models and fallback prompt formatting are not implemented yet.
 
 The model is downloaded to the external Hugging Face cache. Loading fails instead of falling back to CPU when CUDA is unavailable.
 
