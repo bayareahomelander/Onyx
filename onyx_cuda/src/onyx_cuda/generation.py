@@ -1,5 +1,6 @@
-"""Cached greedy generation."""
+"""Cached token generation."""
 
+import math
 from typing import Literal, NamedTuple
 
 import torch
@@ -28,16 +29,52 @@ def _matched_stop_length(
     )
 
 
-def generate_greedy(
+def _sample_token(
+    logits: torch.Tensor,
+    temperature: float,
+    top_p: float,
+    generator: torch.Generator | None,
+) -> torch.Tensor:
+    if temperature == 0:
+        return logits.argmax(dim=-1)
+
+    probabilities = torch.softmax(logits.float() / temperature, dim=-1)
+    if top_p < 1:
+        sorted_probabilities, sorted_indices = probabilities.sort(
+            dim=-1, descending=True
+        )
+        cumulative_probabilities = sorted_probabilities.cumsum(dim=-1)
+        sorted_probabilities.masked_fill_(
+            cumulative_probabilities - sorted_probabilities >= top_p, 0
+        )
+        sorted_probabilities /= sorted_probabilities.sum(dim=-1, keepdim=True)
+        sampled_index = torch.multinomial(
+            sorted_probabilities, 1, generator=generator
+        )
+        return sorted_indices.gather(-1, sampled_index).squeeze(-1)
+
+    return torch.multinomial(probabilities, 1, generator=generator).squeeze(-1)
+
+
+def generate_tokens(
     model: PreTrainedModel,
     prompt_token_ids: list[int],
     max_tokens: int,
     eos_token_ids: int | list[int],
     stop_sequences: list[list[int]] | None = None,
+    temperature: float = 0.0,
+    top_p: float = 1.0,
+    seed: int | None = None,
 ) -> GenerationResult:
-    """Generate at most max_tokens with a batch-one dynamic cache."""
+    """Generate at most max_tokens with greedy or top-p sampling."""
     if max_tokens < 1:
         raise ValueError("max_tokens must be at least 1")
+    if not math.isfinite(temperature) or temperature < 0:
+        raise ValueError("temperature must be finite and nonnegative")
+    if not math.isfinite(top_p) or not 0 < top_p <= 1:
+        raise ValueError("top_p must be finite and in (0, 1]")
+    if seed is not None and not isinstance(seed, int):
+        raise ValueError("seed must be an integer")
 
     if isinstance(eos_token_ids, int):
         eos_token_ids = [eos_token_ids]
@@ -48,7 +85,11 @@ def generate_greedy(
     with torch.inference_mode():
         result = prefill(model, prompt_token_ids)
         cache = result.past_key_values
-        token_id = result.token_id
+        generator = None
+        if temperature > 0 and seed is not None:
+            generator = torch.Generator(device=result.logits.device)
+            generator.manual_seed(seed)
+        token_id = _sample_token(result.logits, temperature, top_p, generator)
 
         for step in range(max_tokens):
             token = token_id.item()
@@ -71,6 +112,8 @@ def generate_greedy(
                 use_cache=True,
             )
             cache = output.past_key_values
-            token_id = output.logits[:, -1, :].argmax(dim=-1)
+            token_id = _sample_token(
+                output.logits[:, -1, :], temperature, top_p, generator
+            )
 
     return GenerationResult(generated, cache, finish_reason)

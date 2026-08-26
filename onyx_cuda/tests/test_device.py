@@ -2,7 +2,7 @@ import pytest
 import torch
 
 from onyx_cuda.device import require_cuda
-from onyx_cuda.generation import generate_greedy
+from onyx_cuda.generation import generate_tokens
 from onyx_cuda.prefill import prefill
 
 
@@ -22,8 +22,18 @@ def test_prefill_fails_with_cpu_model():
         prefill(torch.nn.Linear(1, 1), [0])
 
 
-def test_generate_greedy_rejects_nonpositive_limit():
-    with pytest.raises(ValueError, match="max_tokens must be at least 1"):
-        generate_greedy(
-            torch.nn.Linear(1, 1), [0], max_tokens=0, eos_token_ids=[]
-        )
+def test_generate_tokens_rejects_invalid_options_before_generation():
+    cases = [
+        ({"max_tokens": 0}, "max_tokens"),
+        ({"temperature": -0.1}, "temperature"),
+        ({"temperature": float("inf")}, "temperature"),
+        ({"temperature": float("nan")}, "temperature"),
+        ({"top_p": 0.0}, "top_p"),
+        ({"top_p": 1.1}, "top_p"),
+        ({"top_p": float("nan")}, "top_p"),
+        ({"seed": 1.5}, "seed"),
+    ]
+    for overrides, message in cases:
+        options = {"max_tokens": 1, "eos_token_ids": [], **overrides}
+        with pytest.raises(ValueError, match=message):
+            generate_tokens(torch.nn.Linear(1, 1), [0], **options)

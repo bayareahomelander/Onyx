@@ -3,7 +3,7 @@ import gc
 import torch
 from transformers.cache_utils import DynamicCache
 
-from onyx_cuda.generation import generate_greedy
+from onyx_cuda.generation import generate_tokens
 from onyx_cuda.model import load_model
 from onyx_cuda.prefill import prefill
 from onyx_cuda.prompt import format_prompt
@@ -149,13 +149,15 @@ def test_load_model_prompt_prefill_and_generation_on_cuda():
     expected = reference[0, len(prompt.token_ids) :].tolist()
     limited_expected = limited_reference[0, len(prompt.token_ids) :].tolist()
     eos_token_id = loaded.tokenizer.eos_token_id
-    generated = generate_greedy(
+    generated = generate_tokens(
         loaded.model,
         prompt.token_ids,
         max_tokens=16,
         eos_token_ids=eos_token_id,
+        temperature=0.0,
+        top_p=0.1,
     )
-    limited = generate_greedy(
+    limited = generate_tokens(
         loaded.model,
         prompt.token_ids,
         max_tokens=2,
@@ -180,21 +182,21 @@ def test_load_model_prompt_prefill_and_generation_on_cuda():
     assert one_token_stop_ids == [30982]
     assert multi_token_stop_ids == [80285, 30982]
 
-    one_token_stop = generate_greedy(
+    one_token_stop = generate_tokens(
         loaded.model,
         prompt.token_ids,
         max_tokens=16,
         eos_token_ids=eos_token_id,
         stop_sequences=[one_token_stop_ids],
     )
-    multi_token_stop = generate_greedy(
+    multi_token_stop = generate_tokens(
         loaded.model,
         prompt.token_ids,
         max_tokens=16,
         eos_token_ids=eos_token_id,
         stop_sequences=[multi_token_stop_ids],
     )
-    overlapping_stops = generate_greedy(
+    overlapping_stops = generate_tokens(
         loaded.model,
         prompt.token_ids,
         max_tokens=16,
@@ -210,12 +212,36 @@ def test_load_model_prompt_prefill_and_generation_on_cuda():
     assert overlapping_stops.token_ids == []
     assert overlapping_stops.finish_reason == "stop"
 
+    sampled_a = generate_tokens(
+        loaded.model,
+        prompt.token_ids,
+        max_tokens=8,
+        eos_token_ids=eos_token_id,
+        temperature=0.8,
+        top_p=0.9,
+        seed=1234,
+    )
+    sampled_b = generate_tokens(
+        loaded.model,
+        prompt.token_ids,
+        max_tokens=8,
+        eos_token_ids=eos_token_id,
+        temperature=0.8,
+        top_p=0.9,
+        seed=1234,
+    )
+    assert sampled_a.token_ids == sampled_b.token_ids
+    assert sampled_a.finish_reason == sampled_b.finish_reason
+    sampled_token_ids = sampled_a.token_ids
+
     del (
         generated,
         limited,
         one_token_stop,
         multi_token_stop,
         overlapping_stops,
+        sampled_a,
+        sampled_b,
         reference,
         limited_reference,
     )
@@ -224,7 +250,7 @@ def test_load_model_prompt_prefill_and_generation_on_cuda():
     allocation_baseline = torch.cuda.memory_allocated(device)
     allocations = []
     for _ in range(3):
-        completed = generate_greedy(
+        completed = generate_tokens(
             loaded.model,
             prompt.token_ids,
             max_tokens=16,
@@ -243,6 +269,7 @@ def test_load_model_prompt_prefill_and_generation_on_cuda():
     print(f"prompt_token_count={len(prompt.token_ids)}")
     print(f"generated_token_ids={expected}")
     print(f"generated_text={loaded.tokenizer.decode(expected)!r}")
+    print(f"sampled_token_ids={sampled_token_ids}")
     print("finish_reasons=eos,stop,length")
     print(f"allocation_baseline_bytes={allocation_baseline}")
     print(f"peak_allocated_bytes={torch.cuda.max_memory_allocated(device)}")

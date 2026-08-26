@@ -7,7 +7,7 @@ Onyx CUDA is the Windows and NVIDIA CUDA edition of Onyx, currently under develo
 The package can load the `Qwen/Qwen2.5-0.5B-Instruct` tokenizer and FP16 causal model on `cuda:0` without CPU offload:
 
 ```python
-from onyx_cuda.generation import generate_greedy
+from onyx_cuda.generation import generate_tokens
 from onyx_cuda.model import load_model
 from onyx_cuda.prefill import prefill
 from onyx_cuda.prompt import format_prompt
@@ -30,12 +30,15 @@ print(loaded.tokenizer.decode(result.token_id.tolist()))
 print(result.past_key_values.get_seq_length())
 
 stop_sequences = [loaded.tokenizer.encode(" Ready", add_special_tokens=False)]
-generated = generate_greedy(
+generated = generate_tokens(
     loaded.model,
     prompt.token_ids,
     max_tokens=16,
     eos_token_ids=loaded.tokenizer.eos_token_id,
     stop_sequences=stop_sequences,
+    temperature=0.8,
+    top_p=0.9,
+    seed=1234,
 )
 print(loaded.tokenizer.decode(generated.token_ids, skip_special_tokens=True))
 print(generated.finish_reason)
@@ -43,7 +46,7 @@ print(generated.finish_reason)
 
 The Qwen chat template uses `<|im_end|>` (ID 151645) as EOS, `<|endoftext|>` (ID 151643) as padding, and no BOS token. A formatted prompt ends with `<|im_start|>assistant\n` rather than EOS so generation can begin. API request models and fallback prompt formatting are not implemented yet.
 
-The single prefill returns last-position vocabulary logits, a Transformers dynamic KV cache on CUDA, and one greedy CUDA token. The batch-one greedy loop reuses that cache for one-token forwards and reports `eos`, `stop`, or `length`. Explicit token stop sequences can span tokens; the longest matching suffix is removed before decode. Sampling, text-fragment buffering, and SSE are not implemented yet.
+The single prefill returns last-position vocabulary logits, a Transformers dynamic KV cache on CUDA, and one greedy CUDA token. Generation reuses that cache and supports greedy decoding at temperature zero or seeded temperature/top-p sampling. It reports `eos`, `stop`, or `length`; explicit token stop sequences can span tokens, and the longest matching suffix is removed before decode. Beam search, batching, repetition penalties, text-fragment buffering, and SSE are not implemented yet.
 
 The model is downloaded to the external Hugging Face cache. Loading fails instead of falling back to CPU when CUDA is unavailable.
 
