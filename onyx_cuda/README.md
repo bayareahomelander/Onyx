@@ -1,8 +1,6 @@
 # Onyx CUDA
 
-Independent Windows and NVIDIA CUDA implementation of Onyx.
-
-This project must not import from or modify the macOS `onyx` runtime.
+Onyx CUDA is the Windows and NVIDIA CUDA edition of Onyx, currently under development.
 
 ## Windows development setup
 
@@ -30,16 +28,3 @@ Install the CUDA wheel before the project dependency so pip cannot silently sele
 | Rust/Cargo | 1.96.1 |
 | NVIDIA driver | 610.88 |
 | GPU | GeForce RTX 4050 Laptop GPU (6 GB) |
-
-## Phase 1 verification
-
-Run the durable checks from this directory:
-
-```powershell
-cargo test --manifest-path rust/Cargo.toml
-.\.venv\Scripts\python.exe -m pytest -q
-.\.venv\Scripts\python.exe -m pip check
-.\.venv\Scripts\python.exe -c "import torch; from onyx_cuda import _rust; from onyx_cuda.device import require_cuda; device = require_cuda(); value = (torch.ones(1, device=device) + 1).item(); torch.cuda.synchronize(device); assert value == 2"
-```
-
-The last command deliberately fails if CUDA is unavailable; Onyx CUDA does not silently fall back to CPU.
