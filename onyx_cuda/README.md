@@ -8,6 +8,7 @@ The package can load the `Qwen/Qwen2.5-0.5B-Instruct` tokenizer and FP16 causal 
 
 ```python
 from onyx_cuda.model import load_model
+from onyx_cuda.prefill import prefill
 from onyx_cuda.prompt import format_prompt
 
 loaded = load_model()
@@ -22,9 +23,15 @@ prompt = format_prompt(
 )
 print(prompt.text)
 print(prompt.token_ids)
+
+result = prefill(loaded.model, prompt.token_ids)
+print(loaded.tokenizer.decode(result.token_id.tolist()))
+print(result.past_key_values.get_seq_length())
 ```
 
 The Qwen chat template uses `<|im_end|>` (ID 151645) as EOS, `<|endoftext|>` (ID 151643) as padding, and no BOS token. A formatted prompt ends with `<|im_start|>assistant\n` rather than EOS so generation can begin. API request models and fallback prompt formatting are not implemented yet.
+
+The single prefill returns last-position vocabulary logits, a Transformers dynamic KV cache on CUDA, and one greedy CUDA token. A cached generation loop is not implemented yet.
 
 The model is downloaded to the external Hugging Face cache. Loading fails instead of falling back to CPU when CUDA is unavailable.
 
