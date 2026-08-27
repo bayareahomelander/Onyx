@@ -1,6 +1,7 @@
 """Cached token generation."""
 
 import math
+import time
 from typing import Literal, NamedTuple
 
 import torch
@@ -14,6 +15,13 @@ class GenerationResult(NamedTuple):
     token_ids: list[int]
     past_key_values: Cache
     finish_reason: Literal["eos", "stop", "length"]
+    timings: "GenerationTimings | None" = None
+
+
+class GenerationTimings(NamedTuple):
+    time_to_first_token_seconds: float
+    decode_tokens_per_second: float | None
+    total_seconds: float
 
 
 def _matched_stop_length(
@@ -65,6 +73,7 @@ def generate_tokens(
     temperature: float = 0.0,
     top_p: float = 1.0,
     seed: int | None = None,
+    measure: bool = False,
 ) -> GenerationResult:
     """Generate at most max_tokens with greedy or top-p sampling."""
     if max_tokens < 1:
@@ -82,6 +91,14 @@ def generate_tokens(
 
     generated: list[int] = []
     finish_reason: Literal["eos", "stop", "length"] = "length"
+    started_at = None
+    time_to_first_token = None
+    if measure:
+        device = next(model.parameters()).device
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        started_at = time.perf_counter()
+
     with torch.inference_mode():
         result = prefill(model, prompt_token_ids)
         cache = result.past_key_values
@@ -93,6 +110,8 @@ def generate_tokens(
 
         for step in range(max_tokens):
             token = token_id.item()
+            if started_at is not None and time_to_first_token is None:
+                time_to_first_token = time.perf_counter() - started_at
             generated.append(token)
 
             matched_stop_length = _matched_stop_length(generated, stop_sequences)
@@ -116,4 +135,21 @@ def generate_tokens(
                 output.logits[:, -1, :], temperature, top_p, generator
             )
 
-    return GenerationResult(generated, cache, finish_reason)
+    timings = None
+    if started_at is not None and time_to_first_token is not None:
+        torch.cuda.synchronize(result.logits.device)
+        total_seconds = time.perf_counter() - started_at
+        decode_seconds = total_seconds - time_to_first_token
+        decode_token_count = max(len(generated) - 1, 0)
+        decode_tokens_per_second = (
+            decode_token_count / decode_seconds
+            if decode_token_count and decode_seconds > 0
+            else None
+        )
+        timings = GenerationTimings(
+            time_to_first_token,
+            decode_tokens_per_second,
+            total_seconds,
+        )
+
+    return GenerationResult(generated, cache, finish_reason, timings)

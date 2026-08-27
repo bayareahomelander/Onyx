@@ -48,6 +48,8 @@ The Qwen chat template uses `<|im_end|>` (ID 151645) as EOS, `<|endoftext|>` (ID
 
 The single prefill returns last-position vocabulary logits, a Transformers dynamic KV cache on CUDA, and one greedy CUDA token. Generation reuses that cache and supports greedy decoding at temperature zero or seeded temperature/top-p sampling. It reports `eos`, `stop`, or `length`; explicit token stop sequences can span tokens, and the longest matching suffix is removed before decode. Beam search, batching, repetition penalties, text-fragment buffering, and SSE are not implemented yet.
 
+Pass `measure=True` to `generate_tokens()` to include synchronized time to first token, decode tokens per second, and total generation time in `result.timings`.
+
 The model is downloaded to the external Hugging Face cache. Loading fails instead of falling back to CPU when CUDA is unavailable.
 
 ## Windows development setup
@@ -76,3 +78,13 @@ Install the CUDA wheel before the project dependency so pip cannot silently sele
 | Rust/Cargo | 1.96.1 |
 | NVIDIA driver | 610.88 |
 | GPU | GeForce RTX 4050 Laptop GPU (6 GB) |
+
+## Baseline benchmark
+
+After installing the development environment, run the fixed greedy benchmark from this directory:
+
+```powershell
+.\.venv\Scripts\python.exe -m onyx_cuda.benchmark
+```
+
+It warms up three fixed prompts, measures each three times, verifies stable token IDs, termination reasons, and post-run CUDA allocation, then writes raw results to the ignored `benchmarks/results/phase2_baseline.json` file.

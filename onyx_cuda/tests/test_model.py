@@ -156,6 +156,7 @@ def test_load_model_prompt_prefill_and_generation_on_cuda():
         eos_token_ids=eos_token_id,
         temperature=0.0,
         top_p=0.1,
+        measure=True,
     )
     limited = generate_tokens(
         loaded.model,
@@ -167,12 +168,19 @@ def test_load_model_prompt_prefill_and_generation_on_cuda():
     assert generated.token_ids == expected == [80285, 30982, 151645]
     assert generated.token_ids[-1] == eos_token_id
     assert generated.finish_reason == "eos"
+    assert generated.timings is not None
+    assert generated.timings.time_to_first_token_seconds > 0
+    assert generated.timings.decode_tokens_per_second > 0
+    assert generated.timings.total_seconds >= (
+        generated.timings.time_to_first_token_seconds
+    )
     assert generated.past_key_values.get_seq_length() == (
         len(prompt.token_ids) + len(generated.token_ids) - 1
     )
     assert limited.token_ids == limited_expected == [80285, 30982]
     assert len(limited.token_ids) == 2
     assert limited.finish_reason == "length"
+    assert limited.timings is None
     assert limited.past_key_values.get_seq_length() == len(prompt.token_ids) + 1
 
     one_token_stop_ids = loaded.tokenizer.encode(" Ready", add_special_tokens=False)
