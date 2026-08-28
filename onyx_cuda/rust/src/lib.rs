@@ -3,6 +3,7 @@
 use pyo3::prelude::*;
 
 mod constraint;
+mod json_engine;
 mod regex_engine;
 mod schema;
 
