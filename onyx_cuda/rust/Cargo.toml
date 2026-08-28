@@ -12,3 +12,6 @@ extension-module = ["pyo3/extension-module"]
 
 [dependencies]
 pyo3 = "0.22"
+regex = "1"
+regex-automata = { version = "0.4", features = ["dfa", "dfa-build", "dfa-search", "syntax"] }
+serde_json = "1"
