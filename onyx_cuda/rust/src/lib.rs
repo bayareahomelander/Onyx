@@ -7,8 +7,10 @@ mod grammar;
 mod json_engine;
 mod regex_engine;
 mod schema;
+use grammar::GrammarConstraint;
 
 #[pymodule]
-fn _rust(_module: &Bound<'_, PyModule>) -> PyResult<()> {
+fn _rust(module: &Bound<'_, PyModule>) -> PyResult<()> {
+    module.add_class::<GrammarConstraint>()?;
     Ok(())
 }

@@ -52,6 +52,8 @@ Pass `measure=True` to `generate_tokens()` to include synchronized time to first
 
 The model is downloaded to the external Hugging Face cache. Loading fails instead of falling back to CPU when CUDA is unavailable.
 
+The native extension also exposes `onyx_cuda._rust.GrammarConstraint` for model-free regex and JSON-schema compilation with branchable opaque state handles. Tokenizer vocabulary mapping, GPU logit masking, and constrained `generate_tokens()` integration are not implemented yet.
+
 ## Windows development setup
 
 Prerequisites are 64-bit Windows, Python 3.12, an NVIDIA GPU and driver, the Rust MSVC toolchain, and Visual Studio Build Tools with the C++ workload.

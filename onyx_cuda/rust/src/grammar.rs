@@ -2,15 +2,23 @@
 
 use std::collections::HashMap;
 
+use pyo3::exceptions::PyValueError;
+use pyo3::prelude::*;
+
 use crate::constraint::{ConstraintEngine, ConstraintError};
 use crate::json_engine::JsonEngine;
 use crate::regex_engine::RegexEngine;
 
+#[pyclass(module = "onyx_cuda._rust")]
 pub struct GrammarConstraint {
     vocabulary: Vec<Vec<u8>>,
     initial_engine: Option<Box<dyn ConstraintEngine>>,
     states: HashMap<u32, Box<dyn ConstraintEngine>>,
     next_state_id: u32,
+}
+
+fn constraint_error_to_value_error(error: ConstraintError) -> PyErr {
+    PyValueError::new_err(error.to_string())
 }
 
 impl GrammarConstraint {
@@ -130,6 +138,77 @@ impl GrammarConstraint {
             self.states.remove(&state);
         }
         Ok(())
+    }
+}
+
+#[pymethods]
+impl GrammarConstraint {
+    #[new]
+    fn py_new(vocabulary: Vec<Vec<u8>>) -> PyResult<Self> {
+        Self::new(vocabulary).map_err(constraint_error_to_value_error)
+    }
+
+    #[pyo3(name = "compile_regex")]
+    fn py_compile_regex(&mut self, pattern: &str) -> PyResult<()> {
+        self.compile_regex(pattern)
+            .map_err(constraint_error_to_value_error)
+    }
+
+    #[pyo3(name = "compile_json_schema")]
+    fn py_compile_json_schema(&mut self, schema: &str) -> PyResult<()> {
+        self.compile_json_schema(schema)
+            .map_err(constraint_error_to_value_error)
+    }
+
+    #[pyo3(name = "init_state")]
+    fn py_init_state(&mut self) -> PyResult<u32> {
+        self.init_state().map_err(constraint_error_to_value_error)
+    }
+
+    #[pyo3(name = "advance_state")]
+    fn py_advance_state(&mut self, state: u32, token_id: usize) -> PyResult<u32> {
+        self.advance_state(state, token_id)
+            .map_err(constraint_error_to_value_error)
+    }
+
+    #[pyo3(name = "get_valid_token_ids")]
+    fn py_get_valid_token_ids(&self, state: u32) -> PyResult<Vec<usize>> {
+        self.get_valid_token_ids(state)
+            .map_err(constraint_error_to_value_error)
+    }
+
+    #[pyo3(name = "is_match_state")]
+    fn py_is_match_state(&self, state: u32) -> PyResult<bool> {
+        self.is_match_state(state)
+            .map_err(constraint_error_to_value_error)
+    }
+
+    #[pyo3(name = "is_dead_state")]
+    fn py_is_dead_state(&self, state: u32) -> PyResult<bool> {
+        self.is_dead_state(state)
+            .map_err(constraint_error_to_value_error)
+    }
+
+    #[pyo3(name = "reset")]
+    fn py_reset(&mut self) -> PyResult<()> {
+        self.reset().map_err(constraint_error_to_value_error)
+    }
+
+    #[pyo3(name = "vocab_size")]
+    fn py_vocab_size(&self) -> usize {
+        self.vocab_size()
+    }
+
+    #[pyo3(name = "release_state")]
+    fn py_release_state(&mut self, state: u32) -> PyResult<()> {
+        self.release_state(state)
+            .map_err(constraint_error_to_value_error)
+    }
+
+    #[pyo3(name = "release_states")]
+    fn py_release_states(&mut self, states: Vec<u32>) -> PyResult<()> {
+        self.release_states(states)
+            .map_err(constraint_error_to_value_error)
     }
 }
 
