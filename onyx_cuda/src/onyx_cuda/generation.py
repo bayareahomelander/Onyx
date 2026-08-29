@@ -8,7 +8,9 @@ import torch
 from transformers import PreTrainedModel
 from transformers.cache_utils import Cache
 
+from onyx_cuda.masking import apply_grammar_mask
 from onyx_cuda.prefill import prefill
+from onyx_cuda.vocabulary import TokenByteVocabulary
 
 
 class GenerationResult(NamedTuple):
@@ -74,6 +76,8 @@ def generate_tokens(
     top_p: float = 1.0,
     seed: int | None = None,
     measure: bool = False,
+    regex: str | None = None,
+    token_byte_vocabulary: TokenByteVocabulary | None = None,
 ) -> GenerationResult:
     """Generate at most max_tokens with greedy or top-p sampling."""
     if max_tokens < 1:
@@ -84,6 +88,8 @@ def generate_tokens(
         raise ValueError("top_p must be finite and in (0, 1]")
     if seed is not None and not isinstance(seed, int):
         raise ValueError("seed must be an integer")
+    if regex is not None and token_byte_vocabulary is None:
+        raise ValueError("token_byte_vocabulary is required when regex is set")
 
     if isinstance(eos_token_ids, int):
         eos_token_ids = [eos_token_ids]
@@ -99,41 +105,79 @@ def generate_tokens(
             torch.cuda.synchronize(device)
         started_at = time.perf_counter()
 
-    with torch.inference_mode():
-        result = prefill(model, prompt_token_ids)
-        cache = result.past_key_values
-        generator = None
-        if temperature > 0 and seed is not None:
-            generator = torch.Generator(device=result.logits.device)
-            generator.manual_seed(seed)
-        token_id = _sample_token(result.logits, temperature, top_p, generator)
+    constraint = None
+    grammar_state = None
+    try:
+        with torch.inference_mode():
+            result = prefill(model, prompt_token_ids)
+            logits = result.logits
+            cache = result.past_key_values
+            if regex is not None:
+                from onyx_cuda import _rust
 
-        for step in range(max_tokens):
-            token = token_id.item()
-            if started_at is not None and time_to_first_token is None:
-                time_to_first_token = time.perf_counter() - started_at
-            generated.append(token)
+                token_bytes = token_byte_vocabulary.token_bytes
+                if len(token_bytes) != logits.shape[-1]:
+                    raise ValueError(
+                        "token_byte_vocabulary must match the model logits width"
+                    )
+                constraint = _rust.GrammarConstraint(token_bytes)
+                constraint.compile_regex(regex)
+                grammar_state = constraint.init_state()
 
-            matched_stop_length = _matched_stop_length(generated, stop_sequences)
-            if matched_stop_length:
-                del generated[-matched_stop_length:]
-                finish_reason = "stop"
-                break
-            if token in eos_token_ids:
-                finish_reason = "eos"
-                break
-            if step + 1 == max_tokens:
-                break
+            generator = None
+            if temperature > 0 and seed is not None:
+                generator = torch.Generator(device=logits.device)
+                generator.manual_seed(seed)
 
-            output = model(
-                input_ids=token_id[:, None],
-                past_key_values=cache,
-                use_cache=True,
-            )
-            cache = output.past_key_values
-            token_id = _sample_token(
-                output.logits[:, -1, :], temperature, top_p, generator
-            )
+            for step in range(max_tokens):
+                if constraint is not None:
+                    if constraint.is_match_state(grammar_state):
+                        finish_reason = "stop"
+                        break
+                    valid_token_ids = constraint.get_valid_token_ids(grammar_state)
+                    if not valid_token_ids:
+                        raise ValueError(
+                            "Regex constraint has no valid token continuation"
+                        )
+                    logits = apply_grammar_mask(logits, valid_token_ids)
+
+                token_id = _sample_token(logits, temperature, top_p, generator)
+                token = token_id.item()
+                if started_at is not None and time_to_first_token is None:
+                    time_to_first_token = time.perf_counter() - started_at
+                generated.append(token)
+
+                if constraint is not None:
+                    previous_state = grammar_state
+                    grammar_state = constraint.advance_state(grammar_state, token)
+                    constraint.release_state(previous_state)
+                    if constraint.is_match_state(grammar_state):
+                        finish_reason = "stop"
+                        break
+
+                matched_stop_length = _matched_stop_length(
+                    generated, stop_sequences
+                )
+                if matched_stop_length:
+                    del generated[-matched_stop_length:]
+                    finish_reason = "stop"
+                    break
+                if token in eos_token_ids:
+                    finish_reason = "eos"
+                    break
+                if step + 1 == max_tokens:
+                    break
+
+                output = model(
+                    input_ids=token_id[:, None],
+                    past_key_values=cache,
+                    use_cache=True,
+                )
+                cache = output.past_key_values
+                logits = output.logits[:, -1, :]
+    finally:
+        if constraint is not None and grammar_state is not None:
+            constraint.release_state(grammar_state)
 
     timings = None
     if started_at is not None and time_to_first_token is not None:

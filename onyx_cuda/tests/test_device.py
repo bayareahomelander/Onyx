@@ -37,3 +37,12 @@ def test_generate_tokens_rejects_invalid_options_before_generation():
         options = {"max_tokens": 1, "eos_token_ids": [], **overrides}
         with pytest.raises(ValueError, match=message):
             generate_tokens(torch.nn.Linear(1, 1), [0], **options)
+
+    with pytest.raises(ValueError, match="token_byte_vocabulary"):
+        generate_tokens(
+            torch.nn.Linear(1, 1),
+            [0],
+            max_tokens=1,
+            eos_token_ids=[],
+            regex="CUDA",
+        )

@@ -1,8 +1,10 @@
 import gc
 
+import pytest
 import torch
 from transformers.cache_utils import DynamicCache
 
+from onyx_cuda import _rust
 from onyx_cuda.generation import generate_tokens
 from onyx_cuda.model import load_model
 from onyx_cuda.prefill import prefill
@@ -48,7 +50,7 @@ EXPECTED_PROMPT_TOKEN_IDS = [
 ]
 
 
-def test_load_model_prompt_prefill_and_generation_on_cuda():
+def test_load_model_prompt_prefill_and_generation_on_cuda(monkeypatch):
     device = torch.device("cuda:0")
     torch.cuda.set_device(device)
     torch.cuda.empty_cache()
@@ -263,6 +265,65 @@ def test_load_model_prompt_prefill_and_generation_on_cuda():
     assert sampled_a.finish_reason == sampled_b.finish_reason
     sampled_token_ids = sampled_a.token_ids
 
+    native_constraint = _rust.GrammarConstraint
+    tracked_constraints = []
+
+    class TrackingConstraint:
+        def __init__(self, token_bytes):
+            self.inner = native_constraint(token_bytes)
+            self.active_states = set()
+            self.compile_count = 0
+            tracked_constraints.append(self)
+
+        def __getattr__(self, name):
+            return getattr(self.inner, name)
+
+        def compile_regex(self, pattern):
+            self.compile_count += 1
+            return self.inner.compile_regex(pattern)
+
+        def init_state(self):
+            state = self.inner.init_state()
+            self.active_states.add(state)
+            return state
+
+        def advance_state(self, state, token_id):
+            next_state = self.inner.advance_state(state, token_id)
+            self.active_states.add(next_state)
+            return next_state
+
+        def release_state(self, state):
+            self.inner.release_state(state)
+            self.active_states.remove(state)
+
+    monkeypatch.setattr(_rust, "GrammarConstraint", TrackingConstraint)
+    constrained = []
+    for pattern in ["CUDA", "Ready"]:
+        completed = generate_tokens(
+            loaded.model,
+            prompt.token_ids,
+            max_tokens=8,
+            eos_token_ids=eos_token_id,
+            regex=pattern,
+            token_byte_vocabulary=vocabulary,
+        )
+        assert loaded.tokenizer.decode(completed.token_ids) == pattern
+        assert completed.finish_reason == "stop"
+        constrained.append(completed)
+
+    with pytest.raises(ValueError, match="no valid token continuation"):
+        generate_tokens(
+            loaded.model,
+            prompt.token_ids,
+            max_tokens=8,
+            eos_token_ids=eos_token_id,
+            regex=r"\u{10FFFF}",
+            token_byte_vocabulary=vocabulary,
+        )
+
+    assert all(item.compile_count == 1 for item in tracked_constraints)
+    assert all(not item.active_states for item in tracked_constraints)
+
     del (
         generated,
         limited,
@@ -271,9 +332,12 @@ def test_load_model_prompt_prefill_and_generation_on_cuda():
         overlapping_stops,
         sampled_a,
         sampled_b,
+        completed,
+        constrained,
         reference,
         limited_reference,
     )
+    tracked_constraints.clear()
     gc.collect()
     torch.cuda.empty_cache()
     allocation_baseline = torch.cuda.memory_allocated(device)
