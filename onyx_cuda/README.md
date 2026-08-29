@@ -52,7 +52,7 @@ Pass `measure=True` to `generate_tokens()` to include synchronized time to first
 
 The model is downloaded to the external Hugging Face cache. Loading fails instead of falling back to CPU when CUDA is unavailable.
 
-The native extension also exposes `onyx_cuda._rust.GrammarConstraint` for model-free regex and JSON-schema compilation with branchable opaque state handles. `onyx_cuda.vocabulary.build_token_byte_vocabulary()` maps the complete model-logit ID space to standalone UTF-8 bytes and reports special/empty-token counts. GPU logit masking and constrained `generate_tokens()` integration are not implemented yet.
+The native extension also exposes `onyx_cuda._rust.GrammarConstraint` for model-free regex and JSON-schema compilation with branchable opaque state handles. `onyx_cuda.vocabulary.build_token_byte_vocabulary()` maps the complete model-logit ID space to standalone UTF-8 bytes and reports special/empty-token counts. `onyx_cuda.masking.apply_grammar_mask()` returns a new CUDA logits tensor with invalid token IDs set to negative infinity. Constrained `generate_tokens()` integration is not implemented yet.
 
 ## Windows development setup
 
