@@ -7,6 +7,7 @@ from onyx_cuda.generation import generate_tokens
 from onyx_cuda.model import load_model
 from onyx_cuda.prefill import prefill
 from onyx_cuda.prompt import format_prompt
+from onyx_cuda.vocabulary import build_token_byte_vocabulary
 
 MESSAGES = [
     {"role": "system", "content": "You are a concise assistant."},
@@ -94,6 +95,26 @@ def test_load_model_prompt_prefill_and_generation_on_cuda():
     assert result.token_id.dtype == torch.int64
     assert result.token_id.item() == 80285
     assert loaded.tokenizer.decode(result.token_id.tolist()) == "CUDA"
+
+    vocabulary = build_token_byte_vocabulary(
+        loaded.tokenizer, result.logits.shape[-1]
+    )
+    repeated_vocabulary = build_token_byte_vocabulary(
+        loaded.tokenizer, result.logits.shape[-1]
+    )
+    assert vocabulary == repeated_vocabulary
+    assert len(vocabulary.token_bytes) == result.logits.shape[-1]
+    assert vocabulary.special_token_count == 14
+    assert vocabulary.empty_token_count == 1728
+    assert vocabulary.token_bytes[11] == b","
+    assert vocabulary.token_bytes[13] == b"."
+    assert vocabulary.token_bytes[198] == b"\n"
+    assert vocabulary.token_bytes[220] == b" "
+    assert vocabulary.token_bytes[80285] == b"CUDA"
+    assert vocabulary.token_bytes[151643] == b"<|endoftext|>"
+    assert vocabulary.token_bytes[94] == b""
+    assert vocabulary.token_bytes[151665] == b""
+    assert vocabulary.token_bytes[-1] == b""
 
     cache = result.past_key_values
     assert isinstance(cache, DynamicCache)
@@ -275,6 +296,8 @@ def test_load_model_prompt_prefill_and_generation_on_cuda():
 
     print(f"model_revision={loaded.revision}")
     print(f"prompt_token_count={len(prompt.token_ids)}")
+    print(f"vocabulary_special_token_count={vocabulary.special_token_count}")
+    print(f"vocabulary_empty_token_count={vocabulary.empty_token_count}")
     print(f"generated_token_ids={expected}")
     print(f"generated_text={loaded.tokenizer.decode(expected)!r}")
     print(f"sampled_token_ids={sampled_token_ids}")
