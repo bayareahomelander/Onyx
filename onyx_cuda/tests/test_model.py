@@ -199,6 +199,9 @@ def test_load_model_prompt_prefill_and_generation_on_cuda(monkeypatch):
     assert generated.timings.total_seconds >= (
         generated.timings.time_to_first_token_seconds
     )
+    assert generated.timings.grammar_compile_seconds is None
+    assert generated.timings.valid_token_enumeration_seconds is None
+    assert generated.timings.mask_transfer_seconds is None
     assert generated.past_key_values.get_seq_length() == (
         len(prompt.token_ids) + len(generated.token_ids) - 1
     )
@@ -333,9 +336,15 @@ def test_load_model_prompt_prefill_and_generation_on_cuda(monkeypatch):
             eos_token_ids=eos_token_id,
             regex=pattern,
             token_byte_vocabulary=vocabulary,
+            measure=pattern == "CUDA",
         )
         assert loaded.tokenizer.decode(completed.token_ids) == pattern
         assert completed.finish_reason == "stop"
+        if pattern == "CUDA":
+            assert completed.timings is not None
+            assert completed.timings.grammar_compile_seconds > 0
+            assert completed.timings.valid_token_enumeration_seconds > 0
+            assert completed.timings.mask_transfer_seconds > 0
         constrained.append(completed)
 
     with pytest.raises(ValueError, match="no valid token continuation"):
@@ -417,6 +426,7 @@ def test_load_model_prompt_prefill_and_generation_on_cuda(monkeypatch):
             regex="Ready" if name == "object" else None,
             token_byte_vocabulary=vocabulary,
             json_schema=json.dumps(schema),
+            measure=name == "object",
         )
         parsed_json[name] = json.loads(
             loaded.tokenizer.decode(completed.token_ids)
@@ -424,6 +434,10 @@ def test_load_model_prompt_prefill_and_generation_on_cuda(monkeypatch):
         assert completed.finish_reason == "stop"
         if name == "object":
             assert tracked_constraints[-1].compile_kind == "json"
+            assert completed.timings is not None
+            assert completed.timings.grammar_compile_seconds > 0
+            assert completed.timings.valid_token_enumeration_seconds > 0
+            assert completed.timings.mask_transfer_seconds > 0
         del completed
 
     assert isinstance(parsed_json["object"], dict)

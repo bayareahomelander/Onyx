@@ -1,4 +1,4 @@
-"""Reproducible Phase 2 CUDA baseline benchmark."""
+"""Reproducible CUDA baseline and constraint gates."""
 
 import argparse
 import gc
@@ -15,6 +15,7 @@ import transformers
 from onyx_cuda.generation import generate_tokens
 from onyx_cuda.model import MODEL_ID, load_model
 from onyx_cuda.prompt import format_prompt
+from onyx_cuda.vocabulary import build_token_byte_vocabulary
 
 WARMUPS = 1
 REPETITIONS = 3
@@ -25,11 +26,22 @@ PROMPTS = {
     "number_sequence": "Write the numbers one through ten, separated by commas.",
 }
 DEFAULT_OUTPUT = Path("benchmarks/results/phase2_baseline.json")
+CONSTRAINT_OUTPUT = Path("benchmarks/results/phase3_constraint_gate.json")
 
 
-def _run_prompt(model, tokenizer, device, name: str, user_prompt: str) -> dict:
+def _run_prompt(
+    model,
+    tokenizer,
+    device,
+    name: str,
+    user_prompt: str,
+    *,
+    system_prompt: str = "You are a concise assistant.",
+    generation_options: dict | None = None,
+) -> dict:
+    generation_options = generation_options or {}
     messages = [
-        {"role": "system", "content": "You are a concise assistant."},
+        {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_prompt},
     ]
     prompt = format_prompt(tokenizer, messages)
@@ -41,6 +53,7 @@ def _run_prompt(model, tokenizer, device, name: str, user_prompt: str) -> dict:
             prompt.token_ids,
             max_tokens=MAX_TOKENS,
             eos_token_ids=eos_token_id,
+            **generation_options,
         )
         del warmup
     torch.cuda.synchronize(device)
@@ -59,6 +72,7 @@ def _run_prompt(model, tokenizer, device, name: str, user_prompt: str) -> dict:
             max_tokens=MAX_TOKENS,
             eos_token_ids=eos_token_id,
             measure=True,
+            **generation_options,
         )
         if result.timings is None:
             raise RuntimeError("timing was not recorded")
@@ -85,6 +99,23 @@ def _run_prompt(model, tokenizer, device, name: str, user_prompt: str) -> dict:
             "total_seconds": result.timings.total_seconds,
             "peak_allocated_vram_bytes": torch.cuda.max_memory_allocated(device),
         }
+        if result.timings.grammar_compile_seconds is not None:
+            run.update(
+                {
+                    "grammar_compile_seconds": (
+                        result.timings.grammar_compile_seconds
+                    ),
+                    "valid_token_enumeration_seconds": (
+                        result.timings.valid_token_enumeration_seconds
+                    ),
+                    "mask_transfer_seconds": (
+                        result.timings.mask_transfer_seconds
+                    ),
+                    "output_tokens_per_second": (
+                        len(token_ids) / result.timings.total_seconds
+                    ),
+                }
+            )
         del result
         gc.collect()
         torch.cuda.empty_cache()
@@ -102,7 +133,7 @@ def _run_prompt(model, tokenizer, device, name: str, user_prompt: str) -> dict:
     ]
     if not decode_rates:
         raise RuntimeError(f"no decode throughput available for {name}")
-    return {
+    summary = {
         "name": name,
         "messages": messages,
         "prompt_token_count": len(prompt.token_ids),
@@ -116,16 +147,103 @@ def _run_prompt(model, tokenizer, device, name: str, user_prompt: str) -> dict:
         ),
         "stable": True,
     }
+    if "grammar_compile_seconds" in runs[0]:
+        summary.update(
+            {
+                "median_grammar_compile_seconds": statistics.median(
+                    run["grammar_compile_seconds"] for run in runs
+                ),
+                "median_valid_token_enumeration_seconds": statistics.median(
+                    run["valid_token_enumeration_seconds"] for run in runs
+                ),
+                "median_mask_transfer_seconds": statistics.median(
+                    run["mask_transfer_seconds"] for run in runs
+                ),
+                "median_output_tokens_per_second": statistics.median(
+                    run["output_tokens_per_second"] for run in runs
+                ),
+            }
+        )
+    return summary
+
+
+def _assert_phase2_baseline(current_prompts: list[dict], baseline: dict) -> None:
+    baseline_prompts = {prompt["name"]: prompt for prompt in baseline["prompts"]}
+    for current in current_prompts:
+        expected = baseline_prompts.get(current["name"])
+        if expected is None:
+            raise RuntimeError(f"Phase 2 baseline is missing {current['name']}")
+        expected_run = expected["runs"][0]
+        current_run = current["runs"][0]
+        if (
+            current_run["token_ids"] != expected_run["token_ids"]
+            or current_run["finish_reason"] != expected_run["finish_reason"]
+        ):
+            raise RuntimeError(
+                f"unconstrained output changed from Phase 2 for {current['name']}"
+            )
+
+
+def _run_constraint_prompts(model, tokenizer, device) -> list[dict]:
+    vocabulary = build_token_byte_vocabulary(tokenizer, model.config.vocab_size)
+    regex_pattern = "CUDA Ready"
+    regex_result = _run_prompt(
+        model,
+        tokenizer,
+        device,
+        "regex_cuda_ready",
+        "Reply with CUDA ready.",
+        generation_options={
+            "regex": regex_pattern,
+            "token_byte_vocabulary": vocabulary,
+        },
+    )
+    if regex_result["runs"][0]["text"] != regex_pattern:
+        raise RuntimeError("regex-constrained output did not match exactly")
+
+    schema = {
+        "type": "object",
+        "properties": {"content": {"enum": ["CUDA ready", "Ready"]}},
+        "required": ["content"],
+    }
+    json_result = _run_prompt(
+        model,
+        tokenizer,
+        device,
+        "json_required_enum",
+        "Use no spaces or newlines in the JSON response.",
+        system_prompt="Return compact JSON only.",
+        generation_options={
+            "json_schema": json.dumps(schema, separators=(",", ":")),
+            "token_byte_vocabulary": vocabulary,
+        },
+    )
+    parsed = json.loads(json_result["runs"][0]["text"])
+    if set(parsed) != {"content"} or parsed["content"] not in {
+        "CUDA ready",
+        "Ready",
+    }:
+        raise RuntimeError("JSON-constrained output did not satisfy its schema")
+    return [regex_result, json_result]
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
+    parser.add_argument("--constraints", action="store_true")
+    parser.add_argument("--baseline", type=Path, default=DEFAULT_OUTPUT)
+    parser.add_argument("--output", type=Path)
     args = parser.parse_args()
+    output = args.output or (
+        CONSTRAINT_OUTPUT if args.constraints else DEFAULT_OUTPUT
+    )
 
     device = torch.device("cuda:0")
     torch.cuda.set_device(device)
     loaded = load_model()
+    prompts = [
+        _run_prompt(loaded.model, loaded.tokenizer, device, name, prompt)
+        for name, prompt in PROMPTS.items()
+    ]
     results = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "model": {"id": MODEL_ID, "revision": loaded.revision},
@@ -148,22 +266,54 @@ def main() -> None:
             "temperature": 0.0,
             "top_p": 1.0,
         },
-        "prompts": [
-            _run_prompt(loaded.model, loaded.tokenizer, device, name, prompt)
-            for name, prompt in PROMPTS.items()
-        ],
     }
+    printed_prompts = prompts
+    if args.constraints:
+        if not args.baseline.is_file():
+            raise RuntimeError(
+                f"Phase 2 baseline not found at {args.baseline}; "
+                "run the default benchmark first"
+            )
+        baseline = json.loads(args.baseline.read_text(encoding="utf-8"))
+        if baseline.get("model") != results["model"]:
+            raise RuntimeError("Phase 2 baseline model or revision does not match")
+        _assert_phase2_baseline(prompts, baseline)
+        constraint_prompts = _run_constraint_prompts(
+            loaded.model, loaded.tokenizer, device
+        )
+        results.update(
+            {
+                "phase2_baseline": str(args.baseline),
+                "unconstrained_prompts": prompts,
+                "constraint_prompts": constraint_prompts,
+            }
+        )
+        printed_prompts = constraint_prompts
+    else:
+        results["prompts"] = prompts
 
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(json.dumps(results, indent=2) + "\n", encoding="utf-8")
-    print(f"Wrote {args.output}")
-    for prompt in results["prompts"]:
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(json.dumps(results, indent=2) + "\n", encoding="utf-8")
+    print(f"Wrote {output}")
+    if args.constraints:
+        print("Phase 2 unconstrained outputs unchanged")
+    for prompt in printed_prompts:
+        constraint_metrics = ""
+        if "median_grammar_compile_seconds" in prompt:
+            constraint_metrics = (
+                f" compile={prompt['median_grammar_compile_seconds']:.6f}s"
+                " enum="
+                f"{prompt['median_valid_token_enumeration_seconds']:.6f}s"
+                f" mask={prompt['median_mask_transfer_seconds']:.6f}s"
+                f" output={prompt['median_output_tokens_per_second']:.2f} tok/s"
+            )
         print(
             f"{prompt['name']}: "
             f"ttft={prompt['median_time_to_first_token_seconds']:.6f}s "
             f"decode={prompt['median_decode_tokens_per_second']:.2f} tok/s "
             f"peak={prompt['peak_allocated_vram_bytes']} bytes "
             f"finish={prompt['runs'][0]['finish_reason']}"
+            f"{constraint_metrics}"
         )
 
 

@@ -25,6 +25,9 @@ class GenerationTimings(NamedTuple):
     time_to_first_token_seconds: float
     decode_tokens_per_second: float | None
     total_seconds: float
+    grammar_compile_seconds: float | None = None
+    valid_token_enumeration_seconds: float | None = None
+    mask_transfer_seconds: float | None = None
 
 
 def _matched_stop_length(
@@ -102,6 +105,9 @@ def generate_tokens(
     finish_reason: Literal["eos", "stop", "length"] = "length"
     started_at = None
     time_to_first_token = None
+    grammar_compile_seconds = None
+    valid_token_enumeration_seconds = None
+    mask_transfer_seconds = None
     if measure:
         device = next(model.parameters()).device
         if device.type == "cuda":
@@ -123,12 +129,19 @@ def generate_tokens(
                     raise ValueError(
                         "token_byte_vocabulary must match the model logits width"
                     )
+                compile_started_at = time.perf_counter() if measure else None
                 constraint = _rust.GrammarConstraint(token_bytes)
                 if json_schema is not None:
                     constraint.compile_json_schema(json_schema)
                 else:
                     constraint.compile_regex(regex)
                 grammar_state = constraint.init_state()
+                if compile_started_at is not None:
+                    grammar_compile_seconds = (
+                        time.perf_counter() - compile_started_at
+                    )
+                    valid_token_enumeration_seconds = 0.0
+                    mask_transfer_seconds = 0.0
 
             generator = None
             if temperature > 0 and seed is not None:
@@ -140,12 +153,28 @@ def generate_tokens(
                     if constraint.is_match_state(grammar_state):
                         finish_reason = "stop"
                         break
+                    enumeration_started_at = (
+                        time.perf_counter() if measure else None
+                    )
                     valid_token_ids = constraint.get_valid_token_ids(grammar_state)
+                    if enumeration_started_at is not None:
+                        valid_token_enumeration_seconds += (
+                            time.perf_counter() - enumeration_started_at
+                        )
                     if not valid_token_ids:
                         raise ValueError(
                             "Grammar constraint has no valid token continuation"
                         )
-                    logits = apply_grammar_mask(logits, valid_token_ids)
+                    if measure:
+                        torch.cuda.synchronize(logits.device)
+                        mask_started_at = time.perf_counter()
+                        logits = apply_grammar_mask(logits, valid_token_ids)
+                        torch.cuda.synchronize(logits.device)
+                        mask_transfer_seconds += (
+                            time.perf_counter() - mask_started_at
+                        )
+                    else:
+                        logits = apply_grammar_mask(logits, valid_token_ids)
 
                 token_id = _sample_token(logits, temperature, top_p, generator)
                 token = token_id.item()
@@ -197,9 +226,14 @@ def generate_tokens(
             else None
         )
         timings = GenerationTimings(
-            time_to_first_token,
-            decode_tokens_per_second,
-            total_seconds,
+            time_to_first_token_seconds=time_to_first_token,
+            decode_tokens_per_second=decode_tokens_per_second,
+            total_seconds=total_seconds,
+            grammar_compile_seconds=grammar_compile_seconds,
+            valid_token_enumeration_seconds=(
+                valid_token_enumeration_seconds
+            ),
+            mask_transfer_seconds=mask_transfer_seconds,
         )
 
     if json_schema is not None:
