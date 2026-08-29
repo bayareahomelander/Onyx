@@ -1,10 +1,12 @@
 import gc
+import json
 
 import pytest
 import torch
 from transformers.cache_utils import DynamicCache
 
 from onyx_cuda import _rust
+import onyx_cuda.generation as generation_module
 from onyx_cuda.generation import generate_tokens
 from onyx_cuda.model import load_model
 from onyx_cuda.prefill import prefill
@@ -273,6 +275,8 @@ def test_load_model_prompt_prefill_and_generation_on_cuda(monkeypatch):
             self.inner = native_constraint(token_bytes)
             self.active_states = set()
             self.compile_count = 0
+            self.compile_kind = None
+            self.valid_token_ids = None
             tracked_constraints.append(self)
 
         def __getattr__(self, name):
@@ -280,7 +284,17 @@ def test_load_model_prompt_prefill_and_generation_on_cuda(monkeypatch):
 
         def compile_regex(self, pattern):
             self.compile_count += 1
+            self.compile_kind = "regex"
             return self.inner.compile_regex(pattern)
+
+        def compile_json_schema(self, schema):
+            self.compile_count += 1
+            self.compile_kind = "json"
+            return self.inner.compile_json_schema(schema)
+
+        def get_valid_token_ids(self, state):
+            self.valid_token_ids = self.inner.get_valid_token_ids(state)
+            return self.valid_token_ids
 
         def init_state(self):
             state = self.inner.init_state()
@@ -297,6 +311,19 @@ def test_load_model_prompt_prefill_and_generation_on_cuda(monkeypatch):
             self.active_states.remove(state)
 
     monkeypatch.setattr(_rust, "GrammarConstraint", TrackingConstraint)
+    sample_token = generation_module._sample_token
+
+    def checked_sample_token(logits, temperature, top_p, generator):
+        if not tracked_constraints or not tracked_constraints[-1].active_states:
+            return sample_token(logits, temperature, top_p, generator)
+        valid_token_ids = tracked_constraints[-1].valid_token_ids
+        assert valid_token_ids is not None
+        assert torch.isneginf(logits).sum().item() == (
+            logits.numel() - len(valid_token_ids)
+        )
+        return sample_token(logits, temperature, top_p, generator)
+
+    monkeypatch.setattr(generation_module, "_sample_token", checked_sample_token)
     constrained = []
     for pattern in ["CUDA", "Ready"]:
         completed = generate_tokens(
@@ -321,6 +348,93 @@ def test_load_model_prompt_prefill_and_generation_on_cuda(monkeypatch):
             token_byte_vocabulary=vocabulary,
         )
 
+    json_prompt = format_prompt(
+        loaded.tokenizer,
+        [
+            {"role": "system", "content": "Return compact JSON only."},
+            {
+                "role": "user",
+                "content": "Use no spaces or newlines in the JSON response.",
+            },
+        ],
+    )
+    json_cases = [
+        (
+            "object",
+            {
+                "type": "object",
+                "properties": {"content": {"type": "boolean"}},
+            },
+        ),
+        (
+            "required",
+            {
+                "type": "object",
+                "properties": {"content": {"type": "boolean"}},
+                "required": ["content"],
+            },
+        ),
+        (
+            "enum",
+            {
+                "type": "object",
+                "properties": {
+                    "content": {"enum": ["CUDA ready", "Ready"]}
+                },
+                "required": ["content"],
+            },
+        ),
+        (
+            "nested",
+            {
+                "type": "object",
+                "properties": {
+                    "content": {
+                        "type": "object",
+                        "properties": {},
+                    }
+                },
+                "required": ["content"],
+            },
+        ),
+        (
+            "bounded_array",
+            {
+                "type": "array",
+                "items": {"enum": ["a", "b"]},
+                "minItems": 2,
+                "maxItems": 2,
+            },
+        ),
+    ]
+    parsed_json = {}
+    for name, schema in json_cases:
+        completed = generate_tokens(
+            loaded.model,
+            json_prompt.token_ids,
+            max_tokens=64,
+            eos_token_ids=eos_token_id,
+            regex="Ready" if name == "object" else None,
+            token_byte_vocabulary=vocabulary,
+            json_schema=json.dumps(schema),
+        )
+        parsed_json[name] = json.loads(
+            loaded.tokenizer.decode(completed.token_ids)
+        )
+        assert completed.finish_reason == "stop"
+        if name == "object":
+            assert tracked_constraints[-1].compile_kind == "json"
+        del completed
+
+    assert isinstance(parsed_json["object"], dict)
+    assert set(parsed_json["required"]) == {"content"}
+    assert isinstance(parsed_json["required"]["content"], bool)
+    assert parsed_json["enum"]["content"] in {"CUDA ready", "Ready"}
+    assert set(parsed_json["nested"]) == {"content"}
+    assert parsed_json["nested"]["content"] == {}
+    assert len(parsed_json["bounded_array"]) == 2
+    assert set(parsed_json["bounded_array"]) <= {"a", "b"}
+
     assert all(item.compile_count == 1 for item in tracked_constraints)
     assert all(not item.active_states for item in tracked_constraints)
 
@@ -332,8 +446,8 @@ def test_load_model_prompt_prefill_and_generation_on_cuda(monkeypatch):
         overlapping_stops,
         sampled_a,
         sampled_b,
-        completed,
         constrained,
+        parsed_json,
         reference,
         limited_reference,
     )

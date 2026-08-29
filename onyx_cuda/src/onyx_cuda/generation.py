@@ -1,5 +1,6 @@
 """Cached token generation."""
 
+import json
 import math
 import time
 from typing import Literal, NamedTuple
@@ -78,6 +79,7 @@ def generate_tokens(
     measure: bool = False,
     regex: str | None = None,
     token_byte_vocabulary: TokenByteVocabulary | None = None,
+    json_schema: str | None = None,
 ) -> GenerationResult:
     """Generate at most max_tokens with greedy or top-p sampling."""
     if max_tokens < 1:
@@ -88,8 +90,9 @@ def generate_tokens(
         raise ValueError("top_p must be finite and in (0, 1]")
     if seed is not None and not isinstance(seed, int):
         raise ValueError("seed must be an integer")
-    if regex is not None and token_byte_vocabulary is None:
-        raise ValueError("token_byte_vocabulary is required when regex is set")
+    grammar_requested = regex is not None or json_schema is not None
+    if grammar_requested and token_byte_vocabulary is None:
+        raise ValueError("token_byte_vocabulary is required when a grammar is set")
 
     if isinstance(eos_token_ids, int):
         eos_token_ids = [eos_token_ids]
@@ -112,7 +115,7 @@ def generate_tokens(
             result = prefill(model, prompt_token_ids)
             logits = result.logits
             cache = result.past_key_values
-            if regex is not None:
+            if grammar_requested:
                 from onyx_cuda import _rust
 
                 token_bytes = token_byte_vocabulary.token_bytes
@@ -121,7 +124,10 @@ def generate_tokens(
                         "token_byte_vocabulary must match the model logits width"
                     )
                 constraint = _rust.GrammarConstraint(token_bytes)
-                constraint.compile_regex(regex)
+                if json_schema is not None:
+                    constraint.compile_json_schema(json_schema)
+                else:
+                    constraint.compile_regex(regex)
                 grammar_state = constraint.init_state()
 
             generator = None
@@ -137,7 +143,7 @@ def generate_tokens(
                     valid_token_ids = constraint.get_valid_token_ids(grammar_state)
                     if not valid_token_ids:
                         raise ValueError(
-                            "Regex constraint has no valid token continuation"
+                            "Grammar constraint has no valid token continuation"
                         )
                     logits = apply_grammar_mask(logits, valid_token_ids)
 
@@ -194,6 +200,14 @@ def generate_tokens(
             time_to_first_token,
             decode_tokens_per_second,
             total_seconds,
+        )
+
+    if json_schema is not None:
+        json.loads(
+            b"".join(
+                token_byte_vocabulary.token_bytes[token_id]
+                for token_id in generated
+            ).decode("utf-8")
         )
 
     return GenerationResult(generated, cache, finish_reason, timings)
