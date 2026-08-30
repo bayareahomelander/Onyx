@@ -44,7 +44,7 @@ print(loaded.tokenizer.decode(generated.token_ids, skip_special_tokens=True))
 print(generated.finish_reason)
 ```
 
-`onyx_cuda.model.load_model_pair()` loads that model as the draft together with `Qwen/Qwen2.5-1.5B-Instruct` as the FP16 target. It rejects the pair unless logits widths, every token ID's decoded bytes, special/EOS IDs, and chat-template output are identical. Both models fit and complete cached forwards together on the validated 6 GB GPU. Fixed-gamma speculative decoding is not implemented yet.
+`onyx_cuda.model.load_model_pair()` loads that model as the draft together with `Qwen/Qwen2.5-1.5B-Instruct` as the FP16 target. It rejects the pair unless logits widths, every token ID's decoded bytes, special/EOS IDs, and chat-template output are identical. Both models fit and complete cached forwards together on the validated 6 GB GPU. The same `generate_tokens()` path is verified against Transformers greedy output for the 1.5B target, including regex and JSON constraints. Fixed-gamma speculative decoding is not implemented yet.
 
 The Qwen chat template uses `<|im_end|>` (ID 151645) as EOS, `<|endoftext|>` (ID 151643) as padding, and no BOS token. A formatted prompt ends with `<|im_start|>assistant\n` rather than EOS so generation can begin. API request models and fallback prompt formatting are not implemented yet.
 
@@ -100,3 +100,15 @@ After retaining that baseline, run the Phase 3 constraint gate:
 ```
 
 It reruns and compares the unconstrained outputs with the Phase 2 file, then measures deterministic regex and JSON-schema generation. The ignored `benchmarks/results/phase3_constraint_gate.json` records grammar setup, valid-token enumeration, mask/transfer, throughput, and peak allocated VRAM.
+
+Run the 1.5B target-only correctness baseline before speculative work:
+
+```powershell
+.\.venv\Scripts\python.exe -m onyx_cuda.benchmark --target
+```
+
+It uses the same prompts, generation loop, warmups, repetitions, timing, and memory checks and writes `benchmarks/results/phase4_target_baseline.json`. Validate target constraints against that retained baseline with:
+
+```powershell
+.\.venv\Scripts\python.exe -m onyx_cuda.benchmark --target --constraints
+```
