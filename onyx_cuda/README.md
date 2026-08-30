@@ -44,7 +44,9 @@ print(loaded.tokenizer.decode(generated.token_ids, skip_special_tokens=True))
 print(generated.finish_reason)
 ```
 
-`onyx_cuda.model.load_model_pair()` loads that model as the draft together with `Qwen/Qwen2.5-1.5B-Instruct` as the FP16 target. It rejects the pair unless logits widths, every token ID's decoded bytes, special/EOS IDs, and chat-template output are identical. Both models fit and complete cached forwards together on the validated 6 GB GPU. The same `generate_tokens()` path is verified against Transformers greedy output for the 1.5B target, including regex and JSON constraints. Fixed-gamma speculative decoding is not implemented yet.
+`onyx_cuda.model.load_model_pair()` loads that model as the draft together with `Qwen/Qwen2.5-1.5B-Instruct` as the FP16 target. It rejects the pair unless logits widths, every token ID's decoded bytes, special/EOS IDs, and chat-template output are identical. Both models fit and complete cached forwards together on the validated 6 GB GPU. The same `generate_tokens()` path is verified against Transformers greedy output for the 1.5B target, including regex and JSON constraints.
+
+`onyx_cuda.speculative.generate_speculative()` runs greedy fixed-gamma decoding with `gamma >= 1`, exact `max_tokens`, EOS, and overlapping token-stop handling and returns the same token/cache/finish-reason result shape as `generate_tokens()`. Positive-temperature requests are routed unchanged through the trustworthy target-only temperature/top-p sampler; sampled speculative acceptance is not approximated. Grammar-aware speculation, speculative metrics, streaming, and serving are not implemented yet.
 
 The Qwen chat template uses `<|im_end|>` (ID 151645) as EOS, `<|endoftext|>` (ID 151643) as padding, and no BOS token. A formatted prompt ends with `<|im_start|>assistant\n` rather than EOS so generation can begin. API request models and fallback prompt formatting are not implemented yet.
 

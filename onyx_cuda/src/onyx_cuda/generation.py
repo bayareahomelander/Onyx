@@ -71,6 +71,22 @@ def _sample_token(
     return torch.multinomial(probabilities, 1, generator=generator).squeeze(-1)
 
 
+def _validate_generation_options(
+    max_tokens: int,
+    temperature: float,
+    top_p: float,
+    seed: int | None,
+) -> None:
+    if max_tokens < 1:
+        raise ValueError("max_tokens must be at least 1")
+    if not math.isfinite(temperature) or temperature < 0:
+        raise ValueError("temperature must be finite and nonnegative")
+    if not math.isfinite(top_p) or not 0 < top_p <= 1:
+        raise ValueError("top_p must be finite and in (0, 1]")
+    if seed is not None and not isinstance(seed, int):
+        raise ValueError("seed must be an integer")
+
+
 def generate_tokens(
     model: PreTrainedModel,
     prompt_token_ids: list[int],
@@ -86,14 +102,7 @@ def generate_tokens(
     json_schema: str | None = None,
 ) -> GenerationResult:
     """Generate at most max_tokens with greedy or top-p sampling."""
-    if max_tokens < 1:
-        raise ValueError("max_tokens must be at least 1")
-    if not math.isfinite(temperature) or temperature < 0:
-        raise ValueError("temperature must be finite and nonnegative")
-    if not math.isfinite(top_p) or not 0 < top_p <= 1:
-        raise ValueError("top_p must be finite and in (0, 1]")
-    if seed is not None and not isinstance(seed, int):
-        raise ValueError("seed must be an integer")
+    _validate_generation_options(max_tokens, temperature, top_p, seed)
     grammar_requested = regex is not None or json_schema is not None
     if grammar_requested and token_byte_vocabulary is None:
         raise ValueError("token_byte_vocabulary is required when a grammar is set")

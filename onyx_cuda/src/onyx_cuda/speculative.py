@@ -1,4 +1,4 @@
-"""One greedy draft proposal step."""
+"""Fixed-gamma speculative token generation."""
 
 from typing import NamedTuple
 
@@ -6,7 +6,12 @@ import torch
 from transformers import PreTrainedModel
 
 from onyx_cuda.cache import CacheState
-from onyx_cuda.generation import _matched_stop_length
+from onyx_cuda.generation import (
+    GenerationResult,
+    _matched_stop_length,
+    _validate_generation_options,
+    generate_tokens,
+)
 from onyx_cuda.prefill import prefill
 
 
@@ -90,11 +95,16 @@ def verify_proposal(
         accepted += 1
 
     if accepted == len(proposal.token_ids):
+        draft_token_id = (
+            proposal.token_ids[-1]
+            if proposal.token_ids
+            else current_token_id
+        )
         with torch.inference_mode():
             draft_cache.extend(
                 draft_model,
                 torch.tensor(
-                    [[proposal.token_ids[-1]]],
+                    [[draft_token_id]],
                     device=draft_cache.attention_mask.device,
                 ),
             )
@@ -113,10 +123,30 @@ def generate_speculative(
     max_tokens: int,
     gamma: int,
     eos_token_ids: int | list[int],
-) -> list[int]:
-    """Run the greedy fixed-gamma draft/verify loop."""
+    stop_sequences: list[list[int]] | None = None,
+    temperature: float = 0.0,
+    top_p: float = 1.0,
+    seed: int | None = None,
+) -> GenerationResult:
+    """Run greedy speculation or route sampling through the target."""
+    if gamma < 1:
+        raise ValueError("gamma must be at least 1")
+    _validate_generation_options(max_tokens, temperature, top_p, seed)
+    if temperature > 0:
+        return generate_tokens(
+            target_model,
+            prompt_token_ids,
+            max_tokens,
+            eos_token_ids,
+            stop_sequences=stop_sequences,
+            temperature=temperature,
+            top_p=top_p,
+            seed=seed,
+        )
+
     if isinstance(eos_token_ids, int):
         eos_token_ids = [eos_token_ids]
+    stop_sequences = stop_sequences or []
     draft_prefill = prefill(draft_model, prompt_token_ids)
     target_prefill = prefill(target_model, prompt_token_ids)
     draft_cache = CacheState.from_prefill(
@@ -127,17 +157,27 @@ def generate_speculative(
     )
     generated = [target_prefill.token_id.item()]
 
-    while len(generated) < max_tokens and generated[-1] not in eos_token_ids:
+    matched_stop_length = _matched_stop_length(generated, stop_sequences)
+    if matched_stop_length:
+        del generated[-matched_stop_length:]
+        return GenerationResult(
+            generated, target_cache.past_key_values, "stop"
+        )
+    if generated[-1] in eos_token_ids:
+        return GenerationResult(
+            generated, target_cache.past_key_values, "eos"
+        )
+
+    while len(generated) < max_tokens:
         proposal = propose_tokens(
             draft_model,
             draft_cache,
             generated,
             gamma,
-            max_tokens - len(generated),
+            max_tokens - len(generated) - 1,
             eos_token_ids,
+            stop_sequences,
         )
-        if not proposal.token_ids:
-            break
         verified = verify_proposal(
             draft_model,
             draft_cache,
@@ -148,7 +188,17 @@ def generate_speculative(
         )
         for token_id in verified.token_ids:
             generated.append(token_id)
+            matched_stop_length = _matched_stop_length(
+                generated, stop_sequences
+            )
+            if matched_stop_length:
+                del generated[-matched_stop_length:]
+                return GenerationResult(
+                    generated, target_cache.past_key_values, "stop"
+                )
             if token_id in eos_token_ids:
-                return generated
+                return GenerationResult(
+                    generated, target_cache.past_key_values, "eos"
+                )
 
-    return generated
+    return GenerationResult(generated, target_cache.past_key_values, "length")
