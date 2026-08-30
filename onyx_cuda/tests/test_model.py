@@ -8,7 +8,7 @@ from transformers.cache_utils import DynamicCache
 from onyx_cuda import _rust
 import onyx_cuda.generation as generation_module
 from onyx_cuda.generation import generate_tokens
-from onyx_cuda.model import load_model
+from onyx_cuda.model import load_model_pair
 from onyx_cuda.prefill import prefill
 from onyx_cuda.prompt import format_prompt
 from onyx_cuda.vocabulary import build_token_byte_vocabulary
@@ -58,15 +58,30 @@ def test_load_model_prompt_prefill_and_generation_on_cuda(monkeypatch):
     torch.cuda.empty_cache()
     torch.cuda.reset_peak_memory_stats(device)
 
-    loaded = load_model()
+    loaded_pair = load_model_pair()
+    torch.cuda.synchronize(device)
+    load_peak_allocated = torch.cuda.max_memory_allocated(device)
+    loaded = loaded_pair.draft
+    target = loaded_pair.target
+    target_revision = target.revision
 
     assert loaded.revision == loaded.model.config._commit_hash
     assert len(loaded.revision) == 40
     assert not loaded.model.training
     assert all(parameter.device == device for parameter in loaded.model.parameters())
     assert all(parameter.dtype == torch.float16 for parameter in loaded.model.parameters())
+    assert target.revision == target.model.config._commit_hash
+    assert len(target.revision) == 40
+    assert not target.model.training
+    assert all(parameter.device == device for parameter in target.model.parameters())
+    assert all(parameter.dtype == torch.float16 for parameter in target.model.parameters())
+    assert loaded.model.config.vocab_size == target.model.config.vocab_size
+    assert loaded.tokenizer.all_special_ids == target.tokenizer.all_special_ids
+    assert loaded.tokenizer.eos_token_id == target.tokenizer.eos_token_id
 
     prompt = format_prompt(loaded.tokenizer, MESSAGES)
+    target_prompt = format_prompt(target.tokenizer, MESSAGES)
+    assert target_prompt == prompt
     assert prompt.text == EXPECTED_PROMPT_TEXT
     assert prompt.token_ids == EXPECTED_PROMPT_TOKEN_IDS
     assert loaded.tokenizer.decode(prompt.token_ids) == EXPECTED_PROMPT_TEXT
@@ -88,7 +103,19 @@ def test_load_model_prompt_prefill_and_generation_on_cuda(monkeypatch):
     assert prompt.token_ids[-1] != loaded.tokenizer.eos_token_id
 
     result = prefill(loaded.model, prompt.token_ids)
+    target_result = prefill(target.model, target_prompt.token_ids)
     torch.cuda.synchronize(device)
+    forward_peak_allocated = torch.cuda.max_memory_allocated(device)
+
+    assert target_result.logits.shape == (1, target.model.config.vocab_size)
+    assert target_result.logits.device == device
+    assert target_result.logits.dtype == torch.float16
+    assert not target_result.logits.requires_grad
+    assert target_result.past_key_values.get_seq_length() == len(
+        target_prompt.token_ids
+    )
+    assert load_peak_allocated < torch.cuda.get_device_properties(device).total_memory
+    assert forward_peak_allocated < torch.cuda.get_device_properties(device).total_memory
 
     assert result.logits.shape == (1, loaded.model.config.vocab_size)
     assert result.logits.device == device
@@ -140,6 +167,10 @@ def test_load_model_prompt_prefill_and_generation_on_cuda(monkeypatch):
         assert layer.values.shape == expected_cache_shape
         assert layer.keys.device == layer.values.device == device
         assert layer.keys.dtype == layer.values.dtype == torch.float16
+
+    del target_result, target, loaded_pair
+    gc.collect()
+    torch.cuda.empty_cache()
 
     del result, cache
     gc.collect()
@@ -487,6 +518,7 @@ def test_load_model_prompt_prefill_and_generation_on_cuda(monkeypatch):
     assert torch.cuda.max_memory_allocated(device) < torch.cuda.get_device_properties(device).total_memory
 
     print(f"model_revision={loaded.revision}")
+    print(f"target_model_revision={target_revision}")
     print(f"prompt_token_count={len(prompt.token_ids)}")
     print(f"vocabulary_special_token_count={vocabulary.special_token_count}")
     print(f"vocabulary_empty_token_count={vocabulary.empty_token_count}")
@@ -495,4 +527,6 @@ def test_load_model_prompt_prefill_and_generation_on_cuda(monkeypatch):
     print(f"sampled_token_ids={sampled_token_ids}")
     print("finish_reasons=eos,stop,length")
     print(f"allocation_baseline_bytes={allocation_baseline}")
+    print(f"pair_load_peak_allocated_bytes={load_peak_allocated}")
+    print(f"pair_forward_peak_allocated_bytes={forward_peak_allocated}")
     print(f"peak_allocated_bytes={torch.cuda.max_memory_allocated(device)}")

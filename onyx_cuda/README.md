@@ -44,13 +44,15 @@ print(loaded.tokenizer.decode(generated.token_ids, skip_special_tokens=True))
 print(generated.finish_reason)
 ```
 
+`onyx_cuda.model.load_model_pair()` loads that model as the draft together with `Qwen/Qwen2.5-1.5B-Instruct` as the FP16 target. It rejects the pair unless logits widths, every token ID's decoded bytes, special/EOS IDs, and chat-template output are identical. Both models fit and complete cached forwards together on the validated 6 GB GPU. Fixed-gamma speculative decoding is not implemented yet.
+
 The Qwen chat template uses `<|im_end|>` (ID 151645) as EOS, `<|endoftext|>` (ID 151643) as padding, and no BOS token. A formatted prompt ends with `<|im_start|>assistant\n` rather than EOS so generation can begin. API request models and fallback prompt formatting are not implemented yet.
 
 The single prefill returns last-position vocabulary logits, a Transformers dynamic KV cache on CUDA, and one greedy CUDA token. Generation reuses that cache and supports greedy decoding at temperature zero or seeded temperature/top-p sampling. It reports `eos`, `stop`, or `length`; explicit token stop sequences can span tokens, and the longest matching suffix is removed before decode. Beam search, batching, repetition penalties, text-fragment buffering, and SSE are not implemented yet.
 
 Pass `measure=True` to `generate_tokens()` to include synchronized time to first token, decode tokens per second, and total generation time in `result.timings`. Constrained calls also report grammar setup, valid-token enumeration, and CUDA mask/ID-transfer time.
 
-The model is downloaded to the external Hugging Face cache. Loading fails instead of falling back to CPU when CUDA is unavailable.
+The models are downloaded to the external Hugging Face cache. Loading fails instead of falling back to CPU when CUDA is unavailable.
 
 The native extension also exposes `onyx_cuda._rust.GrammarConstraint` for model-free regex and JSON-schema compilation with branchable opaque state handles. `onyx_cuda.vocabulary.build_token_byte_vocabulary()` maps the complete model-logit ID space to standalone UTF-8 bytes and reports special/empty-token counts. `onyx_cuda.masking.apply_grammar_mask()` returns a new CUDA logits tensor with invalid token IDs set to negative infinity. Pass `regex=...` or `json_schema=...` and the matching `token_byte_vocabulary` to `generate_tokens()` for constrained decoding; JSON Schema takes precedence when both constraints are supplied. API-level schema objects and JSON compaction are not implemented yet.
 
