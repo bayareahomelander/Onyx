@@ -9,6 +9,7 @@ import torch
 from transformers import PreTrainedModel
 from transformers.cache_utils import Cache
 
+from onyx_cuda.cache import CacheState
 from onyx_cuda.masking import apply_grammar_mask
 from onyx_cuda.prefill import prefill
 from onyx_cuda.vocabulary import TokenByteVocabulary
@@ -120,7 +121,9 @@ def generate_tokens(
         with torch.inference_mode():
             result = prefill(model, prompt_token_ids)
             logits = result.logits
-            cache = result.past_key_values
+            cache = CacheState.from_prefill(
+                result.past_key_values, result.logits.device
+            )
             if grammar_requested:
                 from onyx_cuda import _rust
 
@@ -203,13 +206,7 @@ def generate_tokens(
                 if step + 1 == max_tokens:
                     break
 
-                output = model(
-                    input_ids=token_id[:, None],
-                    past_key_values=cache,
-                    use_cache=True,
-                )
-                cache = output.past_key_values
-                logits = output.logits[:, -1, :]
+                logits = cache.extend(model, token_id[:, None])[:, -1, :]
     finally:
         if constraint is not None and grammar_state is not None:
             constraint.release_state(grammar_state)
@@ -244,4 +241,6 @@ def generate_tokens(
             ).decode("utf-8")
         )
 
-    return GenerationResult(generated, cache, finish_reason, timings)
+    return GenerationResult(
+        generated, cache.past_key_values, finish_reason, timings
+    )
