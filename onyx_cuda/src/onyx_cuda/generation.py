@@ -87,6 +87,38 @@ def _validate_generation_options(
         raise ValueError("seed must be an integer")
 
 
+def _validate_grammar_request(
+    regex: str | None,
+    token_byte_vocabulary: TokenByteVocabulary | None,
+    json_schema: str | None,
+) -> bool:
+    grammar_requested = regex is not None or json_schema is not None
+    if grammar_requested and token_byte_vocabulary is None:
+        raise ValueError("token_byte_vocabulary is required when a grammar is set")
+    return grammar_requested
+
+
+def _initialize_grammar_constraint(
+    logits_vocab_size: int,
+    regex: str | None,
+    token_byte_vocabulary: TokenByteVocabulary,
+    json_schema: str | None,
+):
+    from onyx_cuda import _rust
+
+    token_bytes = token_byte_vocabulary.token_bytes
+    if len(token_bytes) != logits_vocab_size:
+        raise ValueError(
+            "token_byte_vocabulary must match the model logits width"
+        )
+    constraint = _rust.GrammarConstraint(token_bytes)
+    if json_schema is not None:
+        constraint.compile_json_schema(json_schema)
+    else:
+        constraint.compile_regex(regex)
+    return constraint, constraint.init_state()
+
+
 def generate_tokens(
     model: PreTrainedModel,
     prompt_token_ids: list[int],
@@ -103,9 +135,9 @@ def generate_tokens(
 ) -> GenerationResult:
     """Generate at most max_tokens with greedy or top-p sampling."""
     _validate_generation_options(max_tokens, temperature, top_p, seed)
-    grammar_requested = regex is not None or json_schema is not None
-    if grammar_requested and token_byte_vocabulary is None:
-        raise ValueError("token_byte_vocabulary is required when a grammar is set")
+    grammar_requested = _validate_grammar_request(
+        regex, token_byte_vocabulary, json_schema
+    )
 
     if isinstance(eos_token_ids, int):
         eos_token_ids = [eos_token_ids]
@@ -134,20 +166,13 @@ def generate_tokens(
                 result.past_key_values, result.logits.device
             )
             if grammar_requested:
-                from onyx_cuda import _rust
-
-                token_bytes = token_byte_vocabulary.token_bytes
-                if len(token_bytes) != logits.shape[-1]:
-                    raise ValueError(
-                        "token_byte_vocabulary must match the model logits width"
-                    )
                 compile_started_at = time.perf_counter() if measure else None
-                constraint = _rust.GrammarConstraint(token_bytes)
-                if json_schema is not None:
-                    constraint.compile_json_schema(json_schema)
-                else:
-                    constraint.compile_regex(regex)
-                grammar_state = constraint.init_state()
+                constraint, grammar_state = _initialize_grammar_constraint(
+                    logits.shape[-1],
+                    regex,
+                    token_byte_vocabulary,
+                    json_schema,
+                )
                 if compile_started_at is not None:
                     grammar_compile_seconds = (
                         time.perf_counter() - compile_started_at

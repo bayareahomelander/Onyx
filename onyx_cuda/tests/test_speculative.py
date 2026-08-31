@@ -1,3 +1,4 @@
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -6,7 +7,7 @@ import torch
 import onyx_cuda.speculative as speculative_module
 from onyx_cuda.benchmark import MAX_TOKENS, PROMPTS
 from onyx_cuda.cache import CacheState
-from onyx_cuda.generation import generate_tokens
+from onyx_cuda.generation import GenerationResult, generate_tokens
 from onyx_cuda.model import load_model_pair
 from onyx_cuda.prefill import prefill
 from onyx_cuda.prompt import format_prompt
@@ -16,6 +17,10 @@ from onyx_cuda.speculative import (
     generate_speculative,
     propose_tokens,
     verify_proposal,
+)
+from onyx_cuda.vocabulary import (
+    TokenByteVocabulary,
+    build_token_byte_vocabulary,
 )
 
 
@@ -30,13 +35,114 @@ class ScriptedCache:
     def extend(self, model, input_ids):
         self.inputs.extend(input_ids.flatten().tolist())
         self.length += input_ids.shape[1]
-        logits = torch.full((1, input_ids.shape[1], 16), -torch.inf)
+        logits = torch.full((1, input_ids.shape[1], 16), -1.0)
         for position in range(input_ids.shape[1]):
             logits[0, position, next(self.token_ids)] = 0
         return logits
 
     def crop(self, length):
         self.length = length
+
+
+class TrackingGrammar:
+    def __init__(self, valid_tokens, matching_histories):
+        self.valid_tokens = valid_tokens
+        self.matching_histories = set(matching_histories)
+        self.states = {}
+        self.next_state = 1
+        self.advance_calls = []
+
+    @property
+    def active_states(self):
+        return set(self.states)
+
+    def init_state(self):
+        state = self.next_state
+        self.next_state += 1
+        self.states[state] = ()
+        return state
+
+    def get_valid_token_ids(self, state):
+        return self.valid_tokens.get(self.states[state], [])
+
+    def advance_state(self, state, token_id):
+        history = self.states[state]
+        self.advance_calls.append((history, token_id))
+        next_state = self.next_state
+        self.next_state += 1
+        self.states[next_state] = (*history, token_id)
+        return next_state
+
+    def is_match_state(self, state):
+        return self.states[state] in self.matching_histories
+
+    def release_states(self, states):
+        for state in states:
+            if state not in self.states:
+                raise ValueError(f"unknown grammar state {state}")
+        for state in states:
+            del self.states[state]
+
+
+def _cpu_grammar_mask(logits, valid_token_ids):
+    masked = torch.full_like(logits, -torch.inf)
+    masked[..., valid_token_ids] = logits[..., valid_token_ids]
+    return masked
+
+
+def _run_scripted_constrained_speculation(
+    monkeypatch,
+    grammar,
+    *,
+    draft_tokens,
+    target_tokens,
+    max_tokens=3,
+    regex="pattern",
+    json_schema=None,
+    vocabulary=None,
+):
+    draft_model = object()
+    target_model = object()
+    draft_cache = ScriptedCache(draft_tokens)
+    target_cache = ScriptedCache(target_tokens)
+
+    def scripted_prefill(model, prompt_token_ids):
+        cache = draft_cache if model is draft_model else target_cache
+        logits = torch.full((1, 16), -1.0)
+        logits[0, 1] = 0
+        return SimpleNamespace(
+            logits=logits,
+            past_key_values=cache,
+            token_id=torch.tensor([1]),
+        )
+
+    monkeypatch.setattr(speculative_module, "prefill", scripted_prefill)
+    monkeypatch.setattr(
+        speculative_module.CacheState,
+        "from_prefill",
+        classmethod(lambda cls, cache, device: cache),
+    )
+    monkeypatch.setattr(
+        speculative_module,
+        "_initialize_grammar_constraint",
+        lambda *args: (grammar, grammar.init_state()),
+    )
+    monkeypatch.setattr(
+        speculative_module, "apply_grammar_mask", _cpu_grammar_mask
+    )
+    vocabulary = vocabulary or TokenByteVocabulary([b""] * 16, 0, 16)
+    result = generate_speculative(
+        draft_model,
+        target_model,
+        [0],
+        max_tokens=max_tokens,
+        gamma=4,
+        eos_token_ids=15,
+        regex=regex,
+        token_byte_vocabulary=vocabulary,
+        json_schema=json_schema,
+    )
+    return result, draft_cache, target_cache
 
 
 def _run_scripted_speculation(
@@ -91,6 +197,102 @@ def test_speculative_options_fail_before_prefill(monkeypatch):
         generate_speculative(object(), object(), [0], 1, 0, [])
     with pytest.raises(ValueError, match="max_tokens"):
         generate_speculative(object(), object(), [0], 0, 1, [])
+    with pytest.raises(ValueError, match="token_byte_vocabulary"):
+        generate_speculative(
+            object(), object(), [0], 1, 1, [], regex="CUDA"
+        )
+
+
+def test_constrained_rejection_verifies_from_canonical_state_and_releases(
+    monkeypatch,
+):
+    grammar = TrackingGrammar(
+        {(): [1], (1,): [2, 3]},
+        {(1, 3)},
+    )
+    result, _, _ = _run_scripted_constrained_speculation(
+        monkeypatch,
+        grammar,
+        draft_tokens=[2],
+        target_tokens=[3, 0],
+    )
+
+    assert result == GenerationResult([1, 3], result.past_key_values, "stop")
+    assert ((1,), 2) in grammar.advance_calls
+    assert ((1,), 3) in grammar.advance_calls
+    assert ((1, 2), 3) not in grammar.advance_calls
+    assert not grammar.active_states
+
+
+def test_constrained_draft_masks_invalid_token_and_validates_json(monkeypatch):
+    grammar = TrackingGrammar(
+        {(): [1], (1,): [2]},
+        {(1, 2)},
+    )
+    token_bytes = [b""] * 16
+    token_bytes[1] = b"{"
+    token_bytes[2] = b"}"
+    vocabulary = TokenByteVocabulary(token_bytes, 0, 14)
+    result, _, _ = _run_scripted_constrained_speculation(
+        monkeypatch,
+        grammar,
+        draft_tokens=[7, 0],
+        target_tokens=[2, 9],
+        regex="ignored",
+        json_schema='{"type":"object"}',
+        vocabulary=vocabulary,
+    )
+
+    assert result.token_ids == [1, 2]
+    assert result.finish_reason == "stop"
+    assert ((1,), 2) in grammar.advance_calls
+    assert all(token_id != 7 for _, token_id in grammar.advance_calls)
+    assert not grammar.active_states
+
+
+def test_constrained_error_releases_every_state(monkeypatch):
+    grammar = TrackingGrammar({(): [1], (1,): []}, set())
+
+    with pytest.raises(ValueError, match="no valid token continuation"):
+        _run_scripted_constrained_speculation(
+            monkeypatch,
+            grammar,
+            draft_tokens=[2],
+            target_tokens=[2],
+        )
+
+    assert not grammar.active_states
+
+
+def test_sampled_speculation_forwards_grammar_to_target(monkeypatch):
+    vocabulary = TokenByteVocabulary([b"x"], 0, 0)
+    expected = GenerationResult([0], object(), "length")
+    captured = {}
+
+    def fake_generate_tokens(*args, **kwargs):
+        captured.update(kwargs)
+        return expected
+
+    monkeypatch.setattr(
+        speculative_module, "generate_tokens", fake_generate_tokens
+    )
+    result = generate_speculative(
+        object(),
+        object(),
+        [0],
+        max_tokens=1,
+        gamma=1,
+        eos_token_ids=[],
+        temperature=0.8,
+        regex="x",
+        token_byte_vocabulary=vocabulary,
+        json_schema='{"type":"string"}',
+    )
+
+    assert result is expected
+    assert captured["regex"] == "x"
+    assert captured["token_byte_vocabulary"] is vocabulary
+    assert captured["json_schema"] == '{"type":"string"}'
 
 
 @pytest.mark.parametrize(
@@ -395,6 +597,74 @@ def test_real_speculation_matches_target_oracle_and_rejects_cleanly():
     )
     assert sampled_speculative.token_ids == sampled_oracle.token_ids
     assert sampled_speculative.finish_reason == sampled_oracle.finish_reason
+
+    vocabulary = build_token_byte_vocabulary(
+        pair.target.tokenizer, pair.target.model.config.vocab_size
+    )
+    regex_oracle = generate_tokens(
+        pair.target.model,
+        prompt.token_ids,
+        max_tokens=MAX_TOKENS,
+        eos_token_ids=eos_token_id,
+        regex="CUDA Ready",
+        token_byte_vocabulary=vocabulary,
+    )
+    for gamma in (1, 4):
+        constrained = generate_speculative(
+            pair.draft.model,
+            pair.target.model,
+            prompt.token_ids,
+            max_tokens=MAX_TOKENS,
+            gamma=gamma,
+            eos_token_ids=eos_token_id,
+            regex="CUDA Ready",
+            token_byte_vocabulary=vocabulary,
+        )
+        assert constrained.token_ids == regex_oracle.token_ids
+        assert constrained.finish_reason == regex_oracle.finish_reason
+
+    schema = json.dumps(
+        {
+            "type": "object",
+            "properties": {
+                "content": {"enum": ["CUDA ready", "Ready"]}
+            },
+            "required": ["content"],
+        },
+        separators=(",", ":"),
+    )
+    json_prompt = format_prompt(
+        pair.target.tokenizer,
+        [
+            {"role": "system", "content": "Return compact JSON only."},
+            {
+                "role": "user",
+                "content": "Use no spaces or newlines in the JSON response.",
+            },
+        ],
+    )
+    json_oracle = generate_tokens(
+        pair.target.model,
+        json_prompt.token_ids,
+        max_tokens=64,
+        eos_token_ids=eos_token_id,
+        json_schema=schema,
+        token_byte_vocabulary=vocabulary,
+    )
+    for gamma in (1, 4):
+        constrained = generate_speculative(
+            pair.draft.model,
+            pair.target.model,
+            json_prompt.token_ids,
+            max_tokens=64,
+            gamma=gamma,
+            eos_token_ids=eos_token_id,
+            token_byte_vocabulary=vocabulary,
+            json_schema=schema,
+        )
+        assert constrained.token_ids == json_oracle.token_ids
+        assert constrained.finish_reason == json_oracle.finish_reason
+        assert json.loads(pair.target.tokenizer.decode(constrained.token_ids))
 
     print(f"speculative_oracle_token_ids={oracle_ids}")
     print(f"rejected_replay_max_abs_differences={max_replay_differences}")
