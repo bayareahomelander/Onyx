@@ -1,6 +1,7 @@
 """OpenAI-shaped request and response models plus the HTTP application factory."""
 
 import gc
+import json
 import sys
 from contextlib import asynccontextmanager
 from time import time
@@ -12,6 +13,7 @@ from pydantic import BaseModel, Field
 
 MODEL_ID = "onyx-speculative"
 SERVICE_VERSION = "0.1.0"
+GAMMA = 4
 
 
 class ChatMessage(BaseModel):
@@ -107,6 +109,96 @@ def get_engine(app: FastAPI, model: str = MODEL_ID) -> Any:
             detail=f"Unknown model '{model}'. Available: {list(engines)}",
         )
     return engines[model]
+
+
+def format_messages_as_prompt(messages: list[ChatMessage]) -> str:
+    parts = []
+    for message in messages:
+        if message.role == "system":
+            parts.append(f"System: {message.content}")
+        elif message.role == "user":
+            parts.append(f"User: {message.content}")
+        elif message.role == "assistant":
+            parts.append(f"Assistant: {message.content}")
+    parts.append("Assistant:")
+    return "\n".join(parts)
+
+
+def _encode_text(tokenizer, text: str) -> list[int]:
+    try:
+        token_ids = tokenizer.encode(text, add_special_tokens=False)
+    except TypeError:
+        token_ids = tokenizer.encode(text)
+    return list(token_ids)
+
+
+def format_request_messages(
+    messages: list[ChatMessage], tokenizer
+) -> tuple[str, list[int]]:
+    chat_messages = [
+        {"role": message.role, "content": message.content} for message in messages
+    ]
+    apply_chat_template = getattr(tokenizer, "apply_chat_template", None)
+    if apply_chat_template is not None:
+        try:
+            text = apply_chat_template(
+                chat_messages, tokenize=False, add_generation_prompt=True
+            )
+            token_ids = apply_chat_template(
+                chat_messages, tokenize=True, add_generation_prompt=True
+            )
+            return text, list(token_ids)
+        except TypeError:
+            pass
+    text = format_messages_as_prompt(messages)
+    return text, _encode_text(tokenizer, text)
+
+
+def resolve_stop_sequences(
+    stop: list[str] | None, tokenizer
+) -> list[list[int]] | None:
+    if not stop:
+        return None
+    sequences = []
+    for sequence in stop:
+        if not sequence:
+            continue
+        token_ids = _encode_text(tokenizer, sequence)
+        if token_ids:
+            sequences.append(token_ids)
+    return sequences or None
+
+
+def prepare_generation(request: ChatCompletionRequest, engine) -> dict[str, Any]:
+    tokenizer = engine.target.tokenizer
+    _text, prompt_token_ids = format_request_messages(request.messages, tokenizer)
+    json_schema = (
+        json.dumps(request.json_schema) if request.json_schema is not None else None
+    )
+    arguments = {
+        "draft_model": engine.draft.model,
+        "target_model": engine.target.model,
+        "prompt_token_ids": prompt_token_ids,
+        "max_tokens": request.max_tokens,
+        "gamma": GAMMA,
+        "eos_token_ids": tokenizer.eos_token_id,
+        "stop_sequences": resolve_stop_sequences(request.stop, tokenizer),
+        "temperature": request.temperature,
+        "top_p": request.top_p,
+        "regex": request.regex,
+        "json_schema": json_schema,
+    }
+    if request.regex is not None or json_schema is not None:
+        arguments["token_byte_vocabulary"] = _build_vocabulary(
+            tokenizer, engine.target.model.config.vocab_size
+        )
+    return arguments
+
+
+def _build_vocabulary(tokenizer, logits_vocab_size):
+    from onyx_cuda.vocabulary import build_token_byte_vocabulary
+
+    return build_token_byte_vocabulary(tokenizer, logits_vocab_size)
 
 
 def create_app(
