@@ -48,7 +48,7 @@ print(generated.finish_reason)
 
 `onyx_cuda.speculative.generate_speculative()` runs greedy fixed-gamma decoding with `gamma >= 1`, exact `max_tokens`, EOS, and overlapping token-stop handling and returns the same token/cache/finish-reason result shape as `generate_tokens()`. It accepts the same `regex`, `json_schema`, and `token_byte_vocabulary` inputs, masks both draft and target choices, verifies from the canonical grammar branch, and releases every temporary state. Positive-temperature requests, including constrained requests, are routed unchanged through the trustworthy target-only temperature/top-p sampler; sampled speculative acceptance is not approximated. Streaming and serving are not implemented yet.
 
-The Qwen chat template uses `<|im_end|>` (ID 151645) as EOS, `<|endoftext|>` (ID 151643) as padding, and no BOS token. A formatted prompt ends with `<|im_start|>assistant\n` rather than EOS so generation can begin. API request models and fallback prompt formatting are not implemented yet.
+The Qwen chat template uses `<|im_end|>` (ID 151645) as EOS, `<|endoftext|>` (ID 151643) as padding, and no BOS token. A formatted prompt ends with `<|im_start|>assistant\n` rather than EOS so generation can begin. `onyx_cuda.server` defines OpenAI-shaped request and response models, including regex, JSON Schema, compact JSON, usage, chunks, and Onyx metrics. Fallback prompt formatting, HTTP routes, and serving are not implemented yet.
 
 The single prefill returns last-position vocabulary logits, a Transformers dynamic KV cache on CUDA, and one greedy CUDA token. Generation reuses that cache and supports greedy decoding at temperature zero or seeded temperature/top-p sampling. It reports `eos`, `stop`, or `length`; explicit token stop sequences can span tokens, and the longest matching suffix is removed before decode. Beam search, batching, repetition penalties, text-fragment buffering, and SSE are not implemented yet.
 
@@ -56,7 +56,7 @@ Pass `measure=True` to `generate_tokens()` to include synchronized time to first
 
 The models are downloaded to the external Hugging Face cache. Loading fails instead of falling back to CPU when CUDA is unavailable.
 
-The native extension also exposes `onyx_cuda._rust.GrammarConstraint` for model-free regex and JSON-schema compilation with branchable opaque state handles. `onyx_cuda.vocabulary.build_token_byte_vocabulary()` maps the complete model-logit ID space to standalone UTF-8 bytes and reports special/empty-token counts. `onyx_cuda.masking.apply_grammar_mask()` returns a new CUDA logits tensor with invalid token IDs set to negative infinity. Pass `regex=...` or `json_schema=...` and the matching `token_byte_vocabulary` to `generate_tokens()` for constrained decoding; JSON Schema takes precedence when both constraints are supplied. API-level schema objects and JSON compaction are not implemented yet.
+The native extension also exposes `onyx_cuda._rust.GrammarConstraint` for model-free regex and JSON-schema compilation with branchable opaque state handles. `onyx_cuda.vocabulary.build_token_byte_vocabulary()` maps the complete model-logit ID space to standalone UTF-8 bytes and reports special/empty-token counts. `onyx_cuda.masking.apply_grammar_mask()` returns a new CUDA logits tensor with invalid token IDs set to negative infinity. Pass `regex=...` or `json_schema=...` and the matching `token_byte_vocabulary` to `generate_tokens()` for constrained decoding; JSON Schema takes precedence when both constraints are supplied. Request models accept JSON Schema objects and a compact-JSON flag; API-level compaction and routing are not implemented yet.
 
 ## Windows development setup
 
@@ -71,6 +71,8 @@ py -3.12 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -e ".[dev]"
 .\.venv\Scripts\python.exe -m pip check
 ```
+
+The optional `server` extra pins FastAPI 0.141.1, Pydantic 2.13.5, Uvicorn 0.52.4, and httpx 0.28.1. `.[dev]` includes that extra so request/response models import. HTTP serving is not implemented yet.
 
 Install the CUDA wheel before the project dependency so pip cannot silently select a CPU-only PyTorch build. The validated baseline is:
 

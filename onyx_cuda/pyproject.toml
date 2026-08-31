@@ -13,9 +13,16 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+server = [
+    "fastapi==0.141.1",
+    "pydantic==2.13.5",
+    "uvicorn==0.52.4",
+    "httpx==0.28.1",
+]
 dev = [
     "maturin==1.14.1",
     "pytest==9.1.1",
+    "onyx-cuda[server]",
 ]
 
 [tool.maturin]
