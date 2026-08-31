@@ -46,9 +46,9 @@ print(generated.finish_reason)
 
 `onyx_cuda.model.load_model_pair()` loads that model as the draft together with `Qwen/Qwen2.5-1.5B-Instruct` as the FP16 target. It rejects the pair unless logits widths, every token ID's decoded bytes, special/EOS IDs, and chat-template output are identical. Both models fit and complete cached forwards together on the validated 6 GB GPU. The same `generate_tokens()` path is verified against Transformers greedy output for the 1.5B target, including regex and JSON constraints.
 
-`onyx_cuda.speculative.generate_speculative()` runs greedy fixed-gamma decoding with `gamma >= 1`, exact `max_tokens`, EOS, and overlapping token-stop handling and returns the same token/cache/finish-reason result shape as `generate_tokens()`. It accepts the same `regex`, `json_schema`, and `token_byte_vocabulary` inputs, masks both draft and target choices, verifies from the canonical grammar branch, and releases every temporary state. Positive-temperature requests, including constrained requests, are routed unchanged through the trustworthy target-only temperature/top-p sampler; sampled speculative acceptance is not approximated. Streaming and serving are not implemented yet.
+`onyx_cuda.speculative.generate_speculative()` runs greedy fixed-gamma decoding with `gamma >= 1`, exact `max_tokens`, EOS, and overlapping token-stop handling and returns the same token/cache/finish-reason result shape as `generate_tokens()`. It accepts the same `regex`, `json_schema`, and `token_byte_vocabulary` inputs, masks both draft and target choices, verifies from the canonical grammar branch, and releases every temporary state. Positive-temperature requests, including constrained requests, are routed unchanged through the trustworthy target-only temperature/top-p sampler; sampled speculative acceptance is not approximated. Streaming and chat-completions serving are not implemented yet.
 
-The Qwen chat template uses `<|im_end|>` (ID 151645) as EOS, `<|endoftext|>` (ID 151643) as padding, and no BOS token. A formatted prompt ends with `<|im_start|>assistant\n` rather than EOS so generation can begin. `onyx_cuda.server` defines OpenAI-shaped request and response models, including regex, JSON Schema, compact JSON, usage, chunks, and Onyx metrics. Fallback prompt formatting, HTTP routes, and serving are not implemented yet.
+The Qwen chat template uses `<|im_end|>` (ID 151645) as EOS, `<|endoftext|>` (ID 151643) as padding, and no BOS token. A formatted prompt ends with `<|im_start|>assistant\n` rather than EOS so generation can begin. `onyx_cuda.server.create_app()` builds a FastAPI app that loads the configured 0.5B/1.5B pair once at startup, serves `GET /` and `GET /v1/models` from the engine registry, and drops registry plus CUDA cache memory at shutdown. Chat completions, fallback prompt formatting, and streaming are not implemented yet.
 
 The single prefill returns last-position vocabulary logits, a Transformers dynamic KV cache on CUDA, and one greedy CUDA token. Generation reuses that cache and supports greedy decoding at temperature zero or seeded temperature/top-p sampling. It reports `eos`, `stop`, or `length`; explicit token stop sequences can span tokens, and the longest matching suffix is removed before decode. Beam search, batching, repetition penalties, text-fragment buffering, and SSE are not implemented yet.
 
@@ -72,7 +72,7 @@ py -3.12 -m venv .venv
 .\.venv\Scripts\python.exe -m pip check
 ```
 
-The optional `server` extra pins FastAPI 0.141.1, Pydantic 2.13.5, Uvicorn 0.52.4, and httpx 0.28.1. `.[dev]` includes that extra so request/response models import. HTTP serving is not implemented yet.
+The optional `server` extra pins FastAPI 0.141.1, Pydantic 2.13.5, Uvicorn 0.52.4, and httpx 0.28.1. `.[dev]` includes that extra so request/response models and `create_app()` import. Chat-completions serving is not implemented yet.
 
 Install the CUDA wheel before the project dependency so pip cannot silently select a CPU-only PyTorch build. The validated baseline is:
 

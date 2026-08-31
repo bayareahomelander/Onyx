@@ -33,7 +33,9 @@ def test_server_import_does_not_load_a_model():
             "assert 'onyx_cuda.generation' not in mods\n"
             "assert 'onyx_cuda.speculative' not in mods\n"
             "assert 'onyx' not in mods\n"
-            "assert hasattr(server, 'ChatCompletionRequest')\n",
+            "assert hasattr(server, 'ChatCompletionRequest')\n"
+            "assert hasattr(server, 'create_app')\n"
+            "assert not hasattr(server, 'app')\n",
         ],
         env=env,
         capture_output=True,
