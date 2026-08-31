@@ -25,7 +25,11 @@ def test_create_app_does_not_load_until_lifespan():
         body = root.json()
         assert body["status"] == "ok"
         assert body["service"] == "Onyx CUDA API"
-        assert body["endpoints"] == ["/", "/v1/models"]
+        assert body["endpoints"] == [
+            "/",
+            "/v1/models",
+            "/v1/chat/completions",
+        ]
         models = client.get("/v1/models")
         assert models.status_code == 200
         ids = [item["id"] for item in models.json()["data"]]

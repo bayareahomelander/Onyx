@@ -132,18 +132,12 @@ def _encode_text(tokenizer, text: str) -> list[int]:
     return list(token_ids)
 
 
-def format_request_messages(
-    messages: list[ChatMessage], tokenizer
-) -> tuple[str, list[int]]:
-    chat_messages = [
-        {"role": message.role, "content": message.content} for message in messages
-    ]
+def format_request_messages(messages: list[ChatMessage], tokenizer) -> tuple[str, list[int]]:
+    chat_messages = [{"role": message.role, "content": message.content} for message in messages]
     apply_chat_template = getattr(tokenizer, "apply_chat_template", None)
     if apply_chat_template is not None:
         try:
-            text = apply_chat_template(
-                chat_messages, tokenize=False, add_generation_prompt=True
-            )
+            text = apply_chat_template(chat_messages, tokenize=False, add_generation_prompt=True)
             token_ids = apply_chat_template(
                 chat_messages, tokenize=True, add_generation_prompt=True
             )
@@ -154,9 +148,7 @@ def format_request_messages(
     return text, _encode_text(tokenizer, text)
 
 
-def resolve_stop_sequences(
-    stop: list[str] | None, tokenizer
-) -> list[list[int]] | None:
+def resolve_stop_sequences(stop: list[str] | None, tokenizer) -> list[list[int]] | None:
     if not stop:
         return None
     sequences = []
@@ -172,9 +164,7 @@ def resolve_stop_sequences(
 def prepare_generation(request: ChatCompletionRequest, engine) -> dict[str, Any]:
     tokenizer = engine.target.tokenizer
     _text, prompt_token_ids = format_request_messages(request.messages, tokenizer)
-    json_schema = (
-        json.dumps(request.json_schema) if request.json_schema is not None else None
-    )
+    json_schema = json.dumps(request.json_schema) if request.json_schema is not None else None
     arguments = {
         "draft_model": engine.draft.model,
         "target_model": engine.target.model,
@@ -193,6 +183,30 @@ def prepare_generation(request: ChatCompletionRequest, engine) -> dict[str, Any]
             tokenizer, engine.target.model.config.vocab_size
         )
     return arguments
+
+
+def truncate_at_stop(text: str, stop: list[str] | None) -> str:
+    positions = [text.find(sequence) for sequence in (stop or []) if sequence]
+    positions = [position for position in positions if position >= 0]
+    return text[: min(positions)] if positions else text
+
+
+def _build_metrics(timings, grammar_constrained: bool) -> OnyxMetrics:
+    if timings is None:
+        return OnyxMetrics(grammar_constrained=grammar_constrained)
+    return OnyxMetrics(
+        tokens_per_second=timings.decode_tokens_per_second,
+        acceptance_rate=timings.acceptance_rate,
+        ttft_ms=timings.time_to_first_token_seconds * 1000,
+        grammar_constrained=grammar_constrained,
+        speculative_iterations=timings.speculative_iteration_count,
+    )
+
+
+def _generate(arguments: dict[str, Any]):
+    from onyx_cuda.speculative import generate_speculative
+
+    return generate_speculative(**arguments)
 
 
 def _build_vocabulary(tokenizer, logits_vocab_size):
@@ -237,7 +251,7 @@ def create_app(
             "status": "ok",
             "service": "Onyx CUDA API",
             "version": SERVICE_VERSION,
-            "endpoints": ["/", "/v1/models"],
+            "endpoints": ["/", "/v1/models", "/v1/chat/completions"],
         }
 
     @app.get("/v1/models")
@@ -253,5 +267,52 @@ def create_app(
                 for model_id in getattr(app.state, "engines", {})
             ],
         }
+
+    @app.post("/v1/chat/completions", response_model=ChatCompletionResponse)
+    async def create_chat_completion(request: ChatCompletionRequest):
+        if request.stream:
+            raise HTTPException(status_code=400, detail="Streaming is not implemented")
+
+        engine = get_engine(app, request.model)
+        tokenizer = engine.target.tokenizer
+        arguments = prepare_generation(request, engine)
+        arguments["measure"] = True
+        prompt_tokens = len(arguments["prompt_token_ids"])
+        completion_tokens = 0
+        choices = []
+        last_timings = None
+
+        for index in range(request.n):
+            result = _generate(arguments)
+            completion_tokens += len(result.token_ids)
+            last_timings = result.timings
+            output = tokenizer.decode(result.token_ids, skip_special_tokens=True)
+            output = truncate_at_stop(output, request.stop)
+            if request.json_schema is not None and request.compact_json:
+                try:
+                    output = json.dumps(json.loads(output), separators=(",", ":"))
+                except json.JSONDecodeError:
+                    pass
+            choices.append(
+                ChatCompletionChoice(
+                    index=index,
+                    message=ChatMessage(role="assistant", content=output),
+                    finish_reason=result.finish_reason,
+                )
+            )
+
+        return ChatCompletionResponse(
+            model=request.model,
+            choices=choices,
+            usage=UsageInfo(
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                total_tokens=prompt_tokens + completion_tokens,
+            ),
+            onyx_metrics=_build_metrics(
+                last_timings,
+                request.regex is not None or request.json_schema is not None,
+            ),
+        )
 
     return app
