@@ -9,6 +9,7 @@ from typing import Any, Callable
 from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 MODEL_ID = "onyx-speculative"
@@ -215,6 +216,21 @@ def _build_vocabulary(tokenizer, logits_vocab_size):
     return build_token_byte_vocabulary(tokenizer, logits_vocab_size)
 
 
+async def _invalid_request(_request, error: ValueError) -> JSONResponse:
+    return JSONResponse(status_code=400, content={"detail": str(error)})
+
+
+async def _service_unavailable(_request, _error: Exception) -> JSONResponse:
+    return JSONResponse(
+        status_code=503,
+        content={"detail": "Model or CUDA service unavailable"},
+    )
+
+
+async def _unexpected_error(_request, _error: Exception) -> JSONResponse:
+    return JSONResponse(status_code=500, content={"detail": "Internal server error"})
+
+
 def create_app(
     *,
     engine: Any | None = None,
@@ -244,6 +260,10 @@ def create_app(
         version=SERVICE_VERSION,
         lifespan=lifespan,
     )
+    app.add_exception_handler(ValueError, _invalid_request)
+    app.add_exception_handler(OSError, _service_unavailable)
+    app.add_exception_handler(RuntimeError, _service_unavailable)
+    app.add_exception_handler(Exception, _unexpected_error)
 
     @app.get("/")
     async def root():

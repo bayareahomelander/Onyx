@@ -57,7 +57,10 @@ def _fake_generation(monkeypatch, results):
 
     def generate(arguments):
         calls.append(arguments.copy())
-        return results[len(calls) - 1]
+        result = results[len(calls) - 1]
+        if isinstance(result, Exception):
+            raise result
+        return result
 
     monkeypatch.setattr(server, "_generate", generate)
     return calls
@@ -252,6 +255,101 @@ def test_streaming_request_is_not_run_as_non_streaming(monkeypatch):
     assert response.status_code == 400
     assert response.json() == {"detail": "Streaming is not implemented"}
     assert calls == []
+
+
+@pytest.mark.parametrize(
+    "invalid_field",
+    [
+        {"top_p": 0},
+        {"json_schema": "not an object"},
+    ],
+)
+def test_request_validation_stays_422_and_does_not_generate(monkeypatch, invalid_field):
+    tokenizer = FakeTokenizer({(10,): "Ready"})
+    calls = _fake_generation(monkeypatch, [_result([10], "stop")])
+
+    with TestClient(create_app(engine=_engine(tokenizer))) as client:
+        invalid = client.post(
+            "/v1/chat/completions",
+            json={
+                "messages": [{"role": "user", "content": "Hi"}],
+                **invalid_field,
+            },
+        )
+        valid = client.post(
+            "/v1/chat/completions",
+            json={"messages": [{"role": "user", "content": "Hi"}]},
+        )
+
+    assert invalid.status_code == 422
+    assert valid.status_code == 200
+    assert len(calls) == 1
+
+
+def test_unknown_model_stays_400_and_next_request_succeeds(monkeypatch):
+    tokenizer = FakeTokenizer({(10,): "Ready"})
+    calls = _fake_generation(monkeypatch, [_result([10], "stop")])
+
+    with TestClient(create_app(engine=_engine(tokenizer))) as client:
+        invalid = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "missing",
+                "messages": [{"role": "user", "content": "Hi"}],
+            },
+        )
+        valid = client.post(
+            "/v1/chat/completions",
+            json={"messages": [{"role": "user", "content": "Hi"}]},
+        )
+
+    assert invalid.status_code == 400
+    assert "missing" in invalid.json()["detail"]
+    assert valid.status_code == 200
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize(
+    ("error", "status_code", "detail"),
+    [
+        (ValueError("invalid regex"), 400, "invalid regex"),
+        (
+            RuntimeError("CUDA is unavailable"),
+            503,
+            "Model or CUDA service unavailable",
+        ),
+        (
+            OSError("model is unavailable"),
+            503,
+            "Model or CUDA service unavailable",
+        ),
+        (LookupError("private traceback detail"), 500, "Internal server error"),
+    ],
+)
+def test_generation_errors_are_mapped_and_next_request_succeeds(
+    monkeypatch, error, status_code, detail
+):
+    tokenizer = FakeTokenizer({(10,): "Ready"})
+    calls = _fake_generation(
+        monkeypatch,
+        [error, _result([10], "stop")],
+    )
+
+    with TestClient(create_app(engine=_engine(tokenizer)), raise_server_exceptions=False) as client:
+        failed = client.post(
+            "/v1/chat/completions",
+            json={"messages": [{"role": "user", "content": "Hi"}]},
+        )
+        valid = client.post(
+            "/v1/chat/completions",
+            json={"messages": [{"role": "user", "content": "Hi"}]},
+        )
+
+    assert failed.status_code == status_code
+    assert failed.json() == {"detail": detail}
+    assert "traceback" not in failed.text.lower()
+    assert valid.status_code == 200
+    assert len(calls) == 2
 
 
 def test_real_cuda_request_matches_direct_generation_content_and_counts():
