@@ -152,11 +152,13 @@ def _run_scripted_speculation(
     draft_tokens,
     target_tokens,
     max_tokens,
+    gamma=4,
     eos=15,
     stops=None,
+    measure=False,
 ):
-    draft_model = object()
-    target_model = object()
+    draft_model = torch.nn.Linear(1, 1) if measure else object()
+    target_model = torch.nn.Linear(1, 1) if measure else object()
     draft_cache = ScriptedCache(draft_tokens)
     target_cache = ScriptedCache(target_tokens)
 
@@ -179,9 +181,10 @@ def _run_scripted_speculation(
         target_model,
         [0],
         max_tokens=max_tokens,
-        gamma=4,
+        gamma=gamma,
         eos_token_ids=eos,
         stop_sequences=stops,
+        measure=measure,
     )
     return result, draft_cache, target_cache
 
@@ -293,6 +296,33 @@ def test_sampled_speculation_forwards_grammar_to_target(monkeypatch):
     assert captured["regex"] == "x"
     assert captured["token_byte_vocabulary"] is vocabulary
     assert captured["json_schema"] == '{"type":"string"}'
+    assert captured["measure"] is False
+
+
+def test_speculative_metrics_count_proposals_and_stages(monkeypatch):
+    result, _, _ = _run_scripted_speculation(
+        monkeypatch,
+        first_token=1,
+        draft_tokens=[2, 3, 0],
+        target_tokens=[2, 4, 9, 5],
+        max_tokens=4,
+        gamma=2,
+        measure=True,
+    )
+
+    assert result.token_ids == [1, 2, 4, 5]
+    assert result.finish_reason == "length"
+    assert result.timings is not None
+    assert result.timings.proposed_token_count == 2
+    assert result.timings.accepted_proposal_count == 1
+    assert result.timings.acceptance_rate == 0.5
+    assert result.timings.speculative_iteration_count == 2
+    assert result.timings.draft_seconds >= 0
+    assert result.timings.verify_seconds >= 0
+    assert result.timings.mask_seconds == 0
+    assert result.timings.total_seconds >= (
+        result.timings.time_to_first_token_seconds
+    )
 
 
 @pytest.mark.parametrize(
@@ -563,7 +593,8 @@ def test_real_speculation_matches_target_oracle_and_rejects_cleanly():
             eos_token_ids=eos_token_id,
         )
         oracle_ids[name] = oracle.token_ids
-        for gamma in (1, 4):
+        for gamma in (1, 2, 4):
+            measure = name == "cuda_ready" and gamma == 2
             speculative = generate_speculative(
                 pair.draft.model,
                 pair.target.model,
@@ -571,9 +602,19 @@ def test_real_speculation_matches_target_oracle_and_rejects_cleanly():
                 max_tokens=MAX_TOKENS,
                 gamma=gamma,
                 eos_token_ids=eos_token_id,
+                measure=measure,
             )
             assert speculative.token_ids == oracle.token_ids
             assert speculative.finish_reason == oracle.finish_reason
+            if measure:
+                assert speculative.timings is not None
+                assert speculative.timings.proposed_token_count > 0
+                assert speculative.timings.accepted_proposal_count >= 0
+                assert 0 <= speculative.timings.acceptance_rate <= 1
+                assert speculative.timings.speculative_iteration_count > 0
+                assert speculative.timings.draft_seconds > 0
+                assert speculative.timings.verify_seconds > 0
+                assert speculative.timings.mask_seconds == 0
 
     sampled_oracle = generate_tokens(
         pair.target.model,
@@ -609,7 +650,7 @@ def test_real_speculation_matches_target_oracle_and_rejects_cleanly():
         regex="CUDA Ready",
         token_byte_vocabulary=vocabulary,
     )
-    for gamma in (1, 4):
+    for gamma in (1, 2, 4):
         constrained = generate_speculative(
             pair.draft.model,
             pair.target.model,
@@ -619,9 +660,14 @@ def test_real_speculation_matches_target_oracle_and_rejects_cleanly():
             eos_token_ids=eos_token_id,
             regex="CUDA Ready",
             token_byte_vocabulary=vocabulary,
+            measure=gamma == 2,
         )
         assert constrained.token_ids == regex_oracle.token_ids
         assert constrained.finish_reason == regex_oracle.finish_reason
+        if gamma == 2:
+            assert constrained.timings is not None
+            assert constrained.timings.grammar_compile_seconds > 0
+            assert constrained.timings.mask_seconds > 0
 
     schema = json.dumps(
         {
@@ -651,7 +697,7 @@ def test_real_speculation_matches_target_oracle_and_rejects_cleanly():
         json_schema=schema,
         token_byte_vocabulary=vocabulary,
     )
-    for gamma in (1, 4):
+    for gamma in (1, 2, 4):
         constrained = generate_speculative(
             pair.draft.model,
             pair.target.model,

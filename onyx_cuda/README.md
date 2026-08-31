@@ -46,13 +46,13 @@ print(generated.finish_reason)
 
 `onyx_cuda.model.load_model_pair()` loads that model as the draft together with `Qwen/Qwen2.5-1.5B-Instruct` as the FP16 target. It rejects the pair unless logits widths, every token ID's decoded bytes, special/EOS IDs, and chat-template output are identical. Both models fit and complete cached forwards together on the validated 6 GB GPU. The same `generate_tokens()` path is verified against Transformers greedy output for the 1.5B target, including regex and JSON constraints.
 
-`onyx_cuda.speculative.generate_speculative()` runs greedy fixed-gamma decoding with `gamma >= 1`, exact `max_tokens`, EOS, and overlapping token-stop handling and returns the same token/cache/finish-reason result shape as `generate_tokens()`. It accepts the same `regex`, `json_schema`, and `token_byte_vocabulary` inputs, masks both draft and target choices, verifies from the canonical grammar branch, and releases every temporary state. Positive-temperature requests, including constrained requests, are routed unchanged through the trustworthy target-only temperature/top-p sampler; sampled speculative acceptance is not approximated. Speculative metrics, streaming, and serving are not implemented yet.
+`onyx_cuda.speculative.generate_speculative()` runs greedy fixed-gamma decoding with `gamma >= 1`, exact `max_tokens`, EOS, and overlapping token-stop handling and returns the same token/cache/finish-reason result shape as `generate_tokens()`. It accepts the same `regex`, `json_schema`, and `token_byte_vocabulary` inputs, masks both draft and target choices, verifies from the canonical grammar branch, and releases every temporary state. Positive-temperature requests, including constrained requests, are routed unchanged through the trustworthy target-only temperature/top-p sampler; sampled speculative acceptance is not approximated. Streaming and serving are not implemented yet.
 
 The Qwen chat template uses `<|im_end|>` (ID 151645) as EOS, `<|endoftext|>` (ID 151643) as padding, and no BOS token. A formatted prompt ends with `<|im_start|>assistant\n` rather than EOS so generation can begin. API request models and fallback prompt formatting are not implemented yet.
 
 The single prefill returns last-position vocabulary logits, a Transformers dynamic KV cache on CUDA, and one greedy CUDA token. Generation reuses that cache and supports greedy decoding at temperature zero or seeded temperature/top-p sampling. It reports `eos`, `stop`, or `length`; explicit token stop sequences can span tokens, and the longest matching suffix is removed before decode. Beam search, batching, repetition penalties, text-fragment buffering, and SSE are not implemented yet.
 
-Pass `measure=True` to `generate_tokens()` to include synchronized time to first token, decode tokens per second, and total generation time in `result.timings`. Constrained calls also report grammar setup, valid-token enumeration, and CUDA mask/ID-transfer time.
+Pass `measure=True` to `generate_tokens()` to include synchronized time to first token, decode tokens per second, and total generation time in `result.timings`. Constrained calls also report grammar setup, valid-token enumeration, and CUDA mask/ID-transfer time. Greedy `generate_speculative(..., measure=True)` uses the same result field and additionally reports proposed and accepted token counts, the accepted/proposed rate as a value from zero to one, iteration count, and synchronized draft, verify, and combined grammar-mask seconds. Draft and verify seconds exclude the separately reported mask time.
 
 The models are downloaded to the external Hugging Face cache. Loading fails instead of falling back to CPU when CUDA is unavailable.
 
@@ -114,3 +114,11 @@ It uses the same prompts, generation loop, warmups, repetitions, timing, and mem
 ```powershell
 .\.venv\Scripts\python.exe -m onyx_cuda.benchmark --target --constraints
 ```
+
+That command writes `benchmarks/results/phase4_target_constraint_gate.json`. Retain it, then run the complete fixed-gamma gate:
+
+```powershell
+.\.venv\Scripts\python.exe -m onyx_cuda.benchmark --speculative
+```
+
+The speculative gate loads the compatible pair; measures all three unconstrained prompts plus the regex and JSON cases at `gamma` 1, 2, and 4 after warmup; checks every output and termination reason against the 1.5B target-only file; rejects post-run allocation drift; and records TTFT, total/output throughput, proposal acceptance, iteration and stage timings, and peak allocated VRAM in ignored `benchmarks/results/phase4_speculative_gate.json`. It reports the gamma with the highest median per-prompt output throughput across the five cases and prints the measured target-time ratio even when speculation is slower.

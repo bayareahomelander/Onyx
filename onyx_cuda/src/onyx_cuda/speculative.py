@@ -1,6 +1,7 @@
 """Fixed-gamma speculative token generation."""
 
 import json
+import time
 from typing import NamedTuple
 
 import torch
@@ -9,6 +10,7 @@ from transformers import PreTrainedModel
 from onyx_cuda.cache import CacheState
 from onyx_cuda.generation import (
     GenerationResult,
+    GenerationTimings,
     _initialize_grammar_constraint,
     _matched_stop_length,
     _validate_grammar_request,
@@ -31,11 +33,30 @@ class VerificationResult(NamedTuple):
     accepted_proposal_count: int
 
 
-def _mask_grammar_logits(constraint, grammar_state: int, logits: torch.Tensor):
+def _synchronize_device(device) -> None:
+    if device is not None and device.type == "cuda":
+        torch.cuda.synchronize(device)
+
+
+def _mask_grammar_logits(
+    constraint,
+    grammar_state: int,
+    logits: torch.Tensor,
+    mask_times: list[float] | None = None,
+):
+    if mask_times is not None:
+        if logits.device.type == "cuda":
+            torch.cuda.synchronize(logits.device)
+        started_at = time.perf_counter()
     valid_token_ids = constraint.get_valid_token_ids(grammar_state)
     if not valid_token_ids:
         raise ValueError("Grammar constraint has no valid token continuation")
-    return apply_grammar_mask(logits, valid_token_ids)
+    masked_logits = apply_grammar_mask(logits, valid_token_ids)
+    if mask_times is not None:
+        if logits.device.type == "cuda":
+            torch.cuda.synchronize(logits.device)
+        mask_times.append(time.perf_counter() - started_at)
+    return masked_logits
 
 
 def _advance_grammar_state(
@@ -70,6 +91,7 @@ def propose_tokens(
     grammar_constraint=None,
     grammar_state: int | None = None,
     live_grammar_states: set[int] | None = None,
+    mask_times: list[float] | None = None,
 ) -> ProposalResult:
     """Greedily propose tokens after the target-selected current token."""
     if not generated_token_ids:
@@ -99,7 +121,10 @@ def propose_tokens(
             logits = draft_cache.extend(draft_model, input_ids)[:, -1, :]
             if grammar_constraint is not None:
                 logits = _mask_grammar_logits(
-                    grammar_constraint, draft_grammar_state, logits
+                    grammar_constraint,
+                    draft_grammar_state,
+                    logits,
+                    mask_times,
                 )
             token_id = logits.argmax(dim=-1)
             token = token_id.item()
@@ -133,6 +158,7 @@ def _verify_proposal(
     grammar_constraint=None,
     grammar_state: int | None = None,
     live_grammar_states: set[int] | None = None,
+    mask_times: list[float] | None = None,
 ) -> tuple[VerificationResult, list[int]]:
     """Verify every proposal position in one target forward."""
     input_ids = torch.tensor(
@@ -166,6 +192,7 @@ def _verify_proposal(
                 grammar_constraint,
                 verify_grammar_state,
                 target_logits[:, position, :],
+                mask_times,
             )
             target = logits.argmax(dim=-1).item()
             token = proposed if proposed == target else target
@@ -187,6 +214,7 @@ def _verify_proposal(
                 grammar_constraint,
                 verify_grammar_state,
                 target_logits[:, len(proposal.token_ids), :],
+                mask_times,
             )
             target = logits.argmax(dim=-1).item()
             verified_token_ids.append(target)
@@ -252,6 +280,7 @@ def generate_speculative(
     top_p: float = 1.0,
     seed: int | None = None,
     *,
+    measure: bool = False,
     regex: str | None = None,
     token_byte_vocabulary: TokenByteVocabulary | None = None,
     json_schema: str | None = None,
@@ -273,6 +302,7 @@ def generate_speculative(
             temperature=temperature,
             top_p=top_p,
             seed=seed,
+            measure=measure,
             regex=regex,
             token_byte_vocabulary=token_byte_vocabulary,
             json_schema=json_schema,
@@ -287,6 +317,21 @@ def generate_speculative(
     generated: list[int] = []
     finish_reason = "length"
     finished = False
+    started_at = None
+    time_to_first_token = None
+    grammar_compile_seconds = None
+    mask_times: list[float] | None = [] if measure else None
+    proposed_token_count = 0
+    accepted_proposal_count = 0
+    speculative_iteration_count = 0
+    draft_seconds = 0.0
+    verify_seconds = 0.0
+    measurement_device = None
+    if measure:
+        measurement_device = next(target_model.parameters()).device
+        _synchronize_device(measurement_device)
+        started_at = time.perf_counter()
+
     try:
         draft_prefill = prefill(draft_model, prompt_token_ids)
         target_prefill = prefill(target_model, prompt_token_ids)
@@ -297,12 +342,17 @@ def generate_speculative(
             target_prefill.past_key_values, target_prefill.logits.device
         )
         if grammar_requested:
+            compile_started_at = time.perf_counter() if measure else None
             constraint, grammar_state = _initialize_grammar_constraint(
                 target_prefill.logits.shape[-1],
                 regex,
                 token_byte_vocabulary,
                 json_schema,
             )
+            if compile_started_at is not None:
+                grammar_compile_seconds = (
+                    time.perf_counter() - compile_started_at
+                )
             live_grammar_states.add(grammar_state)
             if constraint.is_match_state(grammar_state):
                 finish_reason = "stop"
@@ -313,10 +363,16 @@ def generate_speculative(
                 first_token = target_prefill.token_id
             else:
                 first_token_logits = _mask_grammar_logits(
-                    constraint, grammar_state, target_prefill.logits
+                    constraint,
+                    grammar_state,
+                    target_prefill.logits,
+                    mask_times,
                 )
                 first_token = first_token_logits.argmax(dim=-1)
             generated.append(first_token.item())
+            if started_at is not None:
+                _synchronize_device(measurement_device)
+                time_to_first_token = time.perf_counter() - started_at
 
             if constraint is not None:
                 previous_state = grammar_state
@@ -346,6 +402,11 @@ def generate_speculative(
                     finished = True
 
         while not finished and len(generated) < max_tokens:
+            speculative_iteration_count += 1
+            if measurement_device is not None:
+                _synchronize_device(measurement_device)
+                draft_started_at = time.perf_counter()
+                mask_seconds_before = sum(mask_times)
             states_before_draft = set(live_grammar_states)
             proposal = propose_tokens(
                 draft_model,
@@ -360,10 +421,24 @@ def generate_speculative(
                 live_grammar_states=(
                     live_grammar_states if constraint is not None else None
                 ),
+                mask_times=mask_times,
             )
+            proposed_token_count += len(proposal.token_ids)
+            if measurement_device is not None:
+                _synchronize_device(measurement_device)
+                draft_seconds += max(
+                    time.perf_counter()
+                    - draft_started_at
+                    - (sum(mask_times) - mask_seconds_before),
+                    0.0,
+                )
             draft_grammar_states = list(
                 live_grammar_states - states_before_draft
             )
+            if measurement_device is not None:
+                _synchronize_device(measurement_device)
+                verify_started_at = time.perf_counter()
+                mask_seconds_before = sum(mask_times)
             verified, verified_grammar_states = _verify_proposal(
                 draft_model,
                 draft_cache,
@@ -376,7 +451,17 @@ def generate_speculative(
                 live_grammar_states=(
                     live_grammar_states if constraint is not None else None
                 ),
+                mask_times=mask_times,
             )
+            accepted_proposal_count += verified.accepted_proposal_count
+            if measurement_device is not None:
+                _synchronize_device(measurement_device)
+                verify_seconds += max(
+                    time.perf_counter()
+                    - verify_started_at
+                    - (sum(mask_times) - mask_seconds_before),
+                    0.0,
+                )
 
             retained_grammar_state = None
             for position, token_id in enumerate(verified.token_ids):
@@ -431,10 +516,38 @@ def generate_speculative(
                     for token_id in generated
                 ).decode("utf-8")
             )
-
-        return GenerationResult(
-            generated, target_cache.past_key_values, finish_reason
-        )
+        past_key_values = target_cache.past_key_values
     finally:
         if constraint is not None and live_grammar_states:
             constraint.release_states(list(live_grammar_states))
+
+    timings = None
+    if started_at is not None and time_to_first_token is not None:
+        _synchronize_device(measurement_device)
+        total_seconds = time.perf_counter() - started_at
+        decode_seconds = total_seconds - time_to_first_token
+        decode_token_count = max(len(generated) - 1, 0)
+        timings = GenerationTimings(
+            time_to_first_token_seconds=time_to_first_token,
+            decode_tokens_per_second=(
+                decode_token_count / decode_seconds
+                if decode_token_count and decode_seconds > 0
+                else None
+            ),
+            total_seconds=total_seconds,
+            grammar_compile_seconds=grammar_compile_seconds,
+            proposed_token_count=proposed_token_count,
+            accepted_proposal_count=accepted_proposal_count,
+            acceptance_rate=(
+                accepted_proposal_count / proposed_token_count
+                if proposed_token_count
+                else 0.0
+            ),
+            speculative_iteration_count=speculative_iteration_count,
+            draft_seconds=draft_seconds,
+            verify_seconds=verify_seconds,
+            mask_seconds=sum(mask_times),
+        )
+    return GenerationResult(
+        generated, past_key_values, finish_reason, timings
+    )

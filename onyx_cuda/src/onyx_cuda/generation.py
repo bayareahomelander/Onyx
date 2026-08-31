@@ -29,6 +29,13 @@ class GenerationTimings(NamedTuple):
     grammar_compile_seconds: float | None = None
     valid_token_enumeration_seconds: float | None = None
     mask_transfer_seconds: float | None = None
+    proposed_token_count: int | None = None
+    accepted_proposal_count: int | None = None
+    acceptance_rate: float | None = None
+    speculative_iteration_count: int | None = None
+    draft_seconds: float | None = None
+    verify_seconds: float | None = None
+    mask_seconds: float | None = None
 
 
 def _matched_stop_length(
