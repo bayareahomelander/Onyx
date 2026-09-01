@@ -2,6 +2,7 @@
 
 import json
 import time
+from collections.abc import Iterable, Iterator
 from typing import NamedTuple
 
 import torch
@@ -31,6 +32,42 @@ class ProposalResult(NamedTuple):
 class VerificationResult(NamedTuple):
     token_ids: list[int]
     accepted_proposal_count: int
+
+
+class AcceptedTokenEvent(NamedTuple):
+    token_id: int
+
+
+class GenerationFinishedEvent(NamedTuple):
+    result: GenerationResult
+
+
+class TextDeltaEvent(NamedTuple):
+    text: str
+
+
+def _take_ready_tokens(pending: list[int], retain: int = 0) -> list[int]:
+    count = max(len(pending) - retain, 0)
+    ready = pending[:count]
+    del pending[:count]
+    return ready
+
+
+def _flush_stream_text(pending: str, stop: list[str] | None) -> tuple[str, str, bool]:
+    active_stops = [sequence for sequence in (stop or []) if sequence]
+    if not active_stops:
+        return pending, "", False
+
+    positions = [pending.find(sequence) for sequence in active_stops]
+    positions = [position for position in positions if position >= 0]
+    if positions:
+        return pending[: min(positions)], "", True
+
+    retain = max(len(sequence) for sequence in active_stops) - 1
+    if retain <= 0 or len(pending) > retain:
+        split = max(len(pending) - retain, 0)
+        return pending[:split], pending[split:], False
+    return "", pending, False
 
 
 def _synchronize_device(device) -> None:
@@ -70,9 +107,7 @@ def _advance_grammar_state(
     return next_state
 
 
-def _release_grammar_states(
-    constraint, states: list[int], live_grammar_states: set[int]
-) -> None:
+def _release_grammar_states(constraint, states: list[int], live_grammar_states: set[int]) -> None:
     states = list(dict.fromkeys(states))
     if states:
         constraint.release_states(states)
@@ -178,9 +213,7 @@ def _verify_proposal(
             if proposed != target:
                 break
             accepted += 1
-        verified_token_ids = proposal.token_ids[:accepted] + [
-            target_token_ids[accepted]
-        ]
+        verified_token_ids = proposal.token_ids[:accepted] + [target_token_ids[accepted]]
     else:
         if grammar_state is None or live_grammar_states is None:
             raise ValueError("grammar state tracking is required")
@@ -227,11 +260,7 @@ def _verify_proposal(
             verified_grammar_states.append(verify_grammar_state)
 
     if accepted == len(proposal.token_ids):
-        draft_token_id = (
-            proposal.token_ids[-1]
-            if proposal.token_ids
-            else current_token_id
-        )
+        draft_token_id = proposal.token_ids[-1] if proposal.token_ids else current_token_id
         with torch.inference_mode():
             draft_cache.extend(
                 draft_model,
@@ -268,7 +297,7 @@ def verify_proposal(
     )[0]
 
 
-def generate_speculative(
+def generate_speculative_events(
     draft_model: PreTrainedModel,
     target_model: PreTrainedModel,
     prompt_token_ids: list[int],
@@ -284,16 +313,14 @@ def generate_speculative(
     regex: str | None = None,
     token_byte_vocabulary: TokenByteVocabulary | None = None,
     json_schema: str | None = None,
-) -> GenerationResult:
-    """Run greedy speculation or route sampling through the target."""
+) -> Iterator[AcceptedTokenEvent | GenerationFinishedEvent]:
+    """Yield accepted tokens and one terminal result from one generation loop."""
     if gamma < 1:
         raise ValueError("gamma must be at least 1")
     _validate_generation_options(max_tokens, temperature, top_p, seed)
-    grammar_requested = _validate_grammar_request(
-        regex, token_byte_vocabulary, json_schema
-    )
+    grammar_requested = _validate_grammar_request(regex, token_byte_vocabulary, json_schema)
     if temperature > 0:
-        return generate_tokens(
+        result = generate_tokens(
             target_model,
             prompt_token_ids,
             max_tokens,
@@ -307,6 +334,10 @@ def generate_speculative(
             token_byte_vocabulary=token_byte_vocabulary,
             json_schema=json_schema,
         )
+        for token_id in result.token_ids:
+            yield AcceptedTokenEvent(token_id)
+        yield GenerationFinishedEvent(result)
+        return
 
     if isinstance(eos_token_ids, int):
         eos_token_ids = [eos_token_ids]
@@ -315,6 +346,14 @@ def generate_speculative(
     grammar_state = None
     live_grammar_states: set[int] = set()
     generated: list[int] = []
+    pending_events: list[int] = []
+    event_retain = (
+        max(
+            (len(sequence) for sequence in stop_sequences if sequence),
+            default=1,
+        )
+        - 1
+    )
     finish_reason = "length"
     finished = False
     started_at = None
@@ -350,9 +389,7 @@ def generate_speculative(
                 json_schema,
             )
             if compile_started_at is not None:
-                grammar_compile_seconds = (
-                    time.perf_counter() - compile_started_at
-                )
+                grammar_compile_seconds = time.perf_counter() - compile_started_at
             live_grammar_states.add(grammar_state)
             if constraint.is_match_state(grammar_state):
                 finish_reason = "stop"
@@ -370,6 +407,7 @@ def generate_speculative(
                 )
                 first_token = first_token_logits.argmax(dim=-1)
             generated.append(first_token.item())
+            pending_events.append(generated[-1])
             if started_at is not None:
                 _synchronize_device(measurement_device)
                 time_to_first_token = time.perf_counter() - started_at
@@ -382,24 +420,25 @@ def generate_speculative(
                     generated[-1],
                     live_grammar_states,
                 )
-                _release_grammar_states(
-                    constraint, [previous_state], live_grammar_states
-                )
+                _release_grammar_states(constraint, [previous_state], live_grammar_states)
                 if constraint.is_match_state(grammar_state):
                     finish_reason = "stop"
                     finished = True
 
             if not finished:
-                matched_stop_length = _matched_stop_length(
-                    generated, stop_sequences
-                )
+                matched_stop_length = _matched_stop_length(generated, stop_sequences)
                 if matched_stop_length:
                     del generated[-matched_stop_length:]
+                    del pending_events[-matched_stop_length:]
                     finish_reason = "stop"
                     finished = True
                 elif generated[-1] in eos_token_ids:
                     finish_reason = "eos"
                     finished = True
+
+            if not finished:
+                for token_id in _take_ready_tokens(pending_events, event_retain):
+                    yield AcceptedTokenEvent(token_id)
 
         while not finished and len(generated) < max_tokens:
             speculative_iteration_count += 1
@@ -418,9 +457,7 @@ def generate_speculative(
                 stop_sequences,
                 grammar_constraint=constraint,
                 grammar_state=grammar_state,
-                live_grammar_states=(
-                    live_grammar_states if constraint is not None else None
-                ),
+                live_grammar_states=(live_grammar_states if constraint is not None else None),
                 mask_times=mask_times,
             )
             proposed_token_count += len(proposal.token_ids)
@@ -432,9 +469,7 @@ def generate_speculative(
                     - (sum(mask_times) - mask_seconds_before),
                     0.0,
                 )
-            draft_grammar_states = list(
-                live_grammar_states - states_before_draft
-            )
+            draft_grammar_states = list(live_grammar_states - states_before_draft)
             if measurement_device is not None:
                 _synchronize_device(measurement_device)
                 verify_started_at = time.perf_counter()
@@ -448,9 +483,7 @@ def generate_speculative(
                 proposal,
                 grammar_constraint=constraint,
                 grammar_state=grammar_state,
-                live_grammar_states=(
-                    live_grammar_states if constraint is not None else None
-                ),
+                live_grammar_states=(live_grammar_states if constraint is not None else None),
                 mask_times=mask_times,
             )
             accepted_proposal_count += verified.accepted_proposal_count
@@ -466,6 +499,7 @@ def generate_speculative(
             retained_grammar_state = None
             for position, token_id in enumerate(verified.token_ids):
                 generated.append(token_id)
+                pending_events.append(token_id)
                 if constraint is not None and constraint.is_match_state(
                     verified_grammar_states[position]
                 ):
@@ -474,11 +508,10 @@ def generate_speculative(
                     finished = True
                     break
 
-                matched_stop_length = _matched_stop_length(
-                    generated, stop_sequences
-                )
+                matched_stop_length = _matched_stop_length(generated, stop_sequences)
                 if matched_stop_length:
                     del generated[-matched_stop_length:]
+                    del pending_events[-matched_stop_length:]
                     if constraint is not None:
                         retained_grammar_state = verified_grammar_states[position]
                     finish_reason = "stop"
@@ -490,6 +523,9 @@ def generate_speculative(
                     finish_reason = "eos"
                     finished = True
                     break
+
+                for ready_token_id in _take_ready_tokens(pending_events, event_retain):
+                    yield AcceptedTokenEvent(ready_token_id)
 
             if constraint is not None:
                 if retained_grammar_state is None:
@@ -509,11 +545,13 @@ def generate_speculative(
                 )
                 grammar_state = retained_grammar_state
 
+        for token_id in _take_ready_tokens(pending_events):
+            yield AcceptedTokenEvent(token_id)
+
         if json_schema is not None:
             json.loads(
                 b"".join(
-                    token_byte_vocabulary.token_bytes[token_id]
-                    for token_id in generated
+                    token_byte_vocabulary.token_bytes[token_id] for token_id in generated
                 ).decode("utf-8")
             )
         past_key_values = target_cache.past_key_values
@@ -539,15 +577,118 @@ def generate_speculative(
             proposed_token_count=proposed_token_count,
             accepted_proposal_count=accepted_proposal_count,
             acceptance_rate=(
-                accepted_proposal_count / proposed_token_count
-                if proposed_token_count
-                else 0.0
+                accepted_proposal_count / proposed_token_count if proposed_token_count else 0.0
             ),
             speculative_iteration_count=speculative_iteration_count,
             draft_seconds=draft_seconds,
             verify_seconds=verify_seconds,
             mask_seconds=sum(mask_times),
         )
-    return GenerationResult(
-        generated, past_key_values, finish_reason, timings
+    yield GenerationFinishedEvent(
+        GenerationResult(generated, past_key_values, finish_reason, timings)
     )
+
+
+def generate_speculative(
+    draft_model: PreTrainedModel,
+    target_model: PreTrainedModel,
+    prompt_token_ids: list[int],
+    max_tokens: int,
+    gamma: int,
+    eos_token_ids: int | list[int],
+    stop_sequences: list[list[int]] | None = None,
+    temperature: float = 0.0,
+    top_p: float = 1.0,
+    seed: int | None = None,
+    *,
+    measure: bool = False,
+    regex: str | None = None,
+    token_byte_vocabulary: TokenByteVocabulary | None = None,
+    json_schema: str | None = None,
+) -> GenerationResult:
+    """Collect the shared event stream into the established result shape."""
+    accepted_token_ids = []
+    events = generate_speculative_events(
+        draft_model,
+        target_model,
+        prompt_token_ids,
+        max_tokens,
+        gamma,
+        eos_token_ids,
+        stop_sequences=stop_sequences,
+        temperature=temperature,
+        top_p=top_p,
+        seed=seed,
+        measure=measure,
+        regex=regex,
+        token_byte_vocabulary=token_byte_vocabulary,
+        json_schema=json_schema,
+    )
+    try:
+        for event in events:
+            if isinstance(event, AcceptedTokenEvent):
+                accepted_token_ids.append(event.token_id)
+                continue
+            if accepted_token_ids != event.result.token_ids:
+                raise RuntimeError("Accepted-token events do not match the final result")
+            return event.result
+        raise RuntimeError("Generation ended without a terminal event")
+    finally:
+        events.close()
+
+
+def decode_speculative_events(
+    events: Iterable[AcceptedTokenEvent | GenerationFinishedEvent],
+    tokenizer,
+    stop: list[str] | None = None,
+) -> Iterator[TextDeltaEvent | GenerationFinishedEvent]:
+    """Incrementally decode token events and preserve one terminal event."""
+    token_ids: list[int] = []
+    decoded = ""
+    emitted = ""
+    pending = ""
+    stopped = False
+    terminal_seen = False
+    event_iterator = iter(events)
+    try:
+        for event in event_iterator:
+            if terminal_seen:
+                raise RuntimeError("Generation emitted events after completion")
+            if isinstance(event, AcceptedTokenEvent):
+                token_ids.append(event.token_id)
+                if stopped:
+                    continue
+                # ponytail: cumulative decode is bounded by max_tokens; use
+                # raw token bytes only if profiling shows this helper matters.
+                current = tokenizer.decode(token_ids, skip_special_tokens=True)
+                replacement = current.find("\ufffd")
+                stable = current if replacement < 0 else current[:replacement]
+                if not stable.startswith(decoded):
+                    raise RuntimeError("Tokenizer changed already-decoded text")
+                pending += stable[len(decoded) :]
+                decoded = stable
+                text, pending, stopped = _flush_stream_text(pending, stop)
+                if text:
+                    emitted += text
+                    yield TextDeltaEvent(text)
+                continue
+
+            terminal_seen = True
+            final_text = tokenizer.decode(event.result.token_ids, skip_special_tokens=True)
+            positions = [final_text.find(sequence) for sequence in (stop or []) if sequence]
+            positions = [position for position in positions if position >= 0]
+            if positions:
+                final_text = final_text[: min(positions)]
+            if not final_text.startswith(emitted):
+                raise RuntimeError("Streamed text does not match the final result")
+            remaining = final_text[len(emitted) :]
+            if remaining:
+                yield TextDeltaEvent(remaining)
+            yield event
+
+        if not terminal_seen:
+            raise RuntimeError("Generation ended without a terminal event")
+    finally:
+        close = getattr(event_iterator, "close", None)
+        if close is not None:
+            close()

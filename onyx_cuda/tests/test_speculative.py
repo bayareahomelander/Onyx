@@ -12,9 +12,14 @@ from onyx_cuda.model import load_model_pair
 from onyx_cuda.prefill import prefill
 from onyx_cuda.prompt import format_prompt
 from onyx_cuda.speculative import (
+    AcceptedTokenEvent,
+    GenerationFinishedEvent,
     ProposalResult,
+    TextDeltaEvent,
     VerificationResult,
+    decode_speculative_events,
     generate_speculative,
+    generate_speculative_events,
     propose_tokens,
     verify_proposal,
 )
@@ -100,6 +105,7 @@ def _run_scripted_constrained_speculation(
     regex="pattern",
     json_schema=None,
     vocabulary=None,
+    events=False,
 ):
     draft_model = object()
     target_model = object()
@@ -127,11 +133,10 @@ def _run_scripted_constrained_speculation(
         "_initialize_grammar_constraint",
         lambda *args: (grammar, grammar.init_state()),
     )
-    monkeypatch.setattr(
-        speculative_module, "apply_grammar_mask", _cpu_grammar_mask
-    )
+    monkeypatch.setattr(speculative_module, "apply_grammar_mask", _cpu_grammar_mask)
     vocabulary = vocabulary or TokenByteVocabulary([b""] * 16, 0, 16)
-    result = generate_speculative(
+    generate = generate_speculative_events if events else generate_speculative
+    result = generate(
         draft_model,
         target_model,
         [0],
@@ -142,6 +147,8 @@ def _run_scripted_constrained_speculation(
         token_byte_vocabulary=vocabulary,
         json_schema=json_schema,
     )
+    if events:
+        result = list(result)
     return result, draft_cache, target_cache
 
 
@@ -156,6 +163,7 @@ def _run_scripted_speculation(
     eos=15,
     stops=None,
     measure=False,
+    events=False,
 ):
     draft_model = torch.nn.Linear(1, 1) if measure else object()
     target_model = torch.nn.Linear(1, 1) if measure else object()
@@ -176,7 +184,8 @@ def _run_scripted_speculation(
         "from_prefill",
         classmethod(lambda cls, cache, device: cache),
     )
-    result = generate_speculative(
+    generate = generate_speculative_events if events else generate_speculative
+    result = generate(
         draft_model,
         target_model,
         [0],
@@ -186,6 +195,8 @@ def _run_scripted_speculation(
         stop_sequences=stops,
         measure=measure,
     )
+    if events:
+        result = list(result)
     return result, draft_cache, target_cache
 
 
@@ -201,9 +212,7 @@ def test_speculative_options_fail_before_prefill(monkeypatch):
     with pytest.raises(ValueError, match="max_tokens"):
         generate_speculative(object(), object(), [0], 0, 1, [])
     with pytest.raises(ValueError, match="token_byte_vocabulary"):
-        generate_speculative(
-            object(), object(), [0], 1, 1, [], regex="CUDA"
-        )
+        generate_speculative(object(), object(), [0], 1, 1, [], regex="CUDA")
 
 
 def test_constrained_rejection_verifies_from_canonical_state_and_releases(
@@ -224,6 +233,30 @@ def test_constrained_rejection_verifies_from_canonical_state_and_releases(
     assert ((1,), 2) in grammar.advance_calls
     assert ((1,), 3) in grammar.advance_calls
     assert ((1, 2), 3) not in grammar.advance_calls
+    assert not grammar.active_states
+
+
+def test_constrained_event_stream_matches_result_and_releases_states(
+    monkeypatch,
+):
+    grammar = TrackingGrammar(
+        {(): [1], (1,): [2, 3]},
+        {(1, 3)},
+    )
+    events, _, _ = _run_scripted_constrained_speculation(
+        monkeypatch,
+        grammar,
+        draft_tokens=[2],
+        target_tokens=[3, 0],
+        events=True,
+    )
+
+    accepted = [event.token_id for event in events if isinstance(event, AcceptedTokenEvent)]
+    finished = [event for event in events if isinstance(event, GenerationFinishedEvent)]
+    assert accepted == [1, 3]
+    assert len(finished) == 1
+    assert finished[0].result.token_ids == accepted
+    assert finished[0].result.finish_reason == "stop"
     assert not grammar.active_states
 
 
@@ -276,9 +309,7 @@ def test_sampled_speculation_forwards_grammar_to_target(monkeypatch):
         captured.update(kwargs)
         return expected
 
-    monkeypatch.setattr(
-        speculative_module, "generate_tokens", fake_generate_tokens
-    )
+    monkeypatch.setattr(speculative_module, "generate_tokens", fake_generate_tokens)
     result = generate_speculative(
         object(),
         object(),
@@ -320,9 +351,7 @@ def test_speculative_metrics_count_proposals_and_stages(monkeypatch):
     assert result.timings.draft_seconds >= 0
     assert result.timings.verify_seconds >= 0
     assert result.timings.mask_seconds == 0
-    assert result.timings.total_seconds >= (
-        result.timings.time_to_first_token_seconds
-    )
+    assert result.timings.total_seconds >= (result.timings.time_to_first_token_seconds)
 
 
 @pytest.mark.parametrize(
@@ -358,6 +387,61 @@ def test_speculative_final_capacity_is_exact(
     assert len(result.token_ids) == max_tokens
     if max_tokens == 1:
         assert draft_cache.inputs == target_cache.inputs == []
+
+
+def test_text_events_match_collected_greedy_output(monkeypatch):
+    events, _, _ = _run_scripted_speculation(
+        monkeypatch,
+        first_token=1,
+        draft_tokens=[2, 3, 0],
+        target_tokens=[2, 4, 9, 5],
+        max_tokens=4,
+        gamma=2,
+        events=True,
+    )
+
+    class Tokenizer:
+        def decode(self, token_ids, skip_special_tokens=False):
+            assert skip_special_tokens is True
+            return "".join({1: "A", 2: "B", 4: "C", 5: "D"}[token] for token in token_ids)
+
+    decoded = list(decode_speculative_events(events, Tokenizer()))
+    text = "".join(event.text for event in decoded if isinstance(event, TextDeltaEvent))
+    finished = [event for event in decoded if isinstance(event, GenerationFinishedEvent)]
+    assert text == "ABCD"
+    assert len(finished) == 1
+    assert finished[0].result.token_ids == [1, 2, 4, 5]
+    assert finished[0].result.finish_reason == "length"
+
+
+def test_text_events_decode_split_utf8_and_hide_fragmented_stop():
+    class Tokenizer:
+        decoded = {
+            (1,): "\ufffd",
+            (1, 2): "caf\u00e9 ",
+            (1, 2, 3): "caf\u00e9 EN",
+            (1, 2, 3, 4): "caf\u00e9 END",
+        }
+
+        def decode(self, token_ids, skip_special_tokens=False):
+            assert skip_special_tokens is True
+            return self.decoded[tuple(token_ids)]
+
+    result = GenerationResult([1, 2, 3, 4], object(), "stop")
+    events = [
+        AcceptedTokenEvent(1),
+        AcceptedTokenEvent(2),
+        AcceptedTokenEvent(3),
+        AcceptedTokenEvent(4),
+        GenerationFinishedEvent(result),
+    ]
+    decoded = list(decode_speculative_events(events, Tokenizer(), stop=["END"]))
+    text = "".join(event.text for event in decoded if isinstance(event, TextDeltaEvent))
+    finished = [event for event in decoded if isinstance(event, GenerationFinishedEvent)]
+    assert text == "caf\u00e9 "
+    assert "\ufffd" not in text
+    assert "END" not in text
+    assert finished == [GenerationFinishedEvent(result)]
 
 
 @pytest.mark.parametrize(
@@ -427,13 +511,9 @@ def test_scripted_draft_proposal_bounds_order_and_termination(
     expected_inputs,
 ):
     cache = ScriptedCache(scripted)
-    result = propose_tokens(
-        object(), cache, generated, gamma, remaining, eos, stops
-    )
+    result = propose_tokens(object(), cache, generated, gamma, remaining, eos, stops)
 
-    assert result == ProposalResult(
-        expected_tokens, 4, 4 + len(expected_tokens)
-    )
+    assert result == ProposalResult(expected_tokens, 4, 4 + len(expected_tokens))
     assert cache.inputs == expected_inputs
 
 
@@ -495,9 +575,7 @@ def test_scripted_target_verification_acceptance_and_cache_lengths(
     target_cache = ScriptedCache(target_tokens)
     target_cache.length = 10
 
-    result = verify_proposal(
-        object(), draft_cache, object(), target_cache, 1, proposal
-    )
+    result = verify_proposal(object(), draft_cache, object(), target_cache, 1, proposal)
 
     assert result == VerificationResult(expected_tokens, accepted)
     assert target_cache.inputs == [1, 2, 3, 4]
@@ -566,15 +644,9 @@ def test_real_speculation_matches_target_oracle_and_rejects_cleanly():
                 loaded.model,
                 torch.tensor([[replay_token]], device=clean_prefill.logits.device),
             )[:, -1, :]
-        torch.testing.assert_close(
-            dirty_logits, clean_logits, rtol=1e-2, atol=5e-2
-        )
-        assert dirty_logits.argmax(dim=-1).item() == (
-            clean_logits.argmax(dim=-1).item()
-        )
-        max_replay_differences[name] = (
-            (dirty_logits - clean_logits).abs().max().item()
-        )
+        torch.testing.assert_close(dirty_logits, clean_logits, rtol=1e-2, atol=5e-2)
+        assert dirty_logits.argmax(dim=-1).item() == (clean_logits.argmax(dim=-1).item())
+        max_replay_differences[name] = (dirty_logits - clean_logits).abs().max().item()
 
     eos_token_id = pair.target.tokenizer.eos_token_id
     oracle_ids = {}
@@ -595,15 +667,35 @@ def test_real_speculation_matches_target_oracle_and_rejects_cleanly():
         oracle_ids[name] = oracle.token_ids
         for gamma in (1, 2, 4):
             measure = name == "cuda_ready" and gamma == 2
-            speculative = generate_speculative(
-                pair.draft.model,
-                pair.target.model,
-                formatted.token_ids,
-                max_tokens=MAX_TOKENS,
-                gamma=gamma,
-                eos_token_ids=eos_token_id,
-                measure=measure,
-            )
+            arguments = {
+                "draft_model": pair.draft.model,
+                "target_model": pair.target.model,
+                "prompt_token_ids": formatted.token_ids,
+                "max_tokens": MAX_TOKENS,
+                "gamma": gamma,
+                "eos_token_ids": eos_token_id,
+                "measure": measure,
+            }
+            if measure:
+                events = list(generate_speculative_events(**arguments))
+                accepted = [
+                    event.token_id for event in events if isinstance(event, AcceptedTokenEvent)
+                ]
+                decoded = list(decode_speculative_events(events, pair.target.tokenizer))
+                streamed_text = "".join(
+                    event.text for event in decoded if isinstance(event, TextDeltaEvent)
+                )
+                finished = [
+                    event for event in decoded if isinstance(event, GenerationFinishedEvent)
+                ]
+                assert len(finished) == 1
+                speculative = finished[0].result
+                assert accepted == speculative.token_ids
+                assert streamed_text == pair.target.tokenizer.decode(
+                    speculative.token_ids, skip_special_tokens=True
+                )
+            else:
+                speculative = generate_speculative(**arguments)
             assert speculative.token_ids == oracle.token_ids
             assert speculative.finish_reason == oracle.finish_reason
             if measure:
@@ -615,6 +707,7 @@ def test_real_speculation_matches_target_oracle_and_rejects_cleanly():
                 assert speculative.timings.draft_seconds > 0
                 assert speculative.timings.verify_seconds > 0
                 assert speculative.timings.mask_seconds == 0
+                del events, decoded, finished
 
     sampled_oracle = generate_tokens(
         pair.target.model,
@@ -672,9 +765,7 @@ def test_real_speculation_matches_target_oracle_and_rejects_cleanly():
     schema = json.dumps(
         {
             "type": "object",
-            "properties": {
-                "content": {"enum": ["CUDA ready", "Ready"]}
-            },
+            "properties": {"content": {"enum": ["CUDA ready", "Ready"]}},
             "required": ["content"],
         },
         separators=(",", ":"),
