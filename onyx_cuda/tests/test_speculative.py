@@ -106,6 +106,7 @@ def _run_scripted_constrained_speculation(
     json_schema=None,
     vocabulary=None,
     events=False,
+    collect=True,
 ):
     draft_model = object()
     target_model = object()
@@ -147,7 +148,7 @@ def _run_scripted_constrained_speculation(
         token_byte_vocabulary=vocabulary,
         json_schema=json_schema,
     )
-    if events:
+    if events and collect:
         result = list(result)
     return result, draft_cache, target_cache
 
@@ -198,6 +199,37 @@ def _run_scripted_speculation(
     if events:
         result = list(result)
     return result, draft_cache, target_cache
+
+
+def _result_from_events(events, tokenizer, stop=None):
+    events = list(events)
+    accepted = [event.token_id for event in events if isinstance(event, AcceptedTokenEvent)]
+    decoded = list(decode_speculative_events(events, tokenizer, stop=stop))
+    text = "".join(event.text for event in decoded if isinstance(event, TextDeltaEvent))
+    finished = [event for event in decoded if isinstance(event, GenerationFinishedEvent)]
+    assert len(finished) == 1
+    result = finished[0].result
+    assert accepted == result.token_ids
+    expected = tokenizer.decode(result.token_ids, skip_special_tokens=True)
+    if stop:
+        positions = [expected.find(sequence) for sequence in stop if sequence]
+        positions = [position for position in positions if position >= 0]
+        if positions:
+            expected = expected[: min(positions)]
+    assert text == expected
+    return result, text
+
+
+class _MappedTokenizer:
+    def __init__(self, decoded):
+        self.decoded = decoded
+
+    def decode(self, token_ids, skip_special_tokens=False):
+        assert skip_special_tokens is True
+        key = tuple(token_ids)
+        if key in self.decoded:
+            return self.decoded[key]
+        return "".join(self.decoded[token] for token in token_ids)
 
 
 def test_speculative_options_fail_before_prefill(monkeypatch):
@@ -251,12 +283,10 @@ def test_constrained_event_stream_matches_result_and_releases_states(
         events=True,
     )
 
-    accepted = [event.token_id for event in events if isinstance(event, AcceptedTokenEvent)]
-    finished = [event for event in events if isinstance(event, GenerationFinishedEvent)]
-    assert accepted == [1, 3]
-    assert len(finished) == 1
-    assert finished[0].result.token_ids == accepted
-    assert finished[0].result.finish_reason == "stop"
+    result, text = _result_from_events(events, _MappedTokenizer({1: "A", 3: "B"}))
+    assert result.token_ids == [1, 3]
+    assert result.finish_reason == "stop"
+    assert text == "AB"
     assert not grammar.active_states
 
 
@@ -300,6 +330,31 @@ def test_constrained_error_releases_every_state(monkeypatch):
     assert not grammar.active_states
 
 
+def test_closing_event_iterator_releases_grammar(monkeypatch):
+    grammar = TrackingGrammar(
+        {(): [1], (1,): [2, 3]},
+        {(1, 3)},
+    )
+    events, _, _ = _run_scripted_constrained_speculation(
+        monkeypatch,
+        grammar,
+        draft_tokens=[2],
+        target_tokens=[3, 0],
+        events=True,
+        collect=False,
+    )
+
+    try:
+        event = next(events)
+        assert isinstance(event, AcceptedTokenEvent)
+        assert event.token_id == 1
+        assert grammar.active_states
+    finally:
+        events.close()
+
+    assert not grammar.active_states
+
+
 def test_sampled_speculation_forwards_grammar_to_target(monkeypatch):
     vocabulary = TokenByteVocabulary([b"x"], 0, 0)
     expected = GenerationResult([0], object(), "length")
@@ -328,6 +383,28 @@ def test_sampled_speculation_forwards_grammar_to_target(monkeypatch):
     assert captured["token_byte_vocabulary"] is vocabulary
     assert captured["json_schema"] == '{"type":"string"}'
     assert captured["measure"] is False
+
+    captured.clear()
+    events = list(
+        generate_speculative_events(
+            object(),
+            object(),
+            [0],
+            max_tokens=1,
+            gamma=1,
+            eos_token_ids=[],
+            temperature=0.8,
+            regex="x",
+            token_byte_vocabulary=vocabulary,
+            json_schema='{"type":"string"}',
+        )
+    )
+    replayed, text = _result_from_events(events, _MappedTokenizer({0: "x"}))
+    assert captured["regex"] == "x"
+    assert captured["json_schema"] == '{"type":"string"}'
+    assert replayed is expected
+    assert [event.token_id for event in events if isinstance(event, AcceptedTokenEvent)] == [0]
+    assert text == "x"
 
 
 def test_speculative_metrics_count_proposals_and_stages(monkeypatch):
@@ -400,48 +477,38 @@ def test_text_events_match_collected_greedy_output(monkeypatch):
         events=True,
     )
 
-    class Tokenizer:
-        def decode(self, token_ids, skip_special_tokens=False):
-            assert skip_special_tokens is True
-            return "".join({1: "A", 2: "B", 4: "C", 5: "D"}[token] for token in token_ids)
-
-    decoded = list(decode_speculative_events(events, Tokenizer()))
-    text = "".join(event.text for event in decoded if isinstance(event, TextDeltaEvent))
-    finished = [event for event in decoded if isinstance(event, GenerationFinishedEvent)]
+    result, text = _result_from_events(
+        events,
+        _MappedTokenizer({1: "A", 2: "B", 4: "C", 5: "D"}),
+    )
     assert text == "ABCD"
-    assert len(finished) == 1
-    assert finished[0].result.token_ids == [1, 2, 4, 5]
-    assert finished[0].result.finish_reason == "length"
+    assert result.token_ids == [1, 2, 4, 5]
+    assert result.finish_reason == "length"
 
 
-def test_text_events_decode_split_utf8_and_hide_fragmented_stop():
-    class Tokenizer:
-        decoded = {
+def test_text_events_decode_split_utf8_and_hide_fragmented_stop(monkeypatch):
+    events, _, _ = _run_scripted_speculation(
+        monkeypatch,
+        first_token=1,
+        draft_tokens=[2, 3, 0],
+        target_tokens=[2, 3, 4],
+        max_tokens=4,
+        gamma=2,
+        events=True,
+    )
+    tokenizer = _MappedTokenizer(
+        {
             (1,): "\ufffd",
             (1, 2): "caf\u00e9 ",
             (1, 2, 3): "caf\u00e9 EN",
             (1, 2, 3, 4): "caf\u00e9 END",
         }
-
-        def decode(self, token_ids, skip_special_tokens=False):
-            assert skip_special_tokens is True
-            return self.decoded[tuple(token_ids)]
-
-    result = GenerationResult([1, 2, 3, 4], object(), "stop")
-    events = [
-        AcceptedTokenEvent(1),
-        AcceptedTokenEvent(2),
-        AcceptedTokenEvent(3),
-        AcceptedTokenEvent(4),
-        GenerationFinishedEvent(result),
-    ]
-    decoded = list(decode_speculative_events(events, Tokenizer(), stop=["END"]))
-    text = "".join(event.text for event in decoded if isinstance(event, TextDeltaEvent))
-    finished = [event for event in decoded if isinstance(event, GenerationFinishedEvent)]
+    )
+    result, text = _result_from_events(events, tokenizer, stop=["END"])
+    assert result.token_ids == [1, 2, 3, 4]
     assert text == "caf\u00e9 "
     assert "\ufffd" not in text
     assert "END" not in text
-    assert finished == [GenerationFinishedEvent(result)]
 
 
 @pytest.mark.parametrize(
@@ -467,7 +534,7 @@ def test_speculative_eos_and_overlapping_stops_ignore_plus_one(
     expected_tokens,
     expected_reason,
 ):
-    result, _, _ = _run_scripted_speculation(
+    events, _, _ = _run_scripted_speculation(
         monkeypatch,
         first_token=7 if stops else 1,
         draft_tokens=draft_tokens,
@@ -475,10 +542,14 @@ def test_speculative_eos_and_overlapping_stops_ignore_plus_one(
         max_tokens=4,
         eos=eos,
         stops=stops,
+        events=True,
     )
-
-    assert result.token_ids == expected_tokens
-    assert result.finish_reason == expected_reason
+    accepted = [event.token_id for event in events if isinstance(event, AcceptedTokenEvent)]
+    finished = [event for event in events if isinstance(event, GenerationFinishedEvent)]
+    assert accepted == expected_tokens
+    assert len(finished) == 1
+    assert finished[0].result.token_ids == accepted
+    assert finished[0].result.finish_reason == expected_reason
 
 
 @pytest.mark.parametrize(
@@ -667,37 +738,23 @@ def test_real_speculation_matches_target_oracle_and_rejects_cleanly():
         oracle_ids[name] = oracle.token_ids
         for gamma in (1, 2, 4):
             measure = name == "cuda_ready" and gamma == 2
-            arguments = {
-                "draft_model": pair.draft.model,
-                "target_model": pair.target.model,
-                "prompt_token_ids": formatted.token_ids,
-                "max_tokens": MAX_TOKENS,
-                "gamma": gamma,
-                "eos_token_ids": eos_token_id,
-                "measure": measure,
-            }
-            if measure:
-                events = list(generate_speculative_events(**arguments))
-                accepted = [
-                    event.token_id for event in events if isinstance(event, AcceptedTokenEvent)
-                ]
-                decoded = list(decode_speculative_events(events, pair.target.tokenizer))
-                streamed_text = "".join(
-                    event.text for event in decoded if isinstance(event, TextDeltaEvent)
-                )
-                finished = [
-                    event for event in decoded if isinstance(event, GenerationFinishedEvent)
-                ]
-                assert len(finished) == 1
-                speculative = finished[0].result
-                assert accepted == speculative.token_ids
-                assert streamed_text == pair.target.tokenizer.decode(
-                    speculative.token_ids, skip_special_tokens=True
-                )
-            else:
-                speculative = generate_speculative(**arguments)
+            speculative, streamed_text = _result_from_events(
+                generate_speculative_events(
+                    pair.draft.model,
+                    pair.target.model,
+                    formatted.token_ids,
+                    max_tokens=MAX_TOKENS,
+                    gamma=gamma,
+                    eos_token_ids=eos_token_id,
+                    measure=measure,
+                ),
+                pair.target.tokenizer,
+            )
             assert speculative.token_ids == oracle.token_ids
             assert speculative.finish_reason == oracle.finish_reason
+            assert streamed_text == pair.target.tokenizer.decode(
+                oracle.token_ids, skip_special_tokens=True
+            )
             if measure:
                 assert speculative.timings is not None
                 assert speculative.timings.proposed_token_count > 0
@@ -707,7 +764,6 @@ def test_real_speculation_matches_target_oracle_and_rejects_cleanly():
                 assert speculative.timings.draft_seconds > 0
                 assert speculative.timings.verify_seconds > 0
                 assert speculative.timings.mask_seconds == 0
-                del events, decoded, finished
 
     sampled_oracle = generate_tokens(
         pair.target.model,
@@ -718,19 +774,25 @@ def test_real_speculation_matches_target_oracle_and_rejects_cleanly():
         top_p=0.9,
         seed=1234,
     )
-    sampled_speculative = generate_speculative(
-        pair.draft.model,
-        pair.target.model,
-        prompt.token_ids,
-        max_tokens=8,
-        gamma=4,
-        eos_token_ids=eos_token_id,
-        temperature=0.8,
-        top_p=0.9,
-        seed=1234,
+    sampled_speculative, sampled_text = _result_from_events(
+        generate_speculative_events(
+            pair.draft.model,
+            pair.target.model,
+            prompt.token_ids,
+            max_tokens=8,
+            gamma=4,
+            eos_token_ids=eos_token_id,
+            temperature=0.8,
+            top_p=0.9,
+            seed=1234,
+        ),
+        pair.target.tokenizer,
     )
     assert sampled_speculative.token_ids == sampled_oracle.token_ids
     assert sampled_speculative.finish_reason == sampled_oracle.finish_reason
+    assert sampled_text == pair.target.tokenizer.decode(
+        sampled_oracle.token_ids, skip_special_tokens=True
+    )
 
     vocabulary = build_token_byte_vocabulary(
         pair.target.tokenizer, pair.target.model.config.vocab_size
@@ -744,19 +806,25 @@ def test_real_speculation_matches_target_oracle_and_rejects_cleanly():
         token_byte_vocabulary=vocabulary,
     )
     for gamma in (1, 2, 4):
-        constrained = generate_speculative(
-            pair.draft.model,
-            pair.target.model,
-            prompt.token_ids,
-            max_tokens=MAX_TOKENS,
-            gamma=gamma,
-            eos_token_ids=eos_token_id,
-            regex="CUDA Ready",
-            token_byte_vocabulary=vocabulary,
-            measure=gamma == 2,
+        constrained, constrained_text = _result_from_events(
+            generate_speculative_events(
+                pair.draft.model,
+                pair.target.model,
+                prompt.token_ids,
+                max_tokens=MAX_TOKENS,
+                gamma=gamma,
+                eos_token_ids=eos_token_id,
+                regex="CUDA Ready",
+                token_byte_vocabulary=vocabulary,
+                measure=gamma == 2,
+            ),
+            pair.target.tokenizer,
         )
         assert constrained.token_ids == regex_oracle.token_ids
         assert constrained.finish_reason == regex_oracle.finish_reason
+        assert constrained_text == pair.target.tokenizer.decode(
+            regex_oracle.token_ids, skip_special_tokens=True
+        )
         if gamma == 2:
             assert constrained.timings is not None
             assert constrained.timings.grammar_compile_seconds > 0
@@ -789,18 +857,24 @@ def test_real_speculation_matches_target_oracle_and_rejects_cleanly():
         token_byte_vocabulary=vocabulary,
     )
     for gamma in (1, 2, 4):
-        constrained = generate_speculative(
-            pair.draft.model,
-            pair.target.model,
-            json_prompt.token_ids,
-            max_tokens=64,
-            gamma=gamma,
-            eos_token_ids=eos_token_id,
-            token_byte_vocabulary=vocabulary,
-            json_schema=schema,
+        constrained, constrained_text = _result_from_events(
+            generate_speculative_events(
+                pair.draft.model,
+                pair.target.model,
+                json_prompt.token_ids,
+                max_tokens=64,
+                gamma=gamma,
+                eos_token_ids=eos_token_id,
+                token_byte_vocabulary=vocabulary,
+                json_schema=schema,
+            ),
+            pair.target.tokenizer,
         )
         assert constrained.token_ids == json_oracle.token_ids
         assert constrained.finish_reason == json_oracle.finish_reason
+        assert constrained_text == pair.target.tokenizer.decode(
+            json_oracle.token_ids, skip_special_tokens=True
+        )
         assert json.loads(pair.target.tokenizer.decode(constrained.token_ids))
 
     print(f"speculative_oracle_token_ids={oracle_ids}")
