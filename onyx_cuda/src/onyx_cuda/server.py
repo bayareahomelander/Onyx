@@ -1,5 +1,6 @@
 """OpenAI-shaped request and response models plus the HTTP application factory."""
 
+import asyncio
 import gc
 import json
 import sys
@@ -210,6 +211,18 @@ def _generate(arguments: dict[str, Any]):
     return generate_speculative(**arguments)
 
 
+async def _generate_off_event_loop(arguments: dict[str, Any]):
+    worker = asyncio.create_task(asyncio.to_thread(_generate, arguments))
+    try:
+        return await asyncio.shield(worker)
+    except asyncio.CancelledError:
+        try:
+            await worker
+        except Exception:
+            pass
+        raise
+
+
 def _build_vocabulary(tokenizer, logits_vocab_size):
     from onyx_cuda.vocabulary import build_token_byte_vocabulary
 
@@ -248,9 +261,11 @@ def create_app(
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         app.state.engines = {MODEL_ID: loader()}
+        app.state.engine_locks = {model_id: asyncio.Lock() for model_id in app.state.engines}
         try:
             yield
         finally:
+            app.state.engine_locks.clear()
             app.state.engines.clear()
             _release_cuda_memory()
 
@@ -294,45 +309,46 @@ def create_app(
             raise HTTPException(status_code=400, detail="Streaming is not implemented")
 
         engine = get_engine(app, request.model)
-        tokenizer = engine.target.tokenizer
-        arguments = prepare_generation(request, engine)
-        arguments["measure"] = True
-        prompt_tokens = len(arguments["prompt_token_ids"])
-        completion_tokens = 0
-        choices = []
-        last_timings = None
+        async with app.state.engine_locks[request.model]:
+            tokenizer = engine.target.tokenizer
+            arguments = prepare_generation(request, engine)
+            arguments["measure"] = True
+            prompt_tokens = len(arguments["prompt_token_ids"])
+            completion_tokens = 0
+            choices = []
+            last_timings = None
 
-        for index in range(request.n):
-            result = _generate(arguments)
-            completion_tokens += len(result.token_ids)
-            last_timings = result.timings
-            output = tokenizer.decode(result.token_ids, skip_special_tokens=True)
-            output = truncate_at_stop(output, request.stop)
-            if request.json_schema is not None and request.compact_json:
-                try:
-                    output = json.dumps(json.loads(output), separators=(",", ":"))
-                except json.JSONDecodeError:
-                    pass
-            choices.append(
-                ChatCompletionChoice(
-                    index=index,
-                    message=ChatMessage(role="assistant", content=output),
-                    finish_reason=result.finish_reason,
+            for index in range(request.n):
+                result = await _generate_off_event_loop(arguments)
+                completion_tokens += len(result.token_ids)
+                last_timings = result.timings
+                output = tokenizer.decode(result.token_ids, skip_special_tokens=True)
+                output = truncate_at_stop(output, request.stop)
+                if request.json_schema is not None and request.compact_json:
+                    try:
+                        output = json.dumps(json.loads(output), separators=(",", ":"))
+                    except json.JSONDecodeError:
+                        pass
+                choices.append(
+                    ChatCompletionChoice(
+                        index=index,
+                        message=ChatMessage(role="assistant", content=output),
+                        finish_reason=result.finish_reason,
+                    )
                 )
-            )
 
-        return ChatCompletionResponse(
-            model=request.model,
-            choices=choices,
-            usage=UsageInfo(
-                prompt_tokens=prompt_tokens,
-                completion_tokens=completion_tokens,
-                total_tokens=prompt_tokens + completion_tokens,
-            ),
-            onyx_metrics=_build_metrics(
-                last_timings,
-                request.regex is not None or request.json_schema is not None,
-            ),
-        )
+            return ChatCompletionResponse(
+                model=request.model,
+                choices=choices,
+                usage=UsageInfo(
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=completion_tokens,
+                    total_tokens=prompt_tokens + completion_tokens,
+                ),
+                onyx_metrics=_build_metrics(
+                    last_timings,
+                    request.regex is not None or request.json_schema is not None,
+                ),
+            )
 
     return app

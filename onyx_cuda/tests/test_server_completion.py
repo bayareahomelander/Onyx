@@ -1,11 +1,20 @@
+import asyncio
 import json
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 
 import onyx_cuda.server as server
-from onyx_cuda.server import ChatCompletionRequest, create_app, prepare_generation
+from onyx_cuda.server import (
+    MODEL_ID,
+    ChatCompletionRequest,
+    create_app,
+    prepare_generation,
+)
 
 
 class FakeTokenizer:
@@ -257,6 +266,86 @@ def test_streaming_request_is_not_run_as_non_streaming(monkeypatch):
     assert calls == []
 
 
+def test_overlapping_requests_serialize_engine_and_leave_routes_responsive(monkeypatch):
+    tokenizer = FakeTokenizer({(10,): "Ready"})
+    started = threading.Event()
+    release = threading.Event()
+    guard = threading.Lock()
+    active = 0
+    max_active = 0
+
+    def generate(_arguments):
+        nonlocal active, max_active
+        with guard:
+            active += 1
+            max_active = max(max_active, active)
+        started.set()
+        try:
+            assert release.wait(timeout=5)
+            return _result([10], "stop")
+        finally:
+            with guard:
+                active -= 1
+
+    monkeypatch.setattr(server, "_generate", generate)
+    payload = {"messages": [{"role": "user", "content": "Hi"}]}
+
+    with TestClient(create_app(engine=_engine(tokenizer))) as client:
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            first = executor.submit(client.post, "/v1/chat/completions", json=payload)
+            try:
+                assert started.wait(timeout=5)
+                second = executor.submit(client.post, "/v1/chat/completions", json=payload)
+                root = executor.submit(client.get, "/")
+                assert root.result(timeout=2).status_code == 200
+                assert not second.done()
+            finally:
+                release.set()
+
+            assert first.result(timeout=5).status_code == 200
+            assert second.result(timeout=5).status_code == 200
+
+    assert max_active == 1
+
+
+def test_cancelled_request_holds_lock_until_generation_stops(monkeypatch):
+    tokenizer = FakeTokenizer({(10,): "Ready"})
+    started = threading.Event()
+    release = threading.Event()
+
+    def generate(_arguments):
+        started.set()
+        assert release.wait(timeout=5)
+        return _result([10], "stop")
+
+    monkeypatch.setattr(server, "_generate", generate)
+    payload = {"messages": [{"role": "user", "content": "Hi"}]}
+
+    async def exercise():
+        app = create_app(engine=_engine(tokenizer))
+        async with app.router.lifespan_context(app):
+            transport = httpx.ASGITransport(app=app)
+            async with httpx.AsyncClient(
+                transport=transport, base_url="http://testserver"
+            ) as client:
+                cancelled = asyncio.create_task(client.post("/v1/chat/completions", json=payload))
+                assert await asyncio.to_thread(started.wait, 5)
+                cancelled.cancel()
+                await asyncio.sleep(0)
+                waiting = asyncio.create_task(client.post("/v1/chat/completions", json=payload))
+                await asyncio.sleep(0.05)
+                lock = app.state.engine_locks[MODEL_ID]
+                assert lock.locked()
+                assert not waiting.done()
+                release.set()
+                with pytest.raises(asyncio.CancelledError):
+                    await cancelled
+                assert (await waiting).status_code == 200
+                assert not lock.locked()
+
+    asyncio.run(exercise())
+
+
 @pytest.mark.parametrize(
     "invalid_field",
     [
@@ -352,7 +441,7 @@ def test_generation_errors_are_mapped_and_next_request_succeeds(
     assert len(calls) == 2
 
 
-def test_real_cuda_request_matches_direct_generation_content_and_counts():
+def test_real_cuda_two_client_requests_match_direct_generation_without_model_copies():
     from onyx_cuda.model import load_model_pair
     from onyx_cuda.speculative import generate_speculative
 
@@ -366,20 +455,31 @@ def test_real_cuda_request_matches_direct_generation_content_and_counts():
     }
 
     with TestClient(create_app(engine=pair)) as client:
-        response = client.post("/v1/chat/completions", json=payload)
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            responses = list(
+                executor.map(
+                    lambda _index: client.post("/v1/chat/completions", json=payload),
+                    range(2),
+                )
+            )
+        registered = client.app.state.engines[MODEL_ID]
 
-    assert response.status_code == 200
-    body = response.json()
+    assert registered is pair
+    assert registered.draft.model is pair.draft.model
+    assert registered.target.model is pair.target.model
     request = ChatCompletionRequest.model_validate(payload)
     arguments = prepare_generation(request, pair)
     arguments["measure"] = True
     direct = generate_speculative(**arguments)
     expected = pair.target.tokenizer.decode(direct.token_ids, skip_special_tokens=True)
 
-    assert body["choices"][0]["message"]["content"] == expected
-    assert body["choices"][0]["finish_reason"] == direct.finish_reason
-    assert body["usage"] == {
-        "prompt_tokens": len(arguments["prompt_token_ids"]),
-        "completion_tokens": len(direct.token_ids),
-        "total_tokens": len(arguments["prompt_token_ids"]) + len(direct.token_ids),
-    }
+    for response in responses:
+        assert response.status_code == 200
+        body = response.json()
+        assert body["choices"][0]["message"]["content"] == expected
+        assert body["choices"][0]["finish_reason"] == direct.finish_reason
+        assert body["usage"] == {
+            "prompt_tokens": len(arguments["prompt_token_ids"]),
+            "completion_tokens": len(direct.token_ids),
+            "total_tokens": len(arguments["prompt_token_ids"]) + len(direct.token_ids),
+        }

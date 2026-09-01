@@ -20,6 +20,7 @@ def test_create_app_does_not_load_until_lifespan():
     with TestClient(app) as client:
         assert len(starts) == 1
         assert client.app.state.engines[MODEL_ID] is starts[0]
+        assert list(client.app.state.engine_locks) == [MODEL_ID]
         root = client.get("/")
         assert root.status_code == 200
         body = root.json()
@@ -37,6 +38,7 @@ def test_create_app_does_not_load_until_lifespan():
         assert ids == [MODEL_ID]
 
     assert len(starts) == 1
+    assert client.app.state.engine_locks == {}
     assert client.app.state.engines == {}
 
 
