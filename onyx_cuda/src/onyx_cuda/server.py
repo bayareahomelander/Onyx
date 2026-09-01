@@ -3,14 +3,16 @@
 import asyncio
 import gc
 import json
+import queue
 import sys
+import threading
 from contextlib import asynccontextmanager
 from time import time
 from typing import Any, Callable
 from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 MODEL_ID = "onyx-speculative"
@@ -211,8 +213,8 @@ def _generate(arguments: dict[str, Any]):
     return generate_speculative(**arguments)
 
 
-async def _generate_off_event_loop(arguments: dict[str, Any]):
-    worker = asyncio.create_task(asyncio.to_thread(_generate, arguments))
+async def _off_event_loop(fn, *args):
+    worker = asyncio.create_task(asyncio.to_thread(fn, *args))
     try:
         return await asyncio.shield(worker)
     except asyncio.CancelledError:
@@ -221,6 +223,133 @@ async def _generate_off_event_loop(arguments: dict[str, Any]):
         except Exception:
             pass
         raise
+
+
+async def _generate_off_event_loop(arguments: dict[str, Any]):
+    return await _off_event_loop(_generate, arguments)
+
+
+def _completion_event_iter(arguments: dict[str, Any], tokenizer, stop: list[str] | None):
+    from onyx_cuda.speculative import decode_speculative_events, generate_speculative_events
+
+    return decode_speculative_events(
+        generate_speculative_events(**arguments),
+        tokenizer,
+        stop=stop,
+    )
+
+
+def _sse(data: str) -> str:
+    return f"data: {data}\n\n"
+
+
+def _chunk_json(
+    completion_id: str,
+    created: int,
+    model: str,
+    *,
+    role: str | None = None,
+    content: str | None = None,
+    finish_reason: str | None = None,
+) -> str:
+    return ChatCompletionChunk(
+        id=completion_id,
+        created=created,
+        model=model,
+        choices=[
+            ChatCompletionChunkChoice(
+                index=0,
+                delta=ChatCompletionChunkDelta(role=role, content=content),
+                finish_reason=finish_reason,
+            )
+        ],
+    ).model_dump_json()
+
+
+def _stream_error_payload(error: BaseException) -> str:
+    if isinstance(error, ValueError):
+        return json.dumps({"error": {"message": str(error), "type": "invalid_request"}})
+    if isinstance(error, (OSError, RuntimeError)):
+        return json.dumps(
+            {
+                "error": {
+                    "message": "Model or CUDA service unavailable",
+                    "type": "service_unavailable",
+                }
+            }
+        )
+    return json.dumps({"error": {"message": "Internal server error", "type": "server_error"}})
+
+
+def _sse_events(request: ChatCompletionRequest, engine):
+    completion_id = f"chatcmpl-{uuid4().hex[:12]}"
+    created = int(time())
+    model = request.model
+    events = None
+    try:
+        yield _sse(_chunk_json(completion_id, created, model, role="assistant"))
+        arguments = prepare_generation(request, engine)
+        arguments["measure"] = True
+        events = _completion_event_iter(arguments, engine.target.tokenizer, request.stop)
+        finish_reason = None
+        for event in events:
+            result = getattr(event, "result", None)
+            if result is not None:
+                finish_reason = result.finish_reason
+                continue
+            text = getattr(event, "text", None)
+            if text:
+                yield _sse(_chunk_json(completion_id, created, model, content=text))
+        if finish_reason is None:
+            raise Exception("Generation ended without a terminal event")
+        yield _sse(_chunk_json(completion_id, created, model, finish_reason=finish_reason))
+        yield _sse("[DONE]")
+    except Exception as error:
+        yield _sse(_stream_error_payload(error))
+        yield _sse("[DONE]")
+    finally:
+        close = getattr(events, "close", None)
+        if close is not None:
+            close()
+
+
+async def _stream_chat_completion(app: FastAPI, request: ChatCompletionRequest, engine):
+    lock = app.state.engine_locks[request.model]
+    await lock.acquire()
+    cancelled = threading.Event()
+    items: queue.Queue[str | None] = queue.Queue()
+
+    def worker() -> None:
+        stream = _sse_events(request, engine)
+        try:
+            for chunk in stream:
+                if cancelled.is_set():
+                    break
+                items.put(chunk)
+        except Exception as error:
+            items.put(_sse(_stream_error_payload(error)))
+            items.put(_sse("[DONE]"))
+        finally:
+            stream.close()
+            items.put(None)
+
+    thread = threading.Thread(target=worker)
+    thread.start()
+    try:
+        while True:
+            chunk = await asyncio.to_thread(items.get)
+            if chunk is None:
+                break
+            yield chunk
+    finally:
+        cancelled.set()
+        # ponytail: poll-join; ASGI cancel scopes cancel executor futures
+        while thread.is_alive():
+            try:
+                await asyncio.sleep(0)
+            except asyncio.CancelledError:
+                continue
+        lock.release()
 
 
 def _build_vocabulary(tokenizer, logits_vocab_size):
@@ -306,7 +435,18 @@ def create_app(
     @app.post("/v1/chat/completions", response_model=ChatCompletionResponse)
     async def create_chat_completion(request: ChatCompletionRequest):
         if request.stream:
-            raise HTTPException(status_code=400, detail="Streaming is not implemented")
+            if request.n != 1:
+                raise HTTPException(status_code=400, detail="stream=true supports only n=1")
+            engine = get_engine(app, request.model)
+            return StreamingResponse(
+                _stream_chat_completion(app, request, engine),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                    "X-Accel-Buffering": "no",
+                },
+            )
 
         engine = get_engine(app, request.model)
         async with app.state.engine_locks[request.model]:

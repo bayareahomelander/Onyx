@@ -248,22 +248,213 @@ def test_json_response_compacts_only_when_requested(monkeypatch, text, compact_j
     assert calls[0]["token_byte_vocabulary"] is vocabulary
 
 
-def test_streaming_request_is_not_run_as_non_streaming(monkeypatch):
-    calls = _fake_generation(monkeypatch, [])
-    tokenizer = FakeTokenizer({})
+def _parse_sse(body: str) -> list[str]:
+    payloads = []
+    for block in body.split("\n\n"):
+        block = block.strip()
+        if not block:
+            continue
+        data = []
+        for line in block.splitlines():
+            if line.startswith("data:"):
+                data.append(line[5:].lstrip())
+        if data:
+            payloads.append("\n".join(data))
+    return payloads
 
-    with TestClient(create_app(engine=_engine(tokenizer))) as client:
+
+def _fake_stream(monkeypatch, events, error=None):
+    calls = []
+
+    def fake_iter(arguments, tokenizer, stop):
+        calls.append({"arguments": arguments.copy(), "stop": stop})
+
+        def gen():
+            yield from events
+            if error is not None:
+                raise error
+
+        return gen()
+
+    monkeypatch.setattr(server, "_completion_event_iter", fake_iter)
+    return calls
+
+
+def test_streaming_chunks_preserve_id_and_real_finish_reason(monkeypatch):
+    engine = _engine(FakeTokenizer({}))
+    collected = []
+
+    def generate(_arguments):
+        collected.append(1)
+        raise AssertionError("streaming must not collect generate_speculative")
+
+    monkeypatch.setattr(server, "_generate", generate)
+    calls = _fake_stream(
+        monkeypatch,
+        [
+            SimpleNamespace(text="Hel"),
+            SimpleNamespace(text="lo"),
+            SimpleNamespace(result=_result([10, 11], "eos")),
+        ],
+    )
+
+    with TestClient(create_app(engine=engine)) as client:
         response = client.post(
             "/v1/chat/completions",
             json={
                 "messages": [{"role": "user", "content": "Hi"}],
                 "stream": True,
+                "stop": ["END"],
             },
         )
 
-    assert response.status_code == 400
-    assert response.json() == {"detail": "Streaming is not implemented"}
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/event-stream")
+    payloads = _parse_sse(response.text)
+    assert payloads[-1] == "[DONE]"
+    chunks = [json.loads(item) for item in payloads[:-1]]
+    assert chunks[0]["choices"][0]["delta"]["role"] == "assistant"
+    content = "".join(
+        chunk["choices"][0]["delta"]["content"]
+        for chunk in chunks
+        if chunk["choices"][0]["delta"].get("content")
+    )
+    assert content == "Hello"
+    finished = [chunk for chunk in chunks if chunk["choices"][0]["finish_reason"] is not None]
+    assert len(finished) == 1
+    assert finished[0]["choices"][0]["finish_reason"] == "eos"
+    assert {chunk["id"] for chunk in chunks} == {chunks[0]["id"]}
+    assert {chunk["created"] for chunk in chunks} == {chunks[0]["created"]}
+    assert {chunk["model"] for chunk in chunks} == {MODEL_ID}
+    assert collected == []
+    assert calls[0]["arguments"]["measure"] is True
+    assert calls[0]["stop"] == ["END"]
+
+
+def test_streaming_rejects_n_and_unknown_model_before_generation(monkeypatch):
+    calls = _fake_stream(monkeypatch, [])
+
+    with TestClient(create_app(engine=_engine(FakeTokenizer({})))) as client:
+        many = client.post(
+            "/v1/chat/completions",
+            json={"messages": [{"role": "user", "content": "Hi"}], "stream": True, "n": 2},
+        )
+        missing = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "missing",
+                "messages": [{"role": "user", "content": "Hi"}],
+                "stream": True,
+            },
+        )
+        invalid = client.post(
+            "/v1/chat/completions",
+            json={"messages": [{"role": "user", "content": "Hi"}], "stream": True, "top_p": 0},
+        )
+
+    assert many.status_code == 400
+    assert many.json() == {"detail": "stream=true supports only n=1"}
+    assert missing.status_code == 400
+    assert "missing" in missing.json()["detail"]
+    assert invalid.status_code == 422
     assert calls == []
+
+
+@pytest.mark.parametrize(
+    ("error", "error_type", "message"),
+    [
+        (ValueError("invalid regex"), "invalid_request", "invalid regex"),
+        (
+            RuntimeError("CUDA is unavailable"),
+            "service_unavailable",
+            "Model or CUDA service unavailable",
+        ),
+        (LookupError("private traceback detail"), "server_error", "Internal server error"),
+    ],
+)
+def test_streaming_mid_stream_errors_emit_event_and_done(monkeypatch, error, error_type, message):
+    _fake_stream(monkeypatch, [SimpleNamespace(text="He")], error=error)
+    tokenizer = FakeTokenizer({(10,): "Ready"})
+
+    with TestClient(create_app(engine=_engine(tokenizer)), raise_server_exceptions=False) as client:
+        streamed = client.post(
+            "/v1/chat/completions",
+            json={"messages": [{"role": "user", "content": "Hi"}], "stream": True},
+        )
+        monkeypatch.setattr(server, "_generate", lambda _arguments: _result([10], "stop"))
+        valid = client.post(
+            "/v1/chat/completions",
+            json={"messages": [{"role": "user", "content": "Hi"}]},
+        )
+
+    payloads = _parse_sse(streamed.text)
+    assert streamed.status_code == 200
+    assert payloads[-1] == "[DONE]"
+    events = [json.loads(item) for item in payloads[:-1]]
+    assert events[0]["choices"][0]["delta"]["role"] == "assistant"
+    assert events[1]["choices"][0]["delta"]["content"] == "He"
+    assert events[-1] == {"error": {"message": message, "type": error_type}}
+    assert "traceback" not in streamed.text.lower()
+    assert "private traceback detail" not in streamed.text
+    assert valid.status_code == 200
+
+
+def test_cancelled_stream_releases_lock_and_grammar(monkeypatch):
+    tokenizer = FakeTokenizer({(10,): "Ready"})
+    started = threading.Event()
+    release = threading.Event()
+    grammar_states = {"live"}
+
+    def fake_iter(_arguments, _tokenizer, _stop):
+        def gen():
+            try:
+                started.set()
+                assert release.wait(timeout=5)
+                yield SimpleNamespace(text="Hello")
+                yield SimpleNamespace(result=_result([10], "stop"))
+            finally:
+                grammar_states.clear()
+
+        return gen()
+
+    monkeypatch.setattr(server, "_completion_event_iter", fake_iter)
+    monkeypatch.setattr(server, "_generate", lambda _arguments: _result([10], "stop"))
+
+    async def exercise():
+        app = create_app(engine=_engine(tokenizer))
+        async with app.router.lifespan_context(app):
+            transport = httpx.ASGITransport(app=app)
+            async with httpx.AsyncClient(
+                transport=transport, base_url="http://testserver"
+            ) as client:
+                cancelled = asyncio.create_task(
+                    client.post(
+                        "/v1/chat/completions",
+                        json={"messages": [{"role": "user", "content": "Hi"}], "stream": True},
+                    )
+                )
+                assert await asyncio.to_thread(started.wait, 5)
+                cancelled.cancel()
+                await asyncio.sleep(0)
+                waiting = asyncio.create_task(
+                    client.post(
+                        "/v1/chat/completions",
+                        json={"messages": [{"role": "user", "content": "Hi"}]},
+                    )
+                )
+                await asyncio.sleep(0.05)
+                lock = app.state.engine_locks[MODEL_ID]
+                assert lock.locked()
+                assert grammar_states == {"live"}
+                assert not waiting.done()
+                release.set()
+                with pytest.raises(asyncio.CancelledError):
+                    await cancelled
+                assert (await waiting).status_code == 200
+                assert not lock.locked()
+                assert grammar_states == set()
+
+    asyncio.run(exercise())
 
 
 def test_overlapping_requests_serialize_engine_and_leave_routes_responsive(monkeypatch):
