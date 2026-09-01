@@ -89,6 +89,14 @@ Install the CUDA wheel before the project dependency so pip cannot silently sele
 | NVIDIA driver | 610.88 |
 | GPU | GeForce RTX 4050 Laptop GPU (6 GB) |
 
+## Run the API
+
+One Uvicorn worker, factory startup (import does not load the model pair):
+
+```powershell
+.\.venv\Scripts\python.exe -m uvicorn onyx_cuda.server:create_app --factory --host 127.0.0.1 --port 8000
+```
+
 ## Benchmark gates
 
 After installing the development environment, run the fixed greedy benchmark from this directory:

@@ -674,3 +674,172 @@ def test_real_cuda_two_client_requests_match_direct_generation_without_model_cop
             "completion_tokens": len(direct.token_ids),
             "total_tokens": len(arguments["prompt_token_ids"]) + len(direct.token_ids),
         }
+
+
+def test_real_uvicorn_api_phase_gate():
+    import socket
+    import time
+
+    import torch
+    import uvicorn
+    from onyx_cuda.model import load_model_pair
+    from onyx_cuda.speculative import generate_speculative
+
+    pair = load_model_pair()
+    app = create_app(engine=pair)
+    sock = socket.socket()
+    sock.bind(("127.0.0.1", 0))
+    port = sock.getsockname()[1]
+    sock.close()
+    server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=port, log_level="error"))
+    server.install_signal_handlers = lambda: None
+    thread = threading.Thread(target=server.run, daemon=True)
+    thread.start()
+    deadline = time.time() + 60
+    while not server.started:
+        assert thread.is_alive()
+        assert time.time() < deadline
+        time.sleep(0.05)
+
+    payload = {
+        "messages": [
+            {"role": "system", "content": "You are a concise assistant."},
+            {"role": "user", "content": "Reply with CUDA ready."},
+        ],
+        "max_tokens": 4,
+    }
+    schema = {
+        "type": "object",
+        "properties": {"content": {"enum": ["CUDA ready", "Ready"]}},
+        "required": ["content"],
+    }
+
+    try:
+        with httpx.Client(base_url=f"http://127.0.0.1:{port}", timeout=180) as client:
+            root = client.get("/")
+            models = client.get("/v1/models")
+            assert root.status_code == 200
+            assert root.json()["status"] == "ok"
+            assert "/v1/chat/completions" in root.json()["endpoints"]
+            assert [item["id"] for item in models.json()["data"]] == [MODEL_ID]
+            assert (
+                client.post(
+                    "/v1/chat/completions",
+                    json={**payload, "top_p": 0},
+                ).status_code
+                == 422
+            )
+            unknown = client.post(
+                "/v1/chat/completions",
+                json={**payload, "model": "missing"},
+            )
+            assert unknown.status_code == 400
+            assert "missing" in unknown.json()["detail"]
+
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+            warmup = client.post("/v1/chat/completions", json=payload)
+            assert warmup.status_code == 200
+            torch.cuda.synchronize()
+            torch.cuda.reset_peak_memory_stats()
+            baseline = torch.cuda.memory_allocated()
+            allocated = []
+            for _ in range(3):
+                repeated = client.post("/v1/chat/completions", json=payload)
+                assert repeated.status_code == 200
+                torch.cuda.synchronize()
+                allocated.append(torch.cuda.memory_allocated())
+            peak = torch.cuda.max_memory_allocated()
+            assert allocated == [baseline, baseline, baseline]
+            assert peak >= baseline
+
+            body = warmup.json()
+            request = ChatCompletionRequest.model_validate(payload)
+            arguments = prepare_generation(request, pair)
+            arguments["measure"] = True
+            direct = generate_speculative(**arguments)
+            expected = pair.target.tokenizer.decode(direct.token_ids, skip_special_tokens=True)
+            assert app.state.engines[MODEL_ID] is pair
+            assert body["choices"][0]["message"]["content"] == expected
+            assert body["choices"][0]["finish_reason"] == direct.finish_reason
+
+            streamed = client.post("/v1/chat/completions", json={**payload, "stream": True})
+            assert streamed.status_code == 200
+            assert streamed.headers["content-type"].startswith("text/event-stream")
+            payloads = _parse_sse(streamed.text)
+            assert payloads[-1] == "[DONE]"
+            chunks = [json.loads(item) for item in payloads[:-1]]
+            text = "".join(
+                chunk["choices"][0]["delta"]["content"]
+                for chunk in chunks
+                if chunk["choices"][0]["delta"].get("content")
+            )
+            finished = [
+                chunk for chunk in chunks if chunk["choices"][0]["finish_reason"] is not None
+            ]
+            assert text == expected
+            assert len(finished) == 1
+            assert finished[0]["choices"][0]["finish_reason"] == direct.finish_reason
+
+            sampled = client.post(
+                "/v1/chat/completions",
+                json={**payload, "temperature": 0.8, "top_p": 0.9},
+            )
+            stopped = client.post(
+                "/v1/chat/completions",
+                json={**payload, "stop": [" Ready"]},
+            )
+            regex = client.post(
+                "/v1/chat/completions",
+                json={**payload, "regex": "CUDA Ready", "max_tokens": 8},
+            )
+            schema_response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "messages": [
+                        {"role": "system", "content": "Return compact JSON only."},
+                        {
+                            "role": "user",
+                            "content": "Use no spaces or newlines in the JSON response.",
+                        },
+                    ],
+                    "max_tokens": 32,
+                    "json_schema": schema,
+                },
+            )
+            many = client.post("/v1/chat/completions", json={**payload, "n": 2})
+            for response in (sampled, stopped, regex, schema_response, many):
+                assert response.status_code == 200
+                assert response.json()["choices"][0]["finish_reason"] in {
+                    "eos",
+                    "stop",
+                    "length",
+                }
+            assert regex.json()["choices"][0]["message"]["content"] == "CUDA Ready"
+            json.loads(schema_response.json()["choices"][0]["message"]["content"])
+            many_body = many.json()
+            assert len(many_body["choices"]) == 2
+            assert many_body["usage"]["total_tokens"] == (
+                many_body["usage"]["prompt_tokens"] + many_body["usage"]["completion_tokens"]
+            )
+
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                concurrent = list(
+                    executor.map(
+                        lambda _index: client.post("/v1/chat/completions", json=payload),
+                        range(2),
+                    )
+                )
+            assert [item.status_code for item in concurrent] == [200, 200]
+            assert {item.json()["choices"][0]["message"]["content"] for item in concurrent} == {
+                expected
+            }
+
+            print(f"uvicorn_gate_baseline_allocated={baseline}")
+            print(f"uvicorn_gate_peak_allocated={peak}")
+            print(f"uvicorn_gate_post_run_allocated={allocated}")
+    finally:
+        server.should_exit = True
+        thread.join(timeout=30)
+        assert not thread.is_alive()
+        assert app.state.engines == {}
