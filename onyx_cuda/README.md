@@ -1,136 +1,118 @@
 # Onyx CUDA
 
-Onyx CUDA is the Windows and NVIDIA CUDA edition of Onyx, currently under development.
+Onyx CUDA is the Windows and NVIDIA GPU edition of [Onyx](../README.md), an
+inference engine for fast, structured LLM output. It combines speculative
+decoding with token-level regex and JSON Schema constraints and exposes an
+OpenAI-compatible chat-completions API.
 
-## Current capability
+This package is under active development. The current implementation uses
+Qwen2.5 0.5B as the draft model and Qwen2.5 1.5B as the target model.
 
-The package can load the `Qwen/Qwen2.5-0.5B-Instruct` tokenizer and FP16 causal model on `cuda:0` without CPU offload:
+## Features
 
-```python
-from onyx_cuda.generation import generate_tokens
-from onyx_cuda.model import load_model
-from onyx_cuda.prefill import prefill
-from onyx_cuda.prompt import format_prompt
+- NVIDIA CUDA inference with no CPU fallback
+- Grammar-constrained generation using regex or JSON Schema
+- Fixed-gamma speculative decoding
+- OpenAI-compatible non-streaming and streaming responses
+- Generation timing and token-acceptance metrics
 
-loaded = load_model()
-print(loaded.revision)
+## Requirements
 
-prompt = format_prompt(
-    loaded.tokenizer,
-    [
-        {"role": "system", "content": "You are a concise assistant."},
-        {"role": "user", "content": "Reply with CUDA ready."},
-    ],
-)
-print(prompt.text)
-print(prompt.token_ids)
+- 64-bit Windows
+- Python 3.12 recommended
+- NVIDIA GPU and current driver (validated on a 6 GB RTX 4050)
+- Rust MSVC toolchain
+- Visual Studio Build Tools with the C++ workload
 
-result = prefill(loaded.model, prompt.token_ids)
-print(loaded.tokenizer.decode(result.token_id.tolist()))
-print(result.past_key_values.get_seq_length())
+Model weights are downloaded to the Hugging Face cache on first use.
 
-stop_sequences = [loaded.tokenizer.encode(" Ready", add_special_tokens=False)]
-generated = generate_tokens(
-    loaded.model,
-    prompt.token_ids,
-    max_tokens=16,
-    eos_token_ids=loaded.tokenizer.eos_token_id,
-    stop_sequences=stop_sequences,
-    temperature=0.8,
-    top_p=0.9,
-    seed=1234,
-)
-print(loaded.tokenizer.decode(generated.token_ids, skip_special_tokens=True))
-print(generated.finish_reason)
-```
+## Quick start
 
-`onyx_cuda.model.load_model_pair()` loads that model as the draft together with `Qwen/Qwen2.5-1.5B-Instruct` as the FP16 target. It rejects the pair unless logits widths, every token ID's decoded bytes, special/EOS IDs, and chat-template output are identical. Both models fit and complete cached forwards together on the validated 6 GB GPU. The same `generate_tokens()` path is verified against Transformers greedy output for the 1.5B target, including regex and JSON constraints.
-
-`onyx_cuda.speculative.generate_speculative()` runs greedy fixed-gamma decoding with `gamma >= 1`, exact `max_tokens`, EOS, and overlapping token-stop handling and returns the same token/cache/finish-reason result shape as `generate_tokens()`. It accepts the same `regex`, `json_schema`, and `token_byte_vocabulary` inputs, masks both draft and target choices, verifies from the canonical grammar branch, and releases every temporary state. `generate_speculative_events()` exposes that same loop as finalized `AcceptedTokenEvent` values followed by exactly one `GenerationFinishedEvent`; `generate_speculative()` collects those events rather than maintaining another loop. `decode_speculative_events()` incrementally produces `TextDeltaEvent` values, waits for split UTF-8 text to become valid, and withholds enough suffix to suppress fragmented stop strings. Greedy events are emitted during generation; positive-temperature requests, including constrained requests, remain trustworthy target-only temperature/top-p runs whose accepted events are replayed from the completed result. Sampled speculative acceptance is not approximated. `POST /v1/chat/completions` with `stream=true` frames those text events as SSE chunks: assistant role, content deltas, one terminal chunk with the engine finish reason, then `[DONE]`. `n > 1` is rejected for streaming.
-
-The Qwen chat template uses `<|im_end|>` (ID 151645) as EOS, `<|endoftext|>` (ID 151643) as padding, and no BOS token. A formatted prompt ends with `<|im_start|>assistant\n` rather than EOS so generation can begin. `onyx_cuda.server.create_app()` builds a FastAPI app that loads the configured 0.5B/1.5B pair once at startup, serves `GET /`, `GET /v1/models`, and `POST /v1/chat/completions` (non-streaming JSON or SSE) from the engine registry, and drops registry plus CUDA cache memory at shutdown. Requests to the same engine are serialized without per-request model copies, while blocking generation runs outside the event loop so other routes remain responsive. Request preparation uses the tokenizer chat template with a generation prompt and the documented `System:`/`User:`/`Assistant:` fallback when that template is missing. HTTP generation enables synchronized timings; `n > 1` reports Onyx metrics from the final choice and sums completion tokens. Streaming holds the same per-engine lock for the full SSE response.
-
-The HTTP API preserves request-validation responses as 422, returns 400 for unknown models and invalid constraints, returns 503 when model or CUDA execution is unavailable, and returns a generic 500 response for unexpected failures without exposing traceback details.
-
-The single prefill returns last-position vocabulary logits, a Transformers dynamic KV cache on CUDA, and one greedy CUDA token. Generation reuses that cache and supports greedy decoding at temperature zero or seeded temperature/top-p sampling. It reports `eos`, `stop`, or `length`; explicit token stop sequences can span tokens, and the longest matching suffix is removed before decode. Beam search, batching, and repetition penalties are not implemented yet.
-
-Pass `measure=True` to `generate_tokens()` to include synchronized time to first token, decode tokens per second, and total generation time in `result.timings`. Constrained calls also report grammar setup, valid-token enumeration, and CUDA mask/ID-transfer time. Greedy `generate_speculative(..., measure=True)` uses the same result field and additionally reports proposed and accepted token counts, the accepted/proposed rate as a value from zero to one, iteration count, and synchronized draft, verify, and combined grammar-mask seconds. Draft and verify seconds exclude the separately reported mask time.
-
-The models are downloaded to the external Hugging Face cache. Loading fails instead of falling back to CPU when CUDA is unavailable.
-
-The native extension also exposes `onyx_cuda._rust.GrammarConstraint` for model-free regex and JSON-schema compilation with branchable opaque state handles. `onyx_cuda.vocabulary.build_token_byte_vocabulary()` maps the complete model-logit ID space to standalone UTF-8 bytes and reports special/empty-token counts. `onyx_cuda.masking.apply_grammar_mask()` returns a new CUDA logits tensor with invalid token IDs set to negative infinity. Pass `regex=...` or `json_schema=...` and the matching `token_byte_vocabulary` to `generate_tokens()` for constrained decoding; JSON Schema takes precedence when both constraints are supplied. Request preparation serializes JSON Schema once and forwards regex, schema, temperature, top-p, and stop sequences to the Phase 4 generation options; JSON Schema still takes precedence over regex. Non-streaming chat completions compact schema output only after `json.loads` succeeds. Streaming does not compact JSON.
-
-## Windows development setup
-
-Prerequisites are 64-bit Windows, Python 3.12, an NVIDIA GPU and driver, the Rust MSVC toolchain, and Visual Studio Build Tools with the C++ workload.
-
-Create the environment from this directory in PowerShell:
+From the `onyx_cuda` directory, create a virtual environment and install the
+CUDA build of PyTorch before installing the package:
 
 ```powershell
 py -3.12 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install --upgrade pip
 .\.venv\Scripts\python.exe -m pip install torch==2.6.0 --index-url https://download.pytorch.org/whl/cu124
 .\.venv\Scripts\python.exe -m pip install -e ".[dev]"
-.\.venv\Scripts\python.exe -m pip check
 ```
 
-The optional `server` extra pins FastAPI 0.141.1, Pydantic 2.13.5, Uvicorn 0.52.4, and httpx 0.28.1. `.[dev]` includes that extra so request/response models, `create_app()`, and chat completions import.
-
-Install the CUDA wheel before the project dependency so pip cannot silently select a CPU-only PyTorch build. The validated baseline is:
-
-| Component | Version |
-|---|---|
-| Python | 3.12.10 |
-| PyTorch | 2.6.0+cu124 |
-| Transformers | 4.57.6 |
-| Maturin | 1.14.1 |
-| Pytest | 9.1.1 |
-| Rust/Cargo | 1.96.1 |
-| NVIDIA driver | 610.88 |
-| GPU | GeForce RTX 4050 Laptop GPU (6 GB) |
-
-## Run the API
-
-One Uvicorn worker, factory startup (import does not load the model pair):
+Start the API server:
 
 ```powershell
 .\.venv\Scripts\python.exe -m uvicorn onyx_cuda.server:create_app --factory --host 127.0.0.1 --port 8000
 ```
 
-## Benchmark gates
+The first startup may take a while while the draft and target models download.
 
-After installing the development environment, run the fixed greedy benchmark from this directory:
+## Make a request
+
+In another PowerShell window:
+
+```powershell
+curl.exe http://127.0.0.1:8000/v1/chat/completions `
+  -H "Content-Type: application/json" `
+  -d '{"model":"onyx-speculative","messages":[{"role":"user","content":"Generate a product code."}],"regex":"[A-Z]{3}-[0-9]{4}","max_tokens":16}'
+```
+
+For JSON output, pass a JSON Schema instead of a regex:
+
+```json
+{
+  "model": "onyx-speculative",
+  "messages": [{"role": "user", "content": "Generate a user record."}],
+  "json_schema": {
+    "type": "object",
+    "properties": {
+      "name": {"type": "string"},
+      "age": {"type": "integer"}
+    },
+    "required": ["name", "age"]
+  }
+}
+```
+
+Set `"stream": true` to receive server-sent events. The server also provides:
+
+- `GET /` for health information
+- `GET /v1/models` for available models
+- `POST /v1/chat/completions` for generation
+
+## Development
+
+Run the test suite from the `onyx_cuda` directory:
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest
+```
+
+Run the benchmark commands as needed:
 
 ```powershell
 .\.venv\Scripts\python.exe -m onyx_cuda.benchmark
-```
-
-It warms up three fixed prompts, measures each three times, verifies stable token IDs, termination reasons, and post-run CUDA allocation, then writes raw results to the ignored `benchmarks/results/phase2_baseline.json` file.
-
-After retaining that baseline, run the Phase 3 constraint gate:
-
-```powershell
 .\.venv\Scripts\python.exe -m onyx_cuda.benchmark --constraints
-```
-
-It reruns and compares the unconstrained outputs with the Phase 2 file, then measures deterministic regex and JSON-schema generation. The ignored `benchmarks/results/phase3_constraint_gate.json` records grammar setup, valid-token enumeration, mask/transfer, throughput, and peak allocated VRAM.
-
-Run the 1.5B target-only correctness baseline before speculative work:
-
-```powershell
 .\.venv\Scripts\python.exe -m onyx_cuda.benchmark --target
-```
-
-It uses the same prompts, generation loop, warmups, repetitions, timing, and memory checks and writes `benchmarks/results/phase4_target_baseline.json`. Validate target constraints against that retained baseline with:
-
-```powershell
-.\.venv\Scripts\python.exe -m onyx_cuda.benchmark --target --constraints
-```
-
-That command writes `benchmarks/results/phase4_target_constraint_gate.json`. Retain it, then run the complete fixed-gamma gate:
-
-```powershell
 .\.venv\Scripts\python.exe -m onyx_cuda.benchmark --speculative
 ```
 
-The speculative gate loads the compatible pair; measures all three unconstrained prompts plus the regex and JSON cases at `gamma` 1, 2, and 4 after warmup; checks every output and termination reason against the 1.5B target-only file; rejects post-run allocation drift; and records TTFT, total/output throughput, proposal acceptance, iteration and stage timings, and peak allocated VRAM in ignored `benchmarks/results/phase4_speculative_gate.json`. It reports the gamma with the highest median per-prompt output throughput across the five cases and prints the measured target-time ratio even when speculation is slower.
+Benchmark results are written under `benchmarks/results/` and are ignored by
+Git.
+
+## Current limitations
+
+- The model pair is currently fixed to Qwen2.5 0.5B and 1.5B Instruct.
+- Speculative decoding is greedy; positive-temperature requests use the target
+  model directly.
+- Beam search, batching, and repetition penalties are not implemented.
+- CUDA is required. Model loading fails rather than falling back to CPU.
+
+## Project layout
+
+- `src/onyx_cuda/` — model loading, generation, speculative decoding, and API
+- `rust/` — native regex and JSON Schema grammar engine
+- `tests/` — unit and API tests
+
+## License
+
+Onyx is available under the [MIT License](../LICENSE).
