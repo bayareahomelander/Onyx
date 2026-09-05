@@ -79,9 +79,73 @@ Set `"stream": true` to receive server-sent events. The server also provides:
 - `GET /v1/models` for available models
 - `POST /v1/chat/completions` for generation
 
+## API options and completion status
+
+Requests reject unknown fields, including nested message and response-format
+fields. Message content must be text, with a `system`, `user`, or `assistant`
+role. Send at least one message. Values must have the declared JSON types;
+strings such as `"0.8"` are not accepted as numbers.
+
+| Option | Behavior |
+| --- | --- |
+| `max_tokens` or `max_completion_tokens` | Positive output-token budget; default 256. Send only one name. |
+| `temperature`, `top_p`, `seed` | Greedy decoding at temperature 0; target-model sampling above 0. `top_p` and `seed` apply to sampling. The seed is an integer in PyTorch's supported range, −2⁶³ through 2⁶⁴−1. |
+| `response_format` | `{"type":"text"}`, or `json_schema` as shown below. |
+| `json_schema`, `regex` | Onyx constraint extensions. Choose only one of these or `response_format`. |
+| `stop` | One nonempty string or a list of up to four. Supported for text/regex output; JSON completion is determined by its schema. |
+| `n` | Positive number of sequential choices; streaming supports only 1. A fixed seed is reused for each choice. |
+| `stream` | SSE content deltas during generation, for both greedy and sampled decoding. |
+| `compact_json` | Compact completed non-streaming JSON; default true. Explicit `true` with streaming is rejected. Partial JSON is never compacted. |
+
+For the standard structured-output request shape:
+
+```json
+{
+  "messages": [{"role": "user", "content": "Generate a user record."}],
+  "max_completion_tokens": 64,
+  "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+      "name": "user_record",
+      "strict": true,
+      "schema": {
+        "type": "object",
+        "properties": {"name": {"type": "string"}},
+        "required": ["name"]
+      }
+    }
+  }
+}
+```
+
+The schema name and optional description are metadata. `strict` defaults to
+true; false is unsupported. `json_object` mode, tools, multimodal messages,
+penalties, log probabilities, `stream_options`, and other unlisted options are
+rejected explicitly. Use `json_schema` with declared properties for JSON objects.
+
+The API exposes two finish reasons:
+
+- `stop`: normal completion, including EOS or a stop string. For JSON requests,
+  the returned document has passed schema validation.
+- `length`: the token budget was exhausted. HTTP status is 200 and the response
+  contains the partial output and usage. JSON may be incomplete and must not be
+  treated as validated. Increase the budget and retry. A document completed on
+  the last available token still finishes with `stop`.
+
+Streams end with a terminal choice and `[DONE]`, including when the finish reason
+is `length`. Deltas preserve split Unicode characters and withhold possible stop
+strings. They are emitted as tokens become available; sampled generation does
+not wait for the whole answer. Disconnecting closes the generation iterator.
+
+Invalid fields, types, and option combinations return HTTP 422 before generation.
+Unsupported schemas, invalid regexes, and unknown models return HTTP 400. Runtime
+service failures return 503 and unexpected failures return 500. Once an SSE
+response has begun, errors use an `error` event followed by `[DONE]` instead of
+changing the HTTP status; there is no normal terminal choice on that path.
+
 ## Structured-output contract
 
-A successful JSON-schema response contains a complete JSON document that passes
+A JSON-schema response with `finish_reason: "stop"` contains a complete document that passes
 validation against the supported schema subset below. Unsupported keywords and
 malformed schemas raise an error; they are never silently ignored. For example,
 `{"type":"integer","minimum":18}` is rejected because `minimum` is not supported.
@@ -116,11 +180,11 @@ Raw token bytes preserve Unicode characters split across tokens, and special
 tokens cannot satisfy a grammar. Completion is checked both against the schema
 and against the final decoded API text. Numeric output retains its precision
 during validation and compaction. HTTP schemas with decimal values that would
-lose precision in the request parser are rejected. Incomplete output (including token-limit
-or stop-string truncation) is an error, rather than a successful partial JSON
-response. Non-streaming requests return HTTP 400 for schema or validation errors.
+lose precision in the request parser are rejected. Token exhaustion returns
+unvalidated partial content with `finish_reason: "length"`, as described above.
+Non-streaming requests return HTTP 400 for schema or validation errors.
 Streaming requests can emit partial content before an error event; clients must
-wait for a successful terminal choice before treating the assembled JSON as
+wait for a terminal choice with `finish_reason: "stop"` before treating the assembled JSON as
 validated. `[DONE]` alone does not indicate success.
 
 ## Development

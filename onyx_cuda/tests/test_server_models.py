@@ -12,7 +12,6 @@ from onyx_cuda.server import (
     ChatCompletionResponse,
 )
 
-
 SRC_PATH = Path(__file__).resolve().parents[1] / "src"
 
 
@@ -56,7 +55,9 @@ def test_valid_request_and_response_round_trip():
         "temperature": 0.8,
         "stream": True,
         "regex": "CUDA",
-        "json_schema": {"type": "object"},
+        "json_schema": None,
+        "response_format": None,
+        "seed": None,
         "compact_json": False,
         "top_p": 0.9,
         "n": 2,
@@ -144,7 +145,7 @@ def test_valid_request_and_response_round_trip():
         {"messages": [{"content": "hi"}]},
         {"json_schema": "object"},
         {"stream": "maybe"},
-        {"stop": "END"},
+        {"stop": ""},
     ],
 )
 def test_invalid_request_bounds_and_shapes_fail_before_cuda(overrides):
@@ -156,3 +157,85 @@ def test_invalid_request_bounds_and_shapes_fail_before_cuda(overrides):
 def test_missing_messages_fail_validation():
     with pytest.raises(ValidationError):
         ChatCompletionRequest.model_validate({})
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        {
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {"name": "record", "schema": {}, "strict": 1},
+            }
+        },
+        {"tools": []},
+        {"response_format": {"type": "json_object"}},
+        {"response_format": {"type": "text", "typo": True}},
+        {
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {"name": "record", "schema": {"type": "object"}, "strict": False},
+            }
+        },
+        {
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {"name": "record", "schema": {}, "typo": True},
+            }
+        },
+        {"regex": "x", "json_schema": {}},
+        {"response_format": {"type": "text"}, "json_schema": {}},
+        {"max_tokens": 1, "max_completion_tokens": 2},
+        {"messages": []},
+        {"messages": [{"role": "tool", "content": "x"}]},
+        {"messages": [{"role": "user", "content": "x", "name": "ignored"}]},
+        {"max_tokens": True},
+        {"temperature": "0.8"},
+        {"seed": 1.5},
+        {"seed": 2**64},
+        {"stream_options": {"include_usage": True}},
+        {"stop": ["x"] * 5},
+        {"stop": []},
+        {"json_schema": {}, "stop": "END"},
+        {"stream": True, "compact_json": True},
+    ],
+)
+def test_unsupported_options_are_rejected(options):
+    with pytest.raises(ValidationError):
+        ChatCompletionRequest.model_validate(
+            {
+                "messages": [{"role": "user", "content": "Hi"}],
+                **options,
+            }
+        )
+
+
+def test_supported_aliases_and_response_format():
+    schema = {"type": "object", "properties": {"answer": {"type": "string"}}}
+    request = ChatCompletionRequest.model_validate(
+        {
+            "messages": [{"role": "user", "content": "Hi"}],
+            "max_completion_tokens": 12,
+            "seed": 42,
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "answer",
+                    "description": "An answer",
+                    "schema": schema,
+                    "strict": True,
+                },
+            },
+        }
+    )
+    assert request.max_tokens == 12
+    assert request.effective_json_schema == schema
+    assert request.seed == 42
+    assert ChatCompletionRequest.model_validate(request.model_dump()) == request
+    assert ChatCompletionRequest.model_validate(
+        {
+            "messages": [{"role": "user", "content": "Hi"}],
+            "response_format": {"type": "text"},
+            "stop": "END",
+        }
+    ).stop == ["END"]

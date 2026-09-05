@@ -104,7 +104,7 @@ def test_non_streaming_chat_completion_returns_usage_reason_and_metrics(monkeypa
         {
             "index": 0,
             "message": {"role": "assistant", "content": "Hello"},
-            "finish_reason": "eos",
+            "finish_reason": "stop",
         }
     ]
     assert body["usage"] == {
@@ -269,6 +269,95 @@ def test_json_compaction_preserves_numeric_precision(monkeypatch):
 
 
 @pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize(
+    "finish_reason,text", [("length", ' { "answer":'), ("stop", '{"answer":"yes"}')]
+)
+def test_response_format_and_json_exhaustion_contract(monkeypatch, stream, finish_reason, text):
+    engine = _engine(FakeTokenizer({(31,): text}))
+    result = _result([31], finish_reason)
+    calls = _fake_generation(monkeypatch, [result])
+    stream_calls = _fake_stream(
+        monkeypatch, [SimpleNamespace(text=text), SimpleNamespace(result=result)]
+    )
+    monkeypatch.setattr(server, "_build_vocabulary", lambda *_args: object())
+    schema = {
+        "type": "object",
+        "properties": {"answer": {"type": "string"}},
+        "required": ["answer"],
+    }
+    with TestClient(create_app(engine=engine)) as client:
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "messages": [{"role": "user", "content": "Hi"}],
+                "max_completion_tokens": 1,
+                "seed": 42,
+                "temperature": 0.8,
+                "stream": stream,
+                "response_format": {
+                    "type": "json_schema",
+                    "json_schema": {"name": "answer", "schema": schema, "strict": True},
+                },
+            },
+        )
+    assert response.status_code == 200
+    if stream:
+        events = _parse_sse(response.text)
+        assert events[-1] == "[DONE]"
+        chunks = [json.loads(event) for event in events[:-1]]
+        assert not any("error" in chunk for chunk in chunks)
+        assert chunks[-1]["choices"][0]["finish_reason"] == finish_reason
+        assert (
+            "".join(chunk["choices"][0]["delta"].get("content") or "" for chunk in chunks) == text
+        )
+        arguments = stream_calls[0]["arguments"]
+    else:
+        choice = response.json()["choices"][0]
+        assert choice["finish_reason"] == finish_reason
+        assert choice["message"]["content"] == text
+        assert response.json()["usage"]["completion_tokens"] == 1
+        arguments = calls[0]
+    assert arguments["seed"] == 42
+    assert arguments["max_tokens"] == 1
+    assert json.loads(arguments["json_schema"]) == schema
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize(
+    "options,status",
+    [
+        ({"tools": []}, 422),
+        ({"regex": "["}, 400),
+        ({"response_format": {"type": "json_object"}}, 422),
+        (
+            {
+                "response_format": {
+                    "type": "json_schema",
+                    "json_schema": {"name": "age", "schema": {"type": "integer", "minimum": 18}},
+                }
+            },
+            400,
+        ),
+    ],
+)
+def test_unsupported_request_fails_before_generation_or_sse(monkeypatch, stream, options, status):
+    calls = _fake_generation(monkeypatch, [])
+    stream_calls = _fake_stream(monkeypatch, [])
+    with TestClient(create_app(engine=_engine(FakeTokenizer({})))) as client:
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "messages": [{"role": "user", "content": "Hi"}],
+                "stream": stream,
+                **options,
+            },
+        )
+    assert response.status_code == status
+    assert response.headers["content-type"] == "application/json"
+    assert calls == stream_calls == []
+
+
+@pytest.mark.parametrize("stream", [False, True])
 def test_http_schema_rejects_decimal_precision_loss(monkeypatch, stream):
     engine = _engine(FakeTokenizer({}))
     calls = _fake_generation(monkeypatch, [])
@@ -397,7 +486,7 @@ def test_streaming_chunks_preserve_id_and_real_finish_reason(monkeypatch):
     assert content == "Hello"
     finished = [chunk for chunk in chunks if chunk["choices"][0]["finish_reason"] is not None]
     assert len(finished) == 1
-    assert finished[0]["choices"][0]["finish_reason"] == "eos"
+    assert finished[0]["choices"][0]["finish_reason"] == "stop"
     assert {chunk["id"] for chunk in chunks} == {chunks[0]["id"]}
     assert {chunk["created"] for chunk in chunks} == {chunks[0]["created"]}
     assert {chunk["model"] for chunk in chunks} == {MODEL_ID}
@@ -743,7 +832,9 @@ def test_real_cuda_two_client_requests_match_direct_generation_without_model_cop
         assert response.status_code == 200
         body = response.json()
         assert body["choices"][0]["message"]["content"] == expected
-        assert body["choices"][0]["finish_reason"] == direct.finish_reason
+        assert body["choices"][0]["finish_reason"] == (
+            "stop" if direct.finish_reason == "eos" else direct.finish_reason
+        )
         assert body["usage"] == {
             "prompt_tokens": len(arguments["prompt_token_ids"]),
             "completion_tokens": len(direct.token_ids),
@@ -751,7 +842,7 @@ def test_real_cuda_two_client_requests_match_direct_generation_without_model_cop
         }
 
 
-def test_real_uvicorn_api_phase_gate():
+def test_real_uvicorn_api_phase_gate(monkeypatch):
     import socket
     import time
 
@@ -836,7 +927,9 @@ def test_real_uvicorn_api_phase_gate():
             expected = pair.target.tokenizer.decode(direct.token_ids, skip_special_tokens=True)
             assert app.state.engines[MODEL_ID] is pair
             assert body["choices"][0]["message"]["content"] == expected
-            assert body["choices"][0]["finish_reason"] == direct.finish_reason
+            assert body["choices"][0]["finish_reason"] == (
+                "stop" if direct.finish_reason == "eos" else direct.finish_reason
+            )
 
             streamed = client.post("/v1/chat/completions", json={**payload, "stream": True})
             assert streamed.status_code == 200
@@ -854,7 +947,58 @@ def test_real_uvicorn_api_phase_gate():
             ]
             assert text == expected
             assert len(finished) == 1
-            assert finished[0]["choices"][0]["finish_reason"] == direct.finish_reason
+            assert finished[0]["choices"][0]["finish_reason"] == ("stop" if direct.finish_reason == "eos" else direct.finish_reason)
+
+            # The second sample cannot proceed until the HTTP client sees content.
+            # A response that buffers generation deadlocks here and fails the timeout.
+            import onyx_cuda.generation as generation_module
+
+            content_received = threading.Event()
+            sample_calls = []
+            sample_token = generation_module._sample_token
+
+            def gated_sample(*args, **kwargs):
+                if len(sample_calls) == 1:
+                    assert content_received.wait(10), "Sampled content was buffered"
+                sample_calls.append(1)
+                return sample_token(*args, **kwargs)
+
+            try:
+                with monkeypatch.context() as patch:
+                    patch.setattr(generation_module, "_sample_token", gated_sample)
+                    with client.stream(
+                        "POST",
+                        "/v1/chat/completions",
+                        json={
+                            **payload,
+                            "max_tokens": 8,
+                            "temperature": 0.8,
+                            "seed": 42,
+                            "regex": "CUDA Ready",
+                            "stream": True,
+                        },
+                    ) as streamed_sample:
+                        assert streamed_sample.status_code == 200
+                        sampled_text = ""
+                        sampled_finish = None
+                        for line in streamed_sample.iter_lines():
+                            if not line.startswith("data: ") or line == "data: [DONE]":
+                                continue
+                            chunk = json.loads(line[6:])
+                            assert "error" not in chunk
+                            choice = chunk["choices"][0]
+                            content = choice["delta"].get("content")
+                            if content:
+                                sampled_text += content
+                                content_received.set()
+                            if choice["finish_reason"] is not None:
+                                sampled_finish = choice["finish_reason"]
+                        assert content_received.is_set()
+                        assert len(sample_calls) > 1
+                        assert sampled_text == "CUDA Ready"
+                        assert sampled_finish == "stop"
+            finally:
+                content_received.set()
 
             sampled = client.post(
                 "/v1/chat/completions",
@@ -886,7 +1030,6 @@ def test_real_uvicorn_api_phase_gate():
             for response in (sampled, stopped, regex, schema_response, many):
                 assert response.status_code == 200
                 assert response.json()["choices"][0]["finish_reason"] in {
-                    "eos",
                     "stop",
                     "length",
                 }
@@ -907,7 +1050,14 @@ def test_real_uvicorn_api_phase_gate():
 
             # Permanent GPU/API regression: raw UTF-8 and surrogate-pair-sized characters.
             unicode_schema = {"type": "string", "enum": ["é🚀"], "minLength": 2, "maxLength": 2}
-            unicode_payload = {**payload, "max_tokens": 32, "json_schema": unicode_schema}
+            unicode_payload = {
+                **payload,
+                "max_tokens": 32,
+                "response_format": {
+                    "type": "json_schema",
+                    "json_schema": {"name": "unicode", "schema": unicode_schema, "strict": True},
+                },
+            }
             from jsonschema import Draft202012Validator
 
             for temperature in (0.0, 0.8):
@@ -935,11 +1085,36 @@ def test_real_uvicorn_api_phase_gate():
                     value = json.loads(output)
                     assert value == "é🚀"
                     Draft202012Validator(unicode_schema).validate(value)
-            exhausted = client.post(
-                "/v1/chat/completions", json={**unicode_payload, "max_tokens": 1}
-            )
-            assert exhausted.status_code == 400
-            assert "complete valid document" in exhausted.json()["detail"]
+            for temperature in (0.0, 0.8):
+                for stream in (False, True):
+                    exhausted = client.post(
+                        "/v1/chat/completions",
+                        json={
+                            "messages": payload["messages"],
+                            "max_completion_tokens": 1,
+                            "temperature": temperature,
+                            "stream": stream,
+                            "seed": 42,
+                            "response_format": {
+                                "type": "json_schema",
+                                "json_schema": {
+                                    "name": "unicode",
+                                    "schema": unicode_schema,
+                                    "strict": True,
+                                },
+                            },
+                        },
+                    )
+                    assert exhausted.status_code == 200
+                    if stream:
+                        events = _parse_sse(exhausted.text)
+                        assert events[-1] == "[DONE]"
+                        chunks = [json.loads(event) for event in events[:-1]]
+                        assert not any("error" in chunk for chunk in chunks)
+                        assert chunks[-1]["choices"][0]["finish_reason"] == "length"
+                    else:
+                        assert exhausted.json()["choices"][0]["finish_reason"] == "length"
+                        assert exhausted.json()["usage"]["completion_tokens"] == 1
             many_body = many.json()
             assert len(many_body["choices"]) == 2
             assert many_body["usage"]["total_tokens"] == (

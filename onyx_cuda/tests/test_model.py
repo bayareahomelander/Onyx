@@ -455,7 +455,6 @@ def test_load_model_prompt_prefill_and_generation_on_cuda(monkeypatch):
             json_prompt.token_ids,
             max_tokens=64,
             eos_token_ids=eos_token_id,
-            regex="Ready" if name == "object" else None,
             token_byte_vocabulary=vocabulary,
             json_schema=json.dumps(schema),
             measure=name == "object",

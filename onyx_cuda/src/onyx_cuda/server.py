@@ -9,12 +9,12 @@ import threading
 from contextlib import asynccontextmanager
 from decimal import Decimal
 from time import time
-from typing import Any, Callable
+from typing import Annotated, Any, Callable, Literal
 from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator, model_validator
 
 MODEL_ID = "onyx-speculative"
 SERVICE_VERSION = "0.1.0"
@@ -22,28 +22,95 @@ GAMMA = 4
 
 
 class ChatMessage(BaseModel):
-    role: str
+    model_config = ConfigDict(extra="forbid", strict=True)
+    role: Literal["system", "user", "assistant"]
     content: str
 
 
+class TextResponseFormat(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    type: Literal["text"]
+
+
+class ResponseSchema(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True, serialize_by_alias=True)
+    name: str = Field(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9_-]+$")
+    description: str | None = None
+    schema_: dict[str, Any] = Field(alias="schema")
+    strict: Literal[True] = True
+
+    @field_validator("strict", mode="before")
+    @classmethod
+    def require_boolean(cls, value):
+        if not isinstance(value, bool):
+            raise ValueError("strict must be a boolean")
+        return value
+
+
+class SchemaResponseFormat(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    type: Literal["json_schema"]
+    json_schema: ResponseSchema
+
+
 class ChatCompletionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
     model: str = MODEL_ID
-    messages: list[ChatMessage]
-    max_tokens: int = Field(default=256, ge=1)
+    messages: list[ChatMessage] = Field(min_length=1)
+    max_tokens: int = Field(
+        default=256, ge=1, validation_alias=AliasChoices("max_tokens", "max_completion_tokens")
+    )
     temperature: float = Field(default=0.0, ge=0, allow_inf_nan=False)
     stream: bool = False
     regex: str | None = None
     json_schema: dict[str, Any] | None = None
+    response_format: (
+        Annotated[TextResponseFormat | SchemaResponseFormat, Field(discriminator="type")] | None
+    ) = None
     compact_json: bool = True
     top_p: float = Field(default=1.0, gt=0, le=1, allow_inf_nan=False)
+    seed: int | None = Field(default=None, ge=-(2**63), le=2**64 - 1)
     n: int = Field(default=1, ge=1)
-    stop: list[str] | None = None
+    stop: list[str] | None = Field(default=None, max_length=4)
+
+    @field_validator("stop", mode="before")
+    @classmethod
+    def normalize_stop(cls, value):
+        return [value] if isinstance(value, str) else value
+
+    @field_validator("stop")
+    @classmethod
+    def reject_empty_stops(cls, value):
+        if value is not None and (not value or any(not item for item in value)):
+            raise ValueError("stop must contain one to four nonempty strings")
+        return value
+
+    @property
+    def effective_json_schema(self) -> dict[str, Any] | None:
+        if isinstance(self.response_format, SchemaResponseFormat):
+            return self.response_format.json_schema.schema_
+        return self.json_schema
+
+    @model_validator(mode="after")
+    def validate_options(self):
+        if (
+            sum(value is not None for value in (self.regex, self.json_schema, self.response_format))
+            > 1
+        ):
+            raise ValueError("regex, json_schema, and response_format are mutually exclusive")
+        if self.effective_json_schema is not None and self.stop is not None:
+            raise ValueError(
+                "stop is unsupported with JSON output; the schema determines completion"
+            )
+        if "compact_json" in self.model_fields_set and self.compact_json and self.stream:
+            raise ValueError("compact_json=true is unsupported with streaming")
+        return self
 
 
 class ChatCompletionChoice(BaseModel):
     index: int
     message: ChatMessage
-    finish_reason: str = "stop"
+    finish_reason: Literal["stop", "length"] = "stop"
 
 
 class UsageInfo(BaseModel):
@@ -78,7 +145,7 @@ class ChatCompletionChunkDelta(BaseModel):
 class ChatCompletionChunkChoice(BaseModel):
     index: int
     delta: ChatCompletionChunkDelta
-    finish_reason: str | None = None
+    finish_reason: Literal["stop", "length"] | None = None
 
 
 class ChatCompletionChunk(BaseModel):
@@ -169,7 +236,11 @@ def resolve_stop_sequences(stop: list[str] | None, tokenizer) -> list[list[int]]
 def prepare_generation(request: ChatCompletionRequest, engine) -> dict[str, Any]:
     tokenizer = engine.target.tokenizer
     _text, prompt_token_ids = format_request_messages(request.messages, tokenizer)
-    json_schema = json.dumps(request.json_schema) if request.json_schema is not None else None
+    json_schema = (
+        json.dumps(request.effective_json_schema)
+        if request.effective_json_schema is not None
+        else None
+    )
     arguments = {
         "draft_model": engine.draft.model,
         "target_model": engine.target.model,
@@ -180,6 +251,7 @@ def prepare_generation(request: ChatCompletionRequest, engine) -> dict[str, Any]
         "stop_sequences": resolve_stop_sequences(request.stop, tokenizer),
         "temperature": request.temperature,
         "top_p": request.top_p,
+        "seed": request.seed,
         "regex": request.regex,
         "json_schema": json_schema,
     }
@@ -315,17 +387,17 @@ def _sse_events(request: ChatCompletionRequest, engine):
         for event in events:
             result = getattr(event, "result", None)
             if result is not None:
-                finish_reason = result.finish_reason
+                finish_reason = "stop" if result.finish_reason == "eos" else result.finish_reason
                 continue
             text = getattr(event, "text", None)
             if text:
-                if request.json_schema is not None:
+                if request.effective_json_schema is not None:
                     json_parts.append(text)
                 yield _sse(_chunk_json(completion_id, created, model, content=text))
         if finish_reason is None:
             raise Exception("Generation ended without a terminal event")
-        if request.json_schema is not None:
-            _validate_json_response(request.json_schema, "".join(json_parts))
+        if request.effective_json_schema is not None and finish_reason != "length":
+            _validate_json_response(request.effective_json_schema, "".join(json_parts))
         yield _sse(_chunk_json(completion_id, created, model, finish_reason=finish_reason))
         yield _sse("[DONE]")
     except Exception as error:
@@ -458,9 +530,21 @@ def create_app(
 
     @app.post("/v1/chat/completions", response_model=ChatCompletionResponse)
     async def create_chat_completion(request: ChatCompletionRequest, http_request: Request):
-        if request.json_schema is not None:
-            raw_schema = json.loads(await http_request.body(), parse_float=Decimal)["json_schema"]
+        if request.regex is not None:
+            from onyx_cuda import _rust
+
+            _rust.GrammarConstraint([b"x"]).compile_regex(request.regex)
+        if request.effective_json_schema is not None:
+            body = json.loads(await http_request.body(), parse_float=Decimal)
+            raw_schema = (
+                body["response_format"]["json_schema"]["schema"]
+                if isinstance(request.response_format, SchemaResponseFormat)
+                else body["json_schema"]
+            )
             _validate_schema_number_precision(raw_schema)
+            from onyx_cuda import _rust
+
+            _rust.validate_json_schema(json.dumps(request.effective_json_schema))
         if request.stream:
             if request.n != 1:
                 raise HTTPException(status_code=400, detail="stream=true supports only n=1")
@@ -490,16 +574,22 @@ def create_app(
                 completion_tokens += len(result.token_ids)
                 last_timings = result.timings
                 output = tokenizer.decode(result.token_ids, skip_special_tokens=True)
-                output = truncate_at_stop(output, request.stop)
-                if request.json_schema is not None:
-                    compact_output = _validate_json_response(request.json_schema, output)
+                truncated = truncate_at_stop(output, request.stop)
+                finish_reason = (
+                    "stop"
+                    if result.finish_reason == "eos" or truncated != output
+                    else result.finish_reason
+                )
+                output = truncated
+                if request.effective_json_schema is not None and result.finish_reason != "length":
+                    compact_output = _validate_json_response(request.effective_json_schema, output)
                     if request.compact_json:
                         output = compact_output
                 choices.append(
                     ChatCompletionChoice(
                         index=index,
                         message=ChatMessage(role="assistant", content=output),
-                        finish_reason=result.finish_reason,
+                        finish_reason=finish_reason,
                     )
                 )
 
@@ -513,7 +603,7 @@ def create_app(
                 ),
                 onyx_metrics=_build_metrics(
                     last_timings,
-                    request.regex is not None or request.json_schema is not None,
+                    request.regex is not None or request.effective_json_schema is not None,
                 ),
             )
 

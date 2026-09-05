@@ -17,7 +17,6 @@ def _messages():
         ChatMessage(role="system", content="S"),
         ChatMessage(role="user", content="U"),
         ChatMessage(role="assistant", content="A"),
-        ChatMessage(role="tool", content="T"),
     ]
 
 
@@ -64,7 +63,6 @@ def test_format_uses_chat_template_with_role_order_and_generation_prompt():
                 {"role": "system", "content": "S"},
                 {"role": "user", "content": "U"},
                 {"role": "assistant", "content": "A"},
-                {"role": "tool", "content": "T"},
             ],
             "tokenize": False,
             "add_generation_prompt": True,
@@ -74,7 +72,6 @@ def test_format_uses_chat_template_with_role_order_and_generation_prompt():
                 {"role": "system", "content": "S"},
                 {"role": "user", "content": "U"},
                 {"role": "assistant", "content": "A"},
-                {"role": "tool", "content": "T"},
             ],
             "tokenize": True,
             "add_generation_prompt": True,
@@ -114,7 +111,7 @@ def test_stop_sequences_keep_multi_token_and_drop_empty():
     assert resolve_stop_sequences(["", " "], tokenizer) is None
 
 
-def test_prepare_generation_forwards_exact_arguments_and_json_precedence(
+def test_prepare_generation_forwards_exact_arguments_and_json_schema(
     monkeypatch,
 ):
     tokenizer = TemplateTokenizer()
@@ -142,6 +139,7 @@ def test_prepare_generation_forwards_exact_arguments_and_json_precedence(
         "stop_sequences": [[10, 11]],
         "temperature": 0.8,
         "top_p": 0.9,
+        "seed": None,
         "regex": None,
         "json_schema": None,
     }
@@ -161,12 +159,11 @@ def test_prepare_generation_forwards_exact_arguments_and_json_precedence(
     constrained = prepare_generation(
         ChatCompletionRequest(
             messages=[ChatMessage(role="user", content="Hello")],
-            regex="CUDA",
             json_schema=schema,
         ),
         constrained_engine,
     )
-    assert constrained["regex"] == "CUDA"
+    assert constrained["regex"] is None
     assert constrained["json_schema"] == json.dumps(schema)
     assert json.loads(constrained["json_schema"]) == schema
     assert constrained["token_byte_vocabulary"] is vocabulary

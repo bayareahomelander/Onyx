@@ -2,6 +2,7 @@
 
 import math
 import time
+from collections.abc import Iterator
 from typing import Literal, NamedTuple
 
 import torch
@@ -21,6 +22,21 @@ class GenerationResult(NamedTuple):
     timings: "GenerationTimings | None" = None
 
 
+class AcceptedTokenEvent(NamedTuple):
+    token_id: int
+
+
+class GenerationFinishedEvent(NamedTuple):
+    result: GenerationResult
+
+
+def _take_ready_tokens(pending: list[int], retain: int = 0) -> list[int]:
+    count = max(len(pending) - retain, 0)
+    ready = pending[:count]
+    del pending[:count]
+    return ready
+
+
 class GenerationTimings(NamedTuple):
     time_to_first_token_seconds: float
     decode_tokens_per_second: float | None
@@ -37,9 +53,7 @@ class GenerationTimings(NamedTuple):
     mask_seconds: float | None = None
 
 
-def _matched_stop_length(
-    token_ids: list[int], stop_sequences: list[list[int]]
-) -> int:
+def _matched_stop_length(token_ids: list[int], stop_sequences: list[list[int]]) -> int:
     return max(
         (
             len(sequence)
@@ -61,17 +75,13 @@ def _sample_token(
 
     probabilities = torch.softmax(logits.float() / temperature, dim=-1)
     if top_p < 1:
-        sorted_probabilities, sorted_indices = probabilities.sort(
-            dim=-1, descending=True
-        )
+        sorted_probabilities, sorted_indices = probabilities.sort(dim=-1, descending=True)
         cumulative_probabilities = sorted_probabilities.cumsum(dim=-1)
         sorted_probabilities.masked_fill_(
             cumulative_probabilities - sorted_probabilities >= top_p, 0
         )
         sorted_probabilities /= sorted_probabilities.sum(dim=-1, keepdim=True)
-        sampled_index = torch.multinomial(
-            sorted_probabilities, 1, generator=generator
-        )
+        sampled_index = torch.multinomial(sorted_probabilities, 1, generator=generator)
         return sorted_indices.gather(-1, sampled_index).squeeze(-1)
 
     return torch.multinomial(probabilities, 1, generator=generator).squeeze(-1)
@@ -98,6 +108,8 @@ def _validate_grammar_request(
     token_byte_vocabulary: TokenByteVocabulary | None,
     json_schema: str | None,
 ) -> bool:
+    if regex is not None and json_schema is not None:
+        raise ValueError("regex and json_schema are mutually exclusive")
     grammar_requested = regex is not None or json_schema is not None
     if grammar_requested and token_byte_vocabulary is None:
         raise ValueError("token_byte_vocabulary is required when a grammar is set")
@@ -113,9 +125,9 @@ def _validate_json_result(
 ) -> None:
     from onyx_cuda import _rust
 
-    text = b"".join(
-        token_byte_vocabulary.token_bytes[token_id] for token_id in token_ids
-    ).decode("utf-8")
+    text = b"".join(token_byte_vocabulary.token_bytes[token_id] for token_id in token_ids).decode(
+        "utf-8"
+    )
     _rust.validate_json_output(json_schema, text)
 
 
@@ -129,9 +141,7 @@ def _initialize_grammar_constraint(
 
     token_bytes = token_byte_vocabulary.token_bytes
     if len(token_bytes) != logits_vocab_size:
-        raise ValueError(
-            "token_byte_vocabulary must match the model logits width"
-        )
+        raise ValueError("token_byte_vocabulary must match the model logits width")
     constraint = _rust.GrammarConstraint(token_bytes)
     if json_schema is not None:
         constraint.compile_json_schema(json_schema)
@@ -140,7 +150,7 @@ def _initialize_grammar_constraint(
     return constraint, constraint.init_state()
 
 
-def generate_tokens(
+def generate_token_events(
     model: PreTrainedModel,
     prompt_token_ids: list[int],
     max_tokens: int,
@@ -153,18 +163,18 @@ def generate_tokens(
     regex: str | None = None,
     token_byte_vocabulary: TokenByteVocabulary | None = None,
     json_schema: str | None = None,
-) -> GenerationResult:
+) -> Iterator[AcceptedTokenEvent | GenerationFinishedEvent]:
     """Generate at most max_tokens with greedy or top-p sampling."""
     _validate_generation_options(max_tokens, temperature, top_p, seed)
-    grammar_requested = _validate_grammar_request(
-        regex, token_byte_vocabulary, json_schema
-    )
+    grammar_requested = _validate_grammar_request(regex, token_byte_vocabulary, json_schema)
 
     if isinstance(eos_token_ids, int):
         eos_token_ids = [eos_token_ids]
     stop_sequences = stop_sequences or []
 
     generated: list[int] = []
+    pending: list[int] = []
+    retain = max((len(stop) for stop in stop_sequences if stop), default=1) - 1
     finish_reason: Literal["eos", "stop", "length"] = "length"
     started_at = None
     time_to_first_token = None
@@ -180,88 +190,80 @@ def generate_tokens(
     constraint = None
     grammar_state = None
     try:
-        with torch.inference_mode():
-            result = prefill(model, prompt_token_ids)
-            logits = result.logits
-            cache = CacheState.from_prefill(
-                result.past_key_values, result.logits.device
+        result = prefill(model, prompt_token_ids)
+        logits = result.logits
+        cache = CacheState.from_prefill(result.past_key_values, result.logits.device)
+        if grammar_requested:
+            compile_started_at = time.perf_counter() if measure else None
+            constraint, grammar_state = _initialize_grammar_constraint(
+                logits.shape[-1],
+                regex,
+                token_byte_vocabulary,
+                json_schema,
             )
-            if grammar_requested:
-                compile_started_at = time.perf_counter() if measure else None
-                constraint, grammar_state = _initialize_grammar_constraint(
-                    logits.shape[-1],
-                    regex,
-                    token_byte_vocabulary,
-                    json_schema,
-                )
-                if compile_started_at is not None:
-                    grammar_compile_seconds = (
-                        time.perf_counter() - compile_started_at
-                    )
-                    valid_token_enumeration_seconds = 0.0
-                    mask_transfer_seconds = 0.0
+            if compile_started_at is not None:
+                grammar_compile_seconds = time.perf_counter() - compile_started_at
+                valid_token_enumeration_seconds = 0.0
+                mask_transfer_seconds = 0.0
 
-            generator = None
-            if temperature > 0 and seed is not None:
-                generator = torch.Generator(device=logits.device)
-                generator.manual_seed(seed)
+        generator = None
+        if temperature > 0 and seed is not None:
+            generator = torch.Generator(device=logits.device)
+            generator.manual_seed(seed)
 
-            for step in range(max_tokens):
-                if constraint is not None:
-                    if constraint.is_match_state(grammar_state):
-                        finish_reason = "stop"
-                        break
-                    enumeration_started_at = (
-                        time.perf_counter() if measure else None
-                    )
-                    valid_token_ids = constraint.get_valid_token_ids(grammar_state)
-                    if enumeration_started_at is not None:
-                        valid_token_enumeration_seconds += (
-                            time.perf_counter() - enumeration_started_at
-                        )
-                    if not valid_token_ids:
-                        raise ValueError(
-                            "Grammar constraint has no valid token continuation"
-                        )
-                    if measure:
-                        torch.cuda.synchronize(logits.device)
-                        mask_started_at = time.perf_counter()
-                        logits = apply_grammar_mask(logits, valid_token_ids)
-                        torch.cuda.synchronize(logits.device)
-                        mask_transfer_seconds += (
-                            time.perf_counter() - mask_started_at
-                        )
-                    else:
-                        logits = apply_grammar_mask(logits, valid_token_ids)
-
-                token_id = _sample_token(logits, temperature, top_p, generator)
-                token = token_id.item()
-                if started_at is not None and time_to_first_token is None:
-                    time_to_first_token = time.perf_counter() - started_at
-                generated.append(token)
-
-                if constraint is not None:
-                    previous_state = grammar_state
-                    grammar_state = constraint.advance_state(grammar_state, token)
-                    constraint.release_state(previous_state)
-                    if constraint.is_match_state(grammar_state):
-                        finish_reason = "stop"
-                        break
-
-                matched_stop_length = _matched_stop_length(
-                    generated, stop_sequences
-                )
-                if matched_stop_length:
-                    del generated[-matched_stop_length:]
+        for step in range(max_tokens):
+            if constraint is not None:
+                if constraint.is_match_state(grammar_state):
                     finish_reason = "stop"
                     break
-                if token in eos_token_ids:
-                    finish_reason = "eos"
-                    break
-                if step + 1 == max_tokens:
+                enumeration_started_at = time.perf_counter() if measure else None
+                valid_token_ids = constraint.get_valid_token_ids(grammar_state)
+                if enumeration_started_at is not None:
+                    valid_token_enumeration_seconds += time.perf_counter() - enumeration_started_at
+                if not valid_token_ids:
+                    raise ValueError("Grammar constraint has no valid token continuation")
+                if measure:
+                    torch.cuda.synchronize(logits.device)
+                    mask_started_at = time.perf_counter()
+                    logits = apply_grammar_mask(logits, valid_token_ids)
+                    torch.cuda.synchronize(logits.device)
+                    mask_transfer_seconds += time.perf_counter() - mask_started_at
+                else:
+                    logits = apply_grammar_mask(logits, valid_token_ids)
+
+            token_id = _sample_token(logits, temperature, top_p, generator)
+            token = token_id.item()
+            if started_at is not None and time_to_first_token is None:
+                time_to_first_token = time.perf_counter() - started_at
+            generated.append(token)
+            pending.append(token)
+
+            if constraint is not None:
+                previous_state = grammar_state
+                grammar_state = constraint.advance_state(grammar_state, token)
+                constraint.release_state(previous_state)
+                if constraint.is_match_state(grammar_state):
+                    finish_reason = "stop"
                     break
 
+            matched_stop_length = _matched_stop_length(generated, stop_sequences)
+            if matched_stop_length:
+                del generated[-matched_stop_length:]
+                del pending[-matched_stop_length:]
+                finish_reason = "stop"
+                break
+            if token in eos_token_ids:
+                finish_reason = "eos"
+                break
+            for ready_token in _take_ready_tokens(pending, retain):
+                yield AcceptedTokenEvent(ready_token)
+            if step + 1 == max_tokens:
+                break
+
+            with torch.inference_mode():
                 logits = cache.extend(model, token_id[:, None])[:, -1, :]
+        for ready_token in _take_ready_tokens(pending):
+            yield AcceptedTokenEvent(ready_token)
     finally:
         if constraint is not None and grammar_state is not None:
             constraint.release_state(grammar_state)
@@ -282,15 +284,51 @@ def generate_tokens(
             decode_tokens_per_second=decode_tokens_per_second,
             total_seconds=total_seconds,
             grammar_compile_seconds=grammar_compile_seconds,
-            valid_token_enumeration_seconds=(
-                valid_token_enumeration_seconds
-            ),
+            valid_token_enumeration_seconds=(valid_token_enumeration_seconds),
             mask_transfer_seconds=mask_transfer_seconds,
         )
 
-    if json_schema is not None:
+    if json_schema is not None and finish_reason != "length":
         _validate_json_result(json_schema, token_byte_vocabulary, generated)
 
-    return GenerationResult(
-        generated, cache.past_key_values, finish_reason, timings
+    yield GenerationFinishedEvent(
+        GenerationResult(generated, cache.past_key_values, finish_reason, timings)
     )
+
+
+def generate_tokens(
+    model: PreTrainedModel,
+    prompt_token_ids: list[int],
+    max_tokens: int,
+    eos_token_ids: int | list[int],
+    stop_sequences: list[list[int]] | None = None,
+    temperature: float = 0.0,
+    top_p: float = 1.0,
+    seed: int | None = None,
+    measure: bool = False,
+    regex: str | None = None,
+    token_byte_vocabulary: TokenByteVocabulary | None = None,
+    json_schema: str | None = None,
+) -> GenerationResult:
+    """Collect the same incremental loop used by sampled streaming."""
+    events = generate_token_events(
+        model,
+        prompt_token_ids,
+        max_tokens,
+        eos_token_ids,
+        stop_sequences=stop_sequences,
+        temperature=temperature,
+        top_p=top_p,
+        seed=seed,
+        measure=measure,
+        regex=regex,
+        token_byte_vocabulary=token_byte_vocabulary,
+        json_schema=json_schema,
+    )
+    try:
+        for event in events:
+            if isinstance(event, GenerationFinishedEvent):
+                return event.result
+        raise RuntimeError("Generation ended without a terminal event")
+    finally:
+        events.close()

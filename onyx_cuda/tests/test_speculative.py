@@ -144,7 +144,7 @@ def _run_scripted_constrained_speculation(
         max_tokens=max_tokens,
         gamma=4,
         eos_token_ids=15,
-        regex=regex,
+        regex=None if json_schema is not None else regex,
         token_byte_vocabulary=vocabulary,
         json_schema=json_schema,
     )
@@ -304,7 +304,6 @@ def test_constrained_draft_masks_invalid_token_and_validates_json(monkeypatch):
         grammar,
         draft_tokens=[7, 0],
         target_tokens=[2, 9],
-        regex="ignored",
         json_schema='{"type":"object"}',
         vocabulary=vocabulary,
     )
@@ -362,9 +361,10 @@ def test_sampled_speculation_forwards_grammar_to_target(monkeypatch):
 
     def fake_generate_tokens(*args, **kwargs):
         captured.update(kwargs)
-        return expected
+        yield AcceptedTokenEvent(0)
+        yield GenerationFinishedEvent(expected)
 
-    monkeypatch.setattr(speculative_module, "generate_tokens", fake_generate_tokens)
+    monkeypatch.setattr(speculative_module, "generate_token_events", fake_generate_tokens)
     result = generate_speculative(
         object(),
         object(),
@@ -373,13 +373,13 @@ def test_sampled_speculation_forwards_grammar_to_target(monkeypatch):
         gamma=1,
         eos_token_ids=[],
         temperature=0.8,
-        regex="x",
+        regex=None,
         token_byte_vocabulary=vocabulary,
         json_schema='{"type":"string"}',
     )
 
     assert result is expected
-    assert captured["regex"] == "x"
+    assert captured["regex"] is None
     assert captured["token_byte_vocabulary"] is vocabulary
     assert captured["json_schema"] == '{"type":"string"}'
     assert captured["measure"] is False
@@ -394,13 +394,13 @@ def test_sampled_speculation_forwards_grammar_to_target(monkeypatch):
             gamma=1,
             eos_token_ids=[],
             temperature=0.8,
-            regex="x",
+            regex=None,
             token_byte_vocabulary=vocabulary,
             json_schema='{"type":"string"}',
         )
     )
     replayed, text = _result_from_events(events, _MappedTokenizer({0: "x"}))
-    assert captured["regex"] == "x"
+    assert captured["regex"] is None
     assert captured["json_schema"] == '{"type":"string"}'
     assert replayed is expected
     assert [event.token_id for event in events if isinstance(event, AcceptedTokenEvent)] == [0]

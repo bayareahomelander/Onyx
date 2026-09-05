@@ -9,6 +9,9 @@ from transformers import PreTrainedModel
 
 from onyx_cuda.cache import CacheState
 from onyx_cuda.generation import (
+    AcceptedTokenEvent,
+    GenerationFinishedEvent,
+    _take_ready_tokens,
     GenerationResult,
     GenerationTimings,
     _initialize_grammar_constraint,
@@ -16,7 +19,7 @@ from onyx_cuda.generation import (
     _validate_grammar_request,
     _validate_generation_options,
     _validate_json_result,
-    generate_tokens,
+    generate_token_events,
 )
 from onyx_cuda.masking import apply_grammar_mask
 from onyx_cuda.prefill import prefill
@@ -34,23 +37,8 @@ class VerificationResult(NamedTuple):
     accepted_proposal_count: int
 
 
-class AcceptedTokenEvent(NamedTuple):
-    token_id: int
-
-
-class GenerationFinishedEvent(NamedTuple):
-    result: GenerationResult
-
-
 class TextDeltaEvent(NamedTuple):
     text: str
-
-
-def _take_ready_tokens(pending: list[int], retain: int = 0) -> list[int]:
-    count = max(len(pending) - retain, 0)
-    ready = pending[:count]
-    del pending[:count]
-    return ready
 
 
 def _flush_stream_text(pending: str, stop: list[str] | None) -> tuple[str, str, bool]:
@@ -320,7 +308,7 @@ def generate_speculative_events(
     _validate_generation_options(max_tokens, temperature, top_p, seed)
     grammar_requested = _validate_grammar_request(regex, token_byte_vocabulary, json_schema)
     if temperature > 0:
-        result = generate_tokens(
+        yield from generate_token_events(
             target_model,
             prompt_token_ids,
             max_tokens,
@@ -334,9 +322,6 @@ def generate_speculative_events(
             token_byte_vocabulary=token_byte_vocabulary,
             json_schema=json_schema,
         )
-        for token_id in result.token_ids:
-            yield AcceptedTokenEvent(token_id)
-        yield GenerationFinishedEvent(result)
         return
 
     if isinstance(eos_token_ids, int):
@@ -548,7 +533,7 @@ def generate_speculative_events(
         for token_id in _take_ready_tokens(pending_events):
             yield AcceptedTokenEvent(token_id)
 
-        if json_schema is not None:
+        if json_schema is not None and finish_reason != "length":
             _validate_json_result(json_schema, token_byte_vocabulary, generated)
         past_key_values = target_cache.past_key_values
     finally:
@@ -675,6 +660,7 @@ def decode_speculative_events(
             positions = [position for position in positions if position >= 0]
             if positions:
                 final_text = final_text[: min(positions)]
+                event = GenerationFinishedEvent(event.result._replace(finish_reason="stop"))
             if not final_text.startswith(emitted):
                 raise RuntimeError("Streamed text does not match the final result")
             remaining = final_text[len(emitted) :]
