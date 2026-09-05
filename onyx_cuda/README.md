@@ -79,6 +79,50 @@ Set `"stream": true` to receive server-sent events. The server also provides:
 - `GET /v1/models` for available models
 - `POST /v1/chat/completions` for generation
 
+## Structured-output contract
+
+A successful JSON-schema response contains a complete JSON document that passes
+validation against the supported schema subset below. Unsupported keywords and
+malformed schemas raise an error; they are never silently ignored. For example,
+`{"type":"integer","minimum":18}` is rejected because `minimum` is not supported.
+
+| Keyword | Supported behavior |
+| --- | --- |
+| `type` | Object, array, string, number, integer, boolean, null, or a nonempty array of these names |
+| `properties`, `required` | Nested schemas; required names must be declared in properties |
+| `additionalProperties` | Boolean only; generation normally chooses declared property names |
+| `items` | One schema applied to every array element |
+| `minItems`, `maxItems` | Nonnegative integer bounds |
+| `minLength`, `maxLength` | Nonnegative bounds measured in Unicode code points, including escaped characters |
+| `pattern` | Search semantics over decoded string contents, using the portable regex subset described below |
+| `enum` | Nonempty, unique values intersected with all sibling constraints |
+
+Object, array, and string keywords require the corresponding explicit `type`
+(which may be part of a union). Empty schema objects are accepted. Boolean
+schemas, references, composition keywords, numeric bounds, `format`, and all
+other validation keywords are unsupported. `title`, `description`, `default`,
+`examples`, and `$comment` are accepted as annotations and do not affect output.
+
+Patterns support literals, character ranges, grouping, alternation, repetition,
+anchors, and ASCII `\d` / `\w` classes and their complements. They are searched
+within the string; use `^` and `$` to constrain the whole string. Lookaround,
+backreferences, inline flags, Unicode property escapes, character-class set
+operations, and other nonportable escapes are rejected. Grammar generation may
+choose a narrower set of values than the schema permits; it does not promise to
+generate every valid representation.
+
+Constraints require a ByteLevel tokenizer, as used by the bundled Qwen models.
+Raw token bytes preserve Unicode characters split across tokens, and special
+tokens cannot satisfy a grammar. Completion is checked both against the schema
+and against the final decoded API text. Numeric output retains its precision
+during validation and compaction. HTTP schemas with decimal values that would
+lose precision in the request parser are rejected. Incomplete output (including token-limit
+or stop-string truncation) is an error, rather than a successful partial JSON
+response. Non-streaming requests return HTTP 400 for schema or validation errors.
+Streaming requests can emit partial content before an error event; clients must
+wait for a successful terminal choice before treating the assembled JSON as
+validated. `[DONE]` alone does not indicate success.
+
 ## Development
 
 Run the test suite from the `onyx_cuda` directory:

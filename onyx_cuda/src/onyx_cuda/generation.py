@@ -1,6 +1,5 @@
 """Cached token generation."""
 
-import json
 import math
 import time
 from typing import Literal, NamedTuple
@@ -102,7 +101,22 @@ def _validate_grammar_request(
     grammar_requested = regex is not None or json_schema is not None
     if grammar_requested and token_byte_vocabulary is None:
         raise ValueError("token_byte_vocabulary is required when a grammar is set")
+    if json_schema is not None:
+        from onyx_cuda import _rust
+
+        _rust.validate_json_schema(json_schema)
     return grammar_requested
+
+
+def _validate_json_result(
+    json_schema: str, token_byte_vocabulary: TokenByteVocabulary, token_ids: list[int]
+) -> None:
+    from onyx_cuda import _rust
+
+    text = b"".join(
+        token_byte_vocabulary.token_bytes[token_id] for token_id in token_ids
+    ).decode("utf-8")
+    _rust.validate_json_output(json_schema, text)
 
 
 def _initialize_grammar_constraint(
@@ -275,12 +289,7 @@ def generate_tokens(
         )
 
     if json_schema is not None:
-        json.loads(
-            b"".join(
-                token_byte_vocabulary.token_bytes[token_id]
-                for token_id in generated
-            ).decode("utf-8")
-        )
+        _validate_json_result(json_schema, token_byte_vocabulary, generated)
 
     return GenerationResult(
         generated, cache.past_key_values, finish_reason, timings

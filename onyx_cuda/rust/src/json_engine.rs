@@ -19,6 +19,8 @@ use crate::schema::{PropertyBlueprint, SchemaBlueprint, SchemaType};
 pub enum ObjectSyntaxState {
     /// expecting '"' to start a key or '}' for empty/end
     ExpectKeyOrEnd,
+    /// after a comma, a key is mandatory
+    ExpectKey,
     /// inside a key string, accumulating characters
     InKey,
     /// after key closing quote, expecting ':'
@@ -29,28 +31,27 @@ pub enum ObjectSyntaxState {
     ExpectCommaOrEnd,
 }
 
-/// state for parsing a json string value
+/// A decoded JSON character, an unfinished escape/UTF-8 sequence, or a closing quote.
+enum StringStep {
+    Pending,
+    Character(char),
+    End,
+}
+
 #[derive(Debug, Clone)]
 pub struct StringState {
-    /// in escape sequence
-    in_escape: bool,
-    /// compiled dfa for pattern validation
+    pending: Vec<u8>,
     pattern_dfa: Option<Arc<dense::DFA<Vec<u32>>>>,
-    /// current dfa state
     dfa_state: Option<StateID>,
-    /// chars consumed so far
     char_count: usize,
-    /// min chars required
     min_length: Option<usize>,
-    /// max chars allowed
     max_length: Option<usize>,
 }
 
 impl StringState {
-    /// new string state with opening quote seen
     pub fn new_started() -> Self {
-        StringState {
-            in_escape: false,
+        Self {
+            pending: Vec::new(),
             pattern_dfa: None,
             dfa_state: None,
             char_count: 0,
@@ -59,35 +60,129 @@ impl StringState {
         }
     }
 
-    /// string state with regex pattern
-    pub fn with_pattern(pattern: &str) -> Self {
-        match compile_pattern_dfa(pattern) {
-            Ok(compiled) => StringState {
-                in_escape: false,
-                pattern_dfa: Some(Arc::new(compiled.dfa)),
-                dfa_state: Some(compiled.initial_state),
-                char_count: 0,
-                min_length: None,
-                max_length: None,
-            },
-            Err(_) => StringState::new_started(),
-        }
-    }
-
-    /// string state with pattern and length constraints
     pub fn with_pattern_and_constraints(
         pattern: Option<&str>,
-        min_len: Option<usize>,
-        max_len: Option<usize>,
+        min_length: Option<usize>,
+        max_length: Option<usize>,
     ) -> Self {
-        let mut state = if let Some(p) = pattern {
-            StringState::with_pattern(p)
-        } else {
-            StringState::new_started()
-        };
-        state.min_length = min_len;
-        state.max_length = max_len;
+        let mut state = Self::new_started();
+        if let Some(pattern) = pattern {
+            // Schema compilation validates every pattern before constructing states.
+            let normalized = crate::schema::schema_pattern(pattern).expect("validated pattern");
+            let compiled =
+                compile_pattern_dfa(&format!("(?s:.*(?:{normalized}).*)")).expect("validated DFA");
+            state.pattern_dfa = Some(Arc::new(compiled.dfa));
+            state.dfa_state = Some(compiled.initial_state);
+        }
+        state.min_length = min_length;
+        state.max_length = max_length;
         state
+    }
+
+    fn decode_byte(&mut self, byte: u8) -> Option<StringStep> {
+        if self.pending.is_empty() {
+            match byte {
+                b'"' => return Some(StringStep::End),
+                b'\\' | 0xc2..=0xf4 => {
+                    self.pending.push(byte);
+                    return Some(StringStep::Pending);
+                }
+                0x20..=0x7f => return Some(StringStep::Character(byte as char)),
+                _ => return None,
+            }
+        }
+        self.pending.push(byte);
+        let character = if self.pending[0] == b'\\' {
+            match self.pending.len() {
+                2 => match byte {
+                    b'"' | b'\\' | b'/' => byte as char,
+                    b'b' => '\u{8}',
+                    b'f' => '\u{c}',
+                    b'n' => '\n',
+                    b'r' => '\r',
+                    b't' => '\t',
+                    b'u' => return Some(StringStep::Pending),
+                    _ => return None,
+                },
+                3..=6 | 9..=12 => {
+                    if !byte.is_ascii_hexdigit() {
+                        return None;
+                    }
+                    let length = self.pending.len();
+                    if length != 6 && length != 12 {
+                        return Some(StringStep::Pending);
+                    }
+                    let first =
+                        u16::from_str_radix(std::str::from_utf8(&self.pending[2..6]).ok()?, 16)
+                            .ok()?;
+                    if length == 6 {
+                        if (0xd800..=0xdbff).contains(&first) {
+                            return Some(StringStep::Pending);
+                        }
+                        char::from_u32(first as u32)?
+                    } else {
+                        let second = u16::from_str_radix(
+                            std::str::from_utf8(&self.pending[8..12]).ok()?,
+                            16,
+                        )
+                        .ok()?;
+                        if !(0xdc00..=0xdfff).contains(&second) {
+                            return None;
+                        }
+                        char::from_u32(
+                            0x10000 + (((first as u32) - 0xd800) << 10) + (second as u32) - 0xdc00,
+                        )?
+                    }
+                }
+                7 if byte == b'\\' => return Some(StringStep::Pending),
+                8 if byte == b'u' => return Some(StringStep::Pending),
+                _ => return None,
+            }
+        } else {
+            match std::str::from_utf8(&self.pending) {
+                Ok(text) => text.chars().next()?,
+                Err(error) if error.error_len().is_none() => return Some(StringStep::Pending),
+                Err(_) => return None,
+            }
+        };
+        self.pending.clear();
+        Some(StringStep::Character(character))
+    }
+
+    fn advance(&mut self, byte: u8) -> Option<StringStep> {
+        if self.pending.is_empty()
+            && byte != b'"'
+            && self.max_length.is_some_and(|max| self.char_count >= max)
+        {
+            return None;
+        }
+        let step = self.decode_byte(byte)?;
+        match step {
+            StringStep::Character(character) => {
+                self.char_count += 1;
+                if let (Some(dfa), Some(state)) = (&self.pattern_dfa, &mut self.dfa_state) {
+                    let mut buffer = [0; 4];
+                    for &byte in character.encode_utf8(&mut buffer).as_bytes() {
+                        *state = dfa.next_state(*state, byte);
+                        if dfa.is_dead_state(*state) {
+                            return None;
+                        }
+                    }
+                }
+            }
+            StringStep::End => {
+                if self.min_length.is_some_and(|min| self.char_count < min) {
+                    return None;
+                }
+                if let (Some(dfa), Some(state)) = (&self.pattern_dfa, self.dfa_state) {
+                    if !dfa.is_match_state(dfa.next_eoi_state(state)) {
+                        return None;
+                    }
+                }
+            }
+            StringStep::Pending => {}
+        }
+        Some(step)
     }
 }
 
@@ -139,6 +234,8 @@ pub struct NullState {
 pub enum ArraySyntaxState {
     /// expecting a value or ']' for empty/end
     ExpectValueOrEnd,
+    /// after a comma, a value is mandatory
+    ExpectValue,
     /// after a value, expecting ',' or ']'
     ExpectCommaOrEnd,
 }
@@ -209,7 +306,7 @@ pub enum Scope {
         /// keys that have been used (for detecting duplicates)
         used_keys: Vec<String>,
         /// whether we're in an escape sequence (for key parsing)
-        in_escape: bool,
+        key_state: StringState,
         /// required keys that haven't been provided yet
         missing_required_keys: std::collections::HashSet<String>,
     },
@@ -233,6 +330,8 @@ pub struct JsonEngine {
     vocab_size: usize,
     root_blueprint: Arc<SchemaBlueprint>,
     root_value_blueprint: Arc<PropertyBlueprint>,
+    schema: Arc<Value>,
+    output: Vec<u8>,
     stack: Vec<Scope>,
     finished: bool,
     dead: bool,
@@ -261,6 +360,8 @@ impl JsonEngine {
             vocab_size,
             root_blueprint,
             root_value_blueprint,
+            schema: Arc::new(schema),
+            output: Vec::new(),
             stack,
             finished: false,
             dead: false,
@@ -280,7 +381,18 @@ impl JsonEngine {
 
     #[inline]
     fn number_is_complete(state: &NumberState) -> bool {
-        state.buffer.chars().any(|c| c.is_ascii_digit()) && !state.expect_digit
+        !state.expect_digit && serde_json::from_str::<serde_json::Number>(&state.buffer).is_ok()
+    }
+
+    fn complete(stack: &[Scope], finished: bool) -> bool {
+        (finished && stack.is_empty())
+            || matches!(stack, [Scope::Number(state)] if Self::number_is_complete(state))
+            || matches!(stack, [Scope::Enum(state)] if state.candidates.iter().any(|c| c.len() == state.cursor))
+    }
+
+    fn valid_completion(&self, bytes: &[u8]) -> bool {
+        serde_json::from_slice::<Value>(bytes)
+            .is_ok_and(|value| crate::schema::value_matches_schema(&value, &self.schema))
     }
 
     /// helper to update parent scope state after a value is complete
@@ -437,7 +549,7 @@ impl JsonEngine {
                             syntax_state: ObjectSyntaxState::ExpectKeyOrEnd,
                             key_buffer: String::new(),
                             used_keys: Vec::new(),
-                            in_escape: false,
+                            key_state: StringState::new_started(),
                             missing_required_keys: missing_req,
                         });
                         return true;
@@ -497,7 +609,7 @@ impl JsonEngine {
                             syntax_state: ObjectSyntaxState::ExpectKeyOrEnd,
                             key_buffer: String::new(),
                             used_keys: Vec::new(),
-                            in_escape: false,
+                            key_state: StringState::new_started(),
                             missing_required_keys: std::collections::HashSet::new(),
                         });
                         return true;
@@ -543,6 +655,11 @@ impl JsonEngine {
             }
         }
 
+        if Self::complete(&temp_stack, temp_finished) {
+            let mut output = self.output.clone();
+            output.extend_from_slice(token_bytes);
+            return self.valid_completion(&output);
+        }
         true
     }
 
@@ -568,12 +685,15 @@ impl JsonEngine {
 
     /// static version of byte validation
     fn validate_byte_static(
-        root_blueprint: &Arc<SchemaBlueprint>,
+        _root_blueprint: &Arc<SchemaBlueprint>,
         root_value_blueprint: &Arc<PropertyBlueprint>,
         stack: &mut Vec<Scope>,
         finished: &mut bool,
         byte: u8,
     ) -> bool {
+        if *finished {
+            return Self::is_whitespace(byte);
+        }
         loop {
             let scope = match stack.last_mut() {
                 Some(s) => s,
@@ -583,18 +703,6 @@ impl JsonEngine {
             match scope {
                 Scope::Root => {
                     if Self::is_whitespace(byte) {
-                        return true;
-                    }
-
-                    if root_blueprint.root_type == SchemaType::Object && byte == b'{' {
-                        *scope = Scope::Object {
-                            blueprint: Arc::clone(root_blueprint),
-                            syntax_state: ObjectSyntaxState::ExpectKeyOrEnd,
-                            key_buffer: String::new(),
-                            used_keys: Vec::new(),
-                            in_escape: false,
-                            missing_required_keys: root_blueprint.required.clone(),
-                        };
                         return true;
                     }
 
@@ -617,11 +725,11 @@ impl JsonEngine {
                     syntax_state,
                     key_buffer,
                     used_keys,
-                    in_escape,
+                    key_state,
                     missing_required_keys,
                 } => {
                     match syntax_state {
-                        ObjectSyntaxState::ExpectKeyOrEnd => {
+                        ObjectSyntaxState::ExpectKeyOrEnd | ObjectSyntaxState::ExpectKey => {
                             if Self::is_whitespace(byte) {
                                 return true;
                             }
@@ -634,11 +742,12 @@ impl JsonEngine {
                                 if has_unused_key {
                                     *syntax_state = ObjectSyntaxState::InKey;
                                     key_buffer.clear();
+                                    *key_state = StringState::new_started();
                                     return true;
                                 }
                                 return false;
                             }
-                            if byte == b'}' {
+                            if byte == b'}' && *syntax_state == ObjectSyntaxState::ExpectKeyOrEnd {
                                 // only allow closing if all required keys have been provided
                                 if !missing_required_keys.is_empty() {
                                     return false;
@@ -655,35 +764,25 @@ impl JsonEngine {
                         }
 
                         ObjectSyntaxState::InKey => {
-                            if *in_escape {
-                                *in_escape = false;
-                                key_buffer.push(byte as char);
-                                return true;
-                            }
-                            if byte == b'\\' {
-                                *in_escape = true;
-                                return true;
-                            }
-                            if byte == b'"' {
-                                if blueprint.is_key_allowed(key_buffer)
-                                    && !used_keys.contains(key_buffer)
-                                {
+                            match key_state.advance(byte) {
+                                Some(StringStep::End) => {
+                                    if !blueprint.is_key_allowed(key_buffer)
+                                        || used_keys.contains(key_buffer)
+                                    {
+                                        return false;
+                                    }
                                     *syntax_state = ObjectSyntaxState::ExpectColon;
                                     return true;
                                 }
-                                return false;
+                                Some(StringStep::Character(character)) => {
+                                    key_buffer.push(character)
+                                }
+                                Some(StringStep::Pending) => {}
+                                None => return false,
                             }
-                            let test_key = format!("{}{}", key_buffer, byte as char);
-                            // only accept prefix if it matches an unused key
-                            let prefix_valid = blueprint
-                                .allowed_keys
-                                .iter()
-                                .any(|key| key.starts_with(&test_key) && !used_keys.contains(key));
-                            if prefix_valid {
-                                key_buffer.push(byte as char);
-                                return true;
-                            }
-                            return false;
+                            return blueprint.allowed_keys.iter().any(|key| {
+                                key.starts_with(key_buffer.as_str()) && !used_keys.contains(key)
+                            });
                         }
 
                         ObjectSyntaxState::ExpectColon => {
@@ -704,150 +803,10 @@ impl JsonEngine {
                             if Self::is_whitespace(byte) {
                                 return true;
                             }
-
-                            let key = key_buffer.clone();
-
-                            // priority: check for enum values first
-                            if let Some(prop) = blueprint.get_property(&key) {
-                                if let Some(ref enum_vals) = prop.enum_values {
-                                    // filter candidates that start with this byte
-                                    let matching: Vec<Vec<u8>> = enum_vals
-                                        .iter()
-                                        .filter(|v| !v.is_empty() && v[0] == byte)
-                                        .cloned()
-                                        .collect();
-
-                                    if !matching.is_empty() {
-                                        *syntax_state = ObjectSyntaxState::ExpectCommaOrEnd;
-                                        stack.push(Scope::Enum(EnumState {
-                                            candidates: matching,
-                                            cursor: 1,
-                                        }));
-                                        return true;
-                                    }
-                                    return false; // byte doesn't match any enum candidate
-                                }
-                            }
-
-                            // get allowed types for this property
-                            let schema_types = blueprint
-                                .get_property(&key)
-                                .map(|p| p.schema_types.clone())
-                                .unwrap_or_else(|| vec![SchemaType::Any]);
-
-                            // helper to check if byte matches a type
-                            fn matches_type(byte: u8, t: &SchemaType) -> bool {
-                                match t {
-                                    SchemaType::String => byte == b'"',
-                                    SchemaType::Number | SchemaType::Integer => {
-                                        byte.is_ascii_digit() || byte == b'-'
-                                    }
-                                    SchemaType::Boolean => byte == b't' || byte == b'f',
-                                    SchemaType::Null => byte == b'n',
-                                    SchemaType::Object => byte == b'{',
-                                    SchemaType::Array => byte == b'[',
-                                    SchemaType::Any => {
-                                        matches_type(byte, &SchemaType::String)
-                                            || matches_type(byte, &SchemaType::Number)
-                                            || matches_type(byte, &SchemaType::Boolean)
-                                            || matches_type(byte, &SchemaType::Null)
-                                            || matches_type(byte, &SchemaType::Object)
-                                            || matches_type(byte, &SchemaType::Array)
-                                    }
-                                }
-                            }
-
-                            // Find which allowed type matches the byte
-                            let matched_type = schema_types.iter().find(|t| matches_type(byte, t));
-
-                            if let Some(prop_type) = matched_type {
-                                *syntax_state = ObjectSyntaxState::ExpectCommaOrEnd;
-                                match prop_type {
-                                    SchemaType::String => {
-                                        // get pattern and length constraints
-                                        let string_state =
-                                            if let Some(prop) = blueprint.get_property(&key) {
-                                                StringState::with_pattern_and_constraints(
-                                                    prop.pattern.as_deref(),
-                                                    prop.min_length,
-                                                    prop.max_length,
-                                                )
-                                            } else {
-                                                StringState::new_started()
-                                            };
-                                        stack.push(Scope::String(string_state));
-                                        return true;
-                                    }
-                                    SchemaType::Number | SchemaType::Integer => {
-                                        let mut ns = NumberState::default();
-                                        ns.buffer.push(byte as char);
-                                        ns.expect_digit = byte == b'-';
-                                        ns.is_integer = *prop_type == SchemaType::Integer;
-                                        stack.push(Scope::Number(ns));
-                                        return true;
-                                    }
-                                    SchemaType::Boolean => {
-                                        if byte == b't' {
-                                            stack.push(Scope::Boolean(BooleanState {
-                                                target: "true",
-                                                position: 1,
-                                            }));
-                                        } else {
-                                            stack.push(Scope::Boolean(BooleanState {
-                                                target: "false",
-                                                position: 1,
-                                            }));
-                                        }
-                                        return true;
-                                    }
-                                    SchemaType::Null => {
-                                        stack.push(Scope::Null(NullState { position: 1 }));
-                                        return true;
-                                    }
-                                    SchemaType::Object => {
-                                        if let Some(prop) = blueprint.get_property(&key) {
-                                            let (nested_blueprint, missing_req) = if let Some(obp) =
-                                                &prop.object_blueprint
-                                            {
-                                                (Arc::clone(obp), obp.required.clone())
-                                            } else {
-                                                let empty = Arc::new(SchemaBlueprint {
-                                                    root_type: SchemaType::Object,
-                                                    properties: std::collections::HashMap::new(),
-                                                    required: std::collections::HashSet::new(),
-                                                    allowed_keys: Vec::new(),
-                                                });
-                                                (empty, std::collections::HashSet::new())
-                                            };
-                                            stack.push(Scope::Object {
-                                                blueprint: nested_blueprint,
-                                                syntax_state: ObjectSyntaxState::ExpectKeyOrEnd,
-                                                key_buffer: String::new(),
-                                                used_keys: Vec::new(),
-                                                in_escape: false,
-                                                missing_required_keys: missing_req,
-                                            });
-                                        }
-                                        return true;
-                                    }
-                                    SchemaType::Array => {
-                                        let prop = blueprint.get_property(&key);
-                                        let items = prop.as_ref().and_then(|p| p.items.clone());
-                                        let min_items = prop.as_ref().and_then(|p| p.min_items);
-                                        let max_items = prop.as_ref().and_then(|p| p.max_items);
-                                        let arr_state = ArrayState::with_constraints(
-                                            items, min_items, max_items,
-                                        );
-                                        stack.push(Scope::Array(arr_state));
-                                        return true;
-                                    }
-                                    SchemaType::Any => {
-                                        // Handled by specific type match above
-                                        return false;
-                                    }
-                                }
-                            }
-                            return false;
+                            let property =
+                                blueprint.get_property(key_buffer).cloned().map(Arc::new);
+                            *syntax_state = ObjectSyntaxState::ExpectCommaOrEnd;
+                            return Self::push_value_scope(stack, &property, byte);
                         }
 
                         ObjectSyntaxState::ExpectCommaOrEnd => {
@@ -861,7 +820,7 @@ impl JsonEngine {
                                     .iter()
                                     .any(|k| !used_keys.contains(k));
                                 if has_unused_key {
-                                    *syntax_state = ObjectSyntaxState::ExpectKeyOrEnd;
+                                    *syntax_state = ObjectSyntaxState::ExpectKey;
                                     return true;
                                 }
                                 return false;
@@ -884,68 +843,19 @@ impl JsonEngine {
                     }
                 }
 
-                Scope::String(state) => {
-                    if state.in_escape {
-                        state.in_escape = false;
-                        // feed escaped byte to dfa
-                        if let (Some(dfa), Some(dfa_state)) =
-                            (&state.pattern_dfa, &mut state.dfa_state)
-                        {
-                            let new_state = dfa.next_state(*dfa_state, byte);
-                            if dfa.is_dead_state(new_state) {
-                                return false;
-                            }
-                            *dfa_state = new_state;
-                        }
-                        // count escaped char
-                        state.char_count += 1;
-                        return true;
-                    }
-                    if byte == b'\\' {
-                        state.in_escape = true;
-                        return true;
-                    }
-                    if byte == b'"' {
-                        // check minlength
-                        if let Some(min) = state.min_length {
-                            if state.char_count < min {
-                                return false;
-                            }
-                        }
-                        // check dfa match state
-                        if let (Some(dfa), Some(dfa_state)) = (&state.pattern_dfa, state.dfa_state)
-                        {
-                            let eoi_state = dfa.next_eoi_state(dfa_state);
-                            if !dfa.is_match_state(eoi_state) {
-                                return false;
-                            }
-                        }
-                        // string complete
+                Scope::String(state) => match state.advance(byte) {
+                    Some(StringStep::End) => {
                         stack.pop();
                         if stack.is_empty() {
                             *finished = true;
+                        } else {
+                            Self::update_parent_after_value(stack);
                         }
                         return true;
                     }
-                    // check maxlength before accepting char
-                    if let Some(max) = state.max_length {
-                        if state.char_count >= max {
-                            return false;
-                        }
-                    }
-                    // validate against dfa
-                    if let (Some(dfa), Some(dfa_state)) = (&state.pattern_dfa, &mut state.dfa_state)
-                    {
-                        let new_state = dfa.next_state(*dfa_state, byte);
-                        if dfa.is_dead_state(new_state) {
-                            return false;
-                        }
-                        *dfa_state = new_state;
-                    }
-                    // count this char
-                    state.char_count += 1;
-                    return true;
-                }
+                    Some(_) => return true,
+                    None => return false,
+                },
 
                 Scope::Number(state) => {
                     // Check for terminators first
@@ -961,11 +871,18 @@ impl JsonEngine {
 
                     // Handle number characters
                     if byte.is_ascii_digit() {
+                        if !state.has_decimal
+                            && !state.has_exponent
+                            && matches!(state.buffer.as_str(), "0" | "-0")
+                        {
+                            return false;
+                        }
                         state.buffer.push(byte as char);
                         state.expect_digit = false;
                         return true;
                     }
                     if byte == b'.'
+                        && !state.expect_digit
                         && !state.has_decimal
                         && !state.has_exponent
                         && !state.is_integer
@@ -975,7 +892,11 @@ impl JsonEngine {
                         state.expect_digit = true;
                         return true;
                     }
-                    if (byte == b'e' || byte == b'E') && !state.has_exponent && !state.is_integer {
+                    if (byte == b'e' || byte == b'E')
+                        && !state.expect_digit
+                        && !state.has_exponent
+                        && !state.is_integer
+                    {
                         state.buffer.push(byte as char);
                         state.has_exponent = true;
                         state.expect_digit = true;
@@ -1026,11 +947,14 @@ impl JsonEngine {
 
                 Scope::Array(state) => {
                     match state.syntax_state {
-                        ArraySyntaxState::ExpectValueOrEnd => {
+                        ArraySyntaxState::ExpectValueOrEnd | ArraySyntaxState::ExpectValue => {
                             if Self::is_whitespace(byte) {
                                 return true;
                             }
                             if byte == b']' {
+                                if state.syntax_state == ArraySyntaxState::ExpectValue {
+                                    return false;
+                                }
                                 // check minitems before allowing close
                                 if let Some(min) = state.min_items {
                                     if state.item_count < min {
@@ -1069,7 +993,7 @@ impl JsonEngine {
                                         return false;
                                     }
                                 }
-                                state.syntax_state = ArraySyntaxState::ExpectValueOrEnd;
+                                state.syntax_state = ArraySyntaxState::ExpectValue;
                                 return true;
                             }
                             if byte == b']' {
@@ -1100,78 +1024,14 @@ impl JsonEngine {
                     // if so, pop on delimiters
                     let has_complete = state.candidates.iter().any(|c| c.len() == cursor);
 
-                    if has_complete {
-                        // allow delimiters that would end this value
-                        if byte == b',' || byte == b'}' || byte == b']' || Self::is_whitespace(byte)
-                        {
-                            // pop the enum scope
-                            stack.pop();
-                            // update parent state like we do for other primitives
-                            // we need to handle the delimiter in parent scope
-                            // so don't return here, the byte needs to be processed by parent
-                            // for whitespace return true, for delimiters let parent handle it
-                            if Self::is_whitespace(byte) {
-                                return true;
-                            }
-                            // for comma/brace/bracket, let parent handle it by re-validating
-                            // need to update parent state and then let parent handle delimiter
-                            Self::update_parent_after_value(stack);
-                            // now reprocess this byte with the current (parent) scope
-                            if let Some(parent) = stack.last_mut() {
-                                match parent {
-                                    Scope::Object {
-                                        syntax_state,
-                                        missing_required_keys,
-                                        ..
-                                    } => {
-                                        if *syntax_state == ObjectSyntaxState::ExpectCommaOrEnd {
-                                            if byte == b',' {
-                                                *syntax_state = ObjectSyntaxState::ExpectKeyOrEnd;
-                                                return true;
-                                            }
-                                            if byte == b'}' {
-                                                if !missing_required_keys.is_empty() {
-                                                    return false;
-                                                }
-                                                stack.pop();
-                                                if stack.is_empty() {
-                                                    *finished = true;
-                                                } else {
-                                                    Self::update_parent_after_value(stack);
-                                                }
-                                                return true;
-                                            }
-                                        }
-                                    }
-                                    Scope::Array(arr_state) => {
-                                        if arr_state.syntax_state
-                                            == ArraySyntaxState::ExpectCommaOrEnd
-                                        {
-                                            if byte == b',' {
-                                                arr_state.syntax_state =
-                                                    ArraySyntaxState::ExpectValueOrEnd;
-                                                return true;
-                                            }
-                                            if byte == b']' {
-                                                stack.pop();
-                                                if stack.is_empty() {
-                                                    *finished = true;
-                                                } else {
-                                                    Self::update_parent_after_value(stack);
-                                                }
-                                                return true;
-                                            }
-                                        }
-                                    }
-                                    _ => {}
-                                }
-                            } else {
-                                // No parent, we're at root
-                                *finished = true;
-                                return true;
-                            }
-                            return false;
+                    if has_complete && Self::is_number_terminator(byte) {
+                        stack.pop();
+                        if stack.is_empty() {
+                            *finished = true;
+                            return Self::is_whitespace(byte);
                         }
+                        Self::update_parent_after_value(stack);
+                        continue;
                     }
 
                     // check if byte matches any remaining candidate at current cursor
@@ -1210,6 +1070,7 @@ impl JsonEngine {
 impl ConstraintEngine for JsonEngine {
     fn reset(&mut self) {
         self.stack = vec![Scope::Root];
+        self.output.clear();
         self.finished = false;
         self.dead = false;
     }
@@ -1242,19 +1103,25 @@ impl ConstraintEngine for JsonEngine {
             })?
             .clone();
 
+        if !self.validate_token(&bytes) {
+            self.dead = true;
+            return Err(ConstraintError::InvalidState(
+                "Token violates the JSON schema".into(),
+            ));
+        }
+
         for &byte in &bytes {
             self.advance_byte(byte)?;
         }
+        self.output.extend_from_slice(&bytes);
 
         Ok(())
     }
 
     fn is_finished(&self) -> bool {
-        if self.finished && self.stack.is_empty() {
-            return true;
-        }
-
-        matches!(self.stack.as_slice(), [Scope::Number(state)] if Self::number_is_complete(state))
+        !self.dead
+            && Self::complete(&self.stack, self.finished)
+            && self.valid_completion(&self.output)
     }
 
     fn is_dead(&self) -> bool {
@@ -1271,6 +1138,8 @@ impl ConstraintEngine for JsonEngine {
             vocab_size: self.vocab_size,
             root_blueprint: Arc::clone(&self.root_blueprint),
             root_value_blueprint: Arc::clone(&self.root_value_blueprint),
+            schema: Arc::clone(&self.schema),
+            output: self.output.clone(),
             stack: self.stack.clone(),
             finished: self.finished,
             dead: self.dead,

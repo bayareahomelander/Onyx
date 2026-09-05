@@ -219,7 +219,6 @@ def test_regex_response_is_grammar_constrained(monkeypatch):
     [
         (' { "content": "Ready" } ', True, '{"content":"Ready"}'),
         (' { "content": "Ready" } ', False, ' { "content": "Ready" } '),
-        ("not json", True, "not json"),
     ],
 )
 def test_json_response_compacts_only_when_requested(monkeypatch, text, compact_json, expected):
@@ -228,7 +227,11 @@ def test_json_response_compacts_only_when_requested(monkeypatch, text, compact_j
     calls = _fake_generation(monkeypatch, [_result([31], "stop")])
     vocabulary = object()
     monkeypatch.setattr(server, "_build_vocabulary", lambda *_args: vocabulary)
-    schema = {"type": "object", "required": ["content"]}
+    schema = {
+        "type": "object",
+        "properties": {"content": {"type": "string"}},
+        "required": ["content"],
+    }
 
     with TestClient(create_app(engine=engine)) as client:
         response = client.post(
@@ -248,6 +251,41 @@ def test_json_response_compacts_only_when_requested(monkeypatch, text, compact_j
     assert calls[0]["token_byte_vocabulary"] is vocabulary
 
 
+def test_json_compaction_preserves_numeric_precision(monkeypatch):
+    text = ' { "value": 0.10000000000000000001 } '
+    engine = _engine(FakeTokenizer({(31,): text}))
+    _fake_generation(monkeypatch, [_result([31], "stop")])
+    monkeypatch.setattr(server, "_build_vocabulary", lambda *_args: object())
+    with TestClient(create_app(engine=engine)) as client:
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "messages": [{"role": "user", "content": "Hi"}],
+                "json_schema": {"type": "object", "properties": {"value": {"type": "number"}}},
+            },
+        )
+    assert response.status_code == 200
+    assert response.json()["choices"][0]["message"]["content"] == '{"value":0.10000000000000000001}'
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_http_schema_rejects_decimal_precision_loss(monkeypatch, stream):
+    engine = _engine(FakeTokenizer({}))
+    calls = _fake_generation(monkeypatch, [])
+    body = (
+        '{"messages":[{"role":"user","content":"Hi"}],'
+        '"json_schema":{"enum":[0.10000000000000000001]},'
+        '"stream":' + json.dumps(stream) + "}"
+    )
+    with TestClient(create_app(engine=engine)) as client:
+        response = client.post(
+            "/v1/chat/completions", content=body, headers={"Content-Type": "application/json"}
+        )
+    assert response.status_code == 400
+    assert "loses precision" in response.text
+    assert calls == []
+
+
 def _parse_sse(body: str) -> list[str]:
     payloads = []
     for block in body.split("\n\n"):
@@ -261,6 +299,43 @@ def _parse_sse(body: str) -> list[str]:
         if data:
             payloads.append("\n".join(data))
     return payloads
+
+
+@pytest.mark.parametrize("text", ["not json", '{"content":1}', "{}"])
+@pytest.mark.parametrize("stream", [False, True])
+def test_json_response_never_reports_success_for_invalid_decoded_output(monkeypatch, text, stream):
+    engine = _engine(FakeTokenizer({(31,): text}))
+    _fake_generation(monkeypatch, [_result([31], "stop")])
+    _fake_stream(
+        monkeypatch, [SimpleNamespace(text=text), SimpleNamespace(result=_result([31], "stop"))]
+    )
+    monkeypatch.setattr(server, "_build_vocabulary", lambda *_args: object())
+    schema = {
+        "type": "object",
+        "properties": {"content": {"type": "string"}},
+        "required": ["content"],
+    }
+    with TestClient(create_app(engine=engine)) as client:
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "messages": [{"role": "user", "content": "Hi"}],
+                "json_schema": schema,
+                "stream": stream,
+            },
+        )
+    if not stream:
+        assert response.status_code == 400
+    else:
+        events = _parse_sse(response.text)
+        assert events[-1] == "[DONE]"
+        chunks = [json.loads(event) for event in events[:-1]]
+        assert any("error" in chunk for chunk in chunks)
+        assert not any(
+            choice["finish_reason"] is not None
+            for chunk in chunks
+            for choice in chunk.get("choices", [])
+        )
 
 
 def _fake_stream(monkeypatch, events, error=None):
@@ -817,6 +892,54 @@ def test_real_uvicorn_api_phase_gate():
                 }
             assert regex.json()["choices"][0]["message"]["content"] == "CUDA Ready"
             json.loads(schema_response.json()["choices"][0]["message"]["content"])
+            unsupported = client.post(
+                "/v1/chat/completions",
+                json={
+                    **payload,
+                    "json_schema": {
+                        "type": "object",
+                        "properties": {"age": {"type": "integer", "minimum": 18}},
+                    },
+                },
+            )
+            assert unsupported.status_code == 400
+            assert "unsupported keyword 'minimum'" in unsupported.json()["detail"]
+
+            # Permanent GPU/API regression: raw UTF-8 and surrogate-pair-sized characters.
+            unicode_schema = {"type": "string", "enum": ["é🚀"], "minLength": 2, "maxLength": 2}
+            unicode_payload = {**payload, "max_tokens": 32, "json_schema": unicode_schema}
+            from jsonschema import Draft202012Validator
+
+            for temperature in (0.0, 0.8):
+                for stream in (False, True):
+                    response = client.post(
+                        "/v1/chat/completions",
+                        json={
+                            **unicode_payload,
+                            "temperature": temperature,
+                            "stream": stream,
+                        },
+                    )
+                    assert response.status_code == 200
+                    if stream:
+                        events = _parse_sse(response.text)
+                        chunks = [json.loads(event) for event in events[:-1]]
+                        assert events[-1] == "[DONE]"
+                        assert not any("error" in chunk for chunk in chunks)
+                        output = "".join(
+                            chunk["choices"][0]["delta"].get("content") or "" for chunk in chunks
+                        )
+                        assert chunks[-1]["choices"][0]["finish_reason"] == "stop"
+                    else:
+                        output = response.json()["choices"][0]["message"]["content"]
+                    value = json.loads(output)
+                    assert value == "é🚀"
+                    Draft202012Validator(unicode_schema).validate(value)
+            exhausted = client.post(
+                "/v1/chat/completions", json={**unicode_payload, "max_tokens": 1}
+            )
+            assert exhausted.status_code == 400
+            assert "complete valid document" in exhausted.json()["detail"]
             many_body = many.json()
             assert len(many_body["choices"]) == 2
             assert many_body["usage"]["total_tokens"] == (

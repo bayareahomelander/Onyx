@@ -1,6 +1,5 @@
 """Fixed-gamma speculative token generation."""
 
-import json
 import time
 from collections.abc import Iterable, Iterator
 from typing import NamedTuple
@@ -16,6 +15,7 @@ from onyx_cuda.generation import (
     _matched_stop_length,
     _validate_grammar_request,
     _validate_generation_options,
+    _validate_json_result,
     generate_tokens,
 )
 from onyx_cuda.masking import apply_grammar_mask
@@ -549,11 +549,7 @@ def generate_speculative_events(
             yield AcceptedTokenEvent(token_id)
 
         if json_schema is not None:
-            json.loads(
-                b"".join(
-                    token_byte_vocabulary.token_bytes[token_id] for token_id in generated
-                ).decode("utf-8")
-            )
+            _validate_json_result(json_schema, token_byte_vocabulary, generated)
         past_key_values = target_cache.past_key_values
     finally:
         if constraint is not None and live_grammar_states:

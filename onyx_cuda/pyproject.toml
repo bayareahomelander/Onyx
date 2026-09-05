@@ -22,6 +22,7 @@ server = [
 dev = [
     "maturin==1.14.1",
     "pytest==9.1.1",
+    "jsonschema>=4.23,<5",
     "onyx-cuda[server]",
 ]
 

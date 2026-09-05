@@ -9,6 +9,359 @@ use std::sync::Arc;
 
 use crate::constraint::ConstraintError;
 
+fn invalid(path: &str, message: impl std::fmt::Display) -> ConstraintError {
+    ConstraintError::CompilationError(format!("JSON schema {path}: {message}"))
+}
+
+/// Restrict patterns to a portable subset, with JSON Schema's search semantics.
+pub fn schema_pattern(pattern: &str) -> Result<String, ConstraintError> {
+    let mut normalized = String::new();
+    let mut chars = pattern.chars().peekable();
+    let mut in_class = false;
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\\' => {
+                let escaped = chars
+                    .next()
+                    .ok_or_else(|| invalid("pattern", "unfinished escape"))?;
+                match escaped {
+                    'd' => normalized.push_str("[0-9]"),
+                    'D' => normalized.push_str("[^0-9]"),
+                    'w' => normalized.push_str("[A-Za-z0-9_]"),
+                    'W' => normalized.push_str("[^A-Za-z0-9_]"),
+                    'n' | 'r' | 't' | 'f' => {
+                        normalized.push('\\');
+                        normalized.push(escaped);
+                    }
+                    c if "\\/.*+?()[]{}^$|-".contains(c) => {
+                        if c != '/' {
+                            normalized.push('\\');
+                        }
+                        normalized.push(c);
+                    }
+                    _ => {
+                        return Err(invalid(
+                            "pattern",
+                            format!("unsupported escape \\{escaped}"),
+                        ))
+                    }
+                }
+            }
+            '[' if in_class => {
+                return Err(invalid(
+                    "pattern",
+                    "nested character classes are unsupported",
+                ))
+            }
+            '[' => {
+                in_class = true;
+                normalized.push(ch);
+            }
+            ']' => {
+                in_class = false;
+                normalized.push(ch);
+            }
+            '&' | '-' | '~' if in_class && chars.peek() == Some(&ch) => {
+                return Err(invalid(
+                    "pattern",
+                    "character class set operations are unsupported",
+                ));
+            }
+            '(' if chars.peek() == Some(&'?') => {
+                chars.next();
+                if chars.next() != Some(':') {
+                    return Err(invalid(
+                        "pattern",
+                        "only ordinary and noncapturing groups are supported",
+                    ));
+                }
+                normalized.push_str("(?:");
+            }
+            '.' if !in_class => normalized.push_str("[^\\n\\r\\u{2028}\\u{2029}]"),
+            _ => normalized.push(ch),
+        }
+    }
+    regex::Regex::new(&normalized).map_err(|e| invalid("pattern", e))?;
+    Ok(normalized)
+}
+
+/// Fail closed: accepting a schema must never silently discard a validation keyword.
+pub fn validate_schema(schema: &Value, path: &str) -> Result<(), ConstraintError> {
+    let object = schema
+        .as_object()
+        .ok_or_else(|| invalid(path, "expected a schema object"))?;
+    for key in object.keys() {
+        if !matches!(
+            key.as_str(),
+            "type"
+                | "properties"
+                | "required"
+                | "additionalProperties"
+                | "items"
+                | "enum"
+                | "pattern"
+                | "minLength"
+                | "maxLength"
+                | "minItems"
+                | "maxItems"
+                | "title"
+                | "description"
+                | "default"
+                | "examples"
+                | "$comment"
+        ) {
+            return Err(invalid(path, format!("unsupported keyword '{key}'")));
+        }
+    }
+    if let Some(value) = schema.get("type") {
+        let types: Vec<&Value> = match value {
+            Value::String(_) => vec![value],
+            Value::Array(values) if !values.is_empty() => values.iter().collect(),
+            _ => {
+                return Err(invalid(
+                    path,
+                    "type must be a name or a nonempty array of names",
+                ))
+            }
+        };
+        let mut seen = HashSet::new();
+        for kind in types {
+            let name = kind
+                .as_str()
+                .ok_or_else(|| invalid(path, "type names must be strings"))?;
+            if !matches!(
+                name,
+                "object" | "array" | "string" | "number" | "integer" | "boolean" | "null"
+            ) || !seen.insert(name)
+            {
+                return Err(invalid(path, format!("invalid or duplicate type '{name}'")));
+            }
+        }
+    }
+    let types = SchemaType::types_from_value(schema);
+    for (kind, keys) in [
+        (
+            SchemaType::Object,
+            &["properties", "required", "additionalProperties"][..],
+        ),
+        (SchemaType::Array, &["items", "minItems", "maxItems"][..]),
+        (
+            SchemaType::String,
+            &["pattern", "minLength", "maxLength"][..],
+        ),
+    ] {
+        if keys.iter().any(|key| object.contains_key(*key)) && !types.contains(&kind) {
+            return Err(invalid(
+                path,
+                format!("{keys:?} require an explicit {kind:?} type"),
+            ));
+        }
+    }
+    if let Some(props) = schema.get("properties") {
+        let props = props
+            .as_object()
+            .ok_or_else(|| invalid(path, "properties must be an object"))?;
+        for (name, child) in props {
+            validate_schema(child, &format!("{path}.properties[{name:?}]"))?;
+        }
+    }
+    if let Some(required) = schema.get("required") {
+        let required = required
+            .as_array()
+            .ok_or_else(|| invalid(path, "required must be an array"))?;
+        let mut seen = HashSet::new();
+        for name in required {
+            let name = name
+                .as_str()
+                .ok_or_else(|| invalid(path, "required names must be strings"))?;
+            if !seen.insert(name) || schema.get("properties").and_then(|p| p.get(name)).is_none() {
+                return Err(invalid(
+                    path,
+                    "required names must be unique and declared in properties",
+                ));
+            }
+        }
+    }
+    if schema
+        .get("additionalProperties")
+        .is_some_and(|v| !v.is_boolean())
+    {
+        return Err(invalid(
+            path,
+            "only boolean additionalProperties is supported",
+        ));
+    }
+    if let Some(items) = schema.get("items") {
+        validate_schema(items, &format!("{path}.items"))?;
+    }
+    for (min_key, max_key) in [("minLength", "maxLength"), ("minItems", "maxItems")] {
+        for key in [min_key, max_key] {
+            if schema.get(key).is_some_and(|v| v.as_u64().is_none()) {
+                return Err(invalid(
+                    path,
+                    format!("{key} must be a nonnegative integer"),
+                ));
+            }
+        }
+        if let (Some(min), Some(max)) = (
+            schema.get(min_key).and_then(Value::as_u64),
+            schema.get(max_key).and_then(Value::as_u64),
+        ) {
+            if min > max {
+                return Err(invalid(path, format!("{min_key} exceeds {max_key}")));
+            }
+        }
+    }
+    if let Some(pattern) = schema.get("pattern") {
+        let pattern = pattern
+            .as_str()
+            .ok_or_else(|| invalid(path, "pattern must be a string"))?;
+        let normalized = schema_pattern(pattern).map_err(|e| invalid(path, e))?;
+        crate::regex_engine::compile_pattern_dfa(&format!("(?s:.*(?:{normalized}).*)"))
+            .map_err(|e| invalid(path, e))?;
+    }
+    if let Some(values) = schema.get("enum") {
+        let values = values
+            .as_array()
+            .filter(|v| !v.is_empty())
+            .ok_or_else(|| invalid(path, "enum must be a nonempty array"))?;
+        if values
+            .iter()
+            .enumerate()
+            .any(|(i, value)| values[..i].contains(value))
+        {
+            return Err(invalid(path, "enum values must be unique"));
+        }
+        if !values
+            .iter()
+            .any(|value| value_matches_schema(value, schema))
+        {
+            return Err(invalid(
+                path,
+                "enum has no value satisfying the other constraints",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn is_integer(value: &Value) -> bool {
+    let Value::Number(number) = value else {
+        return false;
+    };
+    // Decimal placement, not a floating-point conversion, determines integrality.
+    let text = number.to_string();
+    let (mantissa, exponent) = text.split_once(['e', 'E']).unwrap_or((&text, "0"));
+    if mantissa.chars().all(|c| matches!(c, '-' | '.' | '0')) {
+        return true;
+    }
+    let exponent = exponent.parse::<i64>().unwrap_or_else(|_| {
+        if exponent.starts_with('-') {
+            i64::MIN
+        } else {
+            i64::MAX
+        }
+    });
+    let decimals = mantissa
+        .split_once('.')
+        .map_or(0, |(_, fraction)| fraction.len());
+    let trailing_zeros = mantissa
+        .chars()
+        .rev()
+        .filter(|&c| c != '.')
+        .take_while(|&c| c == '0')
+        .count();
+    exponent >= decimals as i64 - trailing_zeros as i64
+}
+
+/// Used for intersecting enums with their sibling constraints and checking completion.
+pub fn value_matches_schema(value: &Value, schema: &Value) -> bool {
+    let types = SchemaType::types_from_value(schema);
+    if !types.iter().any(|kind| match kind {
+        SchemaType::Any => true,
+        SchemaType::Object => value.is_object(),
+        SchemaType::Array => value.is_array(),
+        SchemaType::String => value.is_string(),
+        SchemaType::Number => value.is_number(),
+        SchemaType::Integer => is_integer(value),
+        SchemaType::Boolean => value.is_boolean(),
+        SchemaType::Null => value.is_null(),
+    }) {
+        return false;
+    }
+    if schema
+        .get("enum")
+        .and_then(Value::as_array)
+        .is_some_and(|values| !values.contains(value))
+    {
+        return false;
+    }
+    if let Some(text) = value.as_str() {
+        let length = text.chars().count() as u64;
+        if schema
+            .get("minLength")
+            .and_then(Value::as_u64)
+            .is_some_and(|min| length < min)
+            || schema
+                .get("maxLength")
+                .and_then(Value::as_u64)
+                .is_some_and(|max| length > max)
+        {
+            return false;
+        }
+        if let Some(pattern) = schema.get("pattern").and_then(Value::as_str) {
+            if !schema_pattern(pattern)
+                .ok()
+                .and_then(|p| regex::Regex::new(&p).ok())
+                .is_some_and(|p| p.is_match(text))
+            {
+                return false;
+            }
+        }
+    }
+    if let Some(items) = value.as_array() {
+        let length = items.len() as u64;
+        if schema
+            .get("minItems")
+            .and_then(Value::as_u64)
+            .is_some_and(|min| length < min)
+            || schema
+                .get("maxItems")
+                .and_then(Value::as_u64)
+                .is_some_and(|max| length > max)
+        {
+            return false;
+        }
+        if let Some(child) = schema.get("items") {
+            if !items.iter().all(|item| value_matches_schema(item, child)) {
+                return false;
+            }
+        }
+    }
+    if let Some(object) = value.as_object() {
+        if schema
+            .get("required")
+            .and_then(Value::as_array)
+            .is_some_and(|keys| {
+                keys.iter()
+                    .any(|k| !object.contains_key(k.as_str().unwrap()))
+            })
+        {
+            return false;
+        }
+        for (key, item) in object {
+            if let Some(child) = schema.get("properties").and_then(|p| p.get(key)) {
+                if !value_matches_schema(item, child) {
+                    return false;
+                }
+            } else if schema.get("additionalProperties") == Some(&Value::Bool(false)) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 /// the type of a JSON schema node
 #[derive(Debug, Clone, PartialEq)]
 pub enum SchemaType {
@@ -128,6 +481,7 @@ impl PropertyBlueprint {
         // parse enum values if present
         let enum_values = value.get("enum").and_then(|v| v.as_array()).map(|arr| {
             arr.iter()
+                .filter(|v| value_matches_schema(v, value))
                 .filter_map(|v| serde_json::to_vec(v).ok())
                 .collect()
         });
@@ -210,6 +564,7 @@ impl SchemaBlueprint {
 
     /// parse a JSON schema from a serde_json::Value
     pub fn from_value(schema: &Value) -> Result<Self, ConstraintError> {
+        validate_schema(schema, "$")?;
         let root_type = SchemaType::from_value(schema);
 
         let mut properties = HashMap::new();

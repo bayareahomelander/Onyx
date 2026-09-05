@@ -1,8 +1,10 @@
 """Tokenizer ID to UTF-8 byte vocabulary mapping."""
 
+import json
 from typing import NamedTuple
 
 from transformers import PreTrainedTokenizerBase
+from transformers.models.gpt2.tokenization_gpt2 import bytes_to_unicode
 
 
 class TokenByteVocabulary(NamedTuple):
@@ -14,7 +16,7 @@ class TokenByteVocabulary(NamedTuple):
 def build_token_byte_vocabulary(
     tokenizer: PreTrainedTokenizerBase, logits_vocab_size: int
 ) -> TokenByteVocabulary:
-    """Map every model logit ID to its standalone decoded UTF-8 bytes."""
+    """Preserve raw ByteLevel bytes, including tokens splitting a UTF-8 character."""
     if (
         isinstance(logits_vocab_size, bool)
         or not isinstance(logits_vocab_size, int)
@@ -22,7 +24,8 @@ def build_token_byte_vocabulary(
     ):
         raise ValueError("Model logits vocabulary size must be a positive integer")
 
-    tokenizer_ids = set(tokenizer.get_vocab().values())
+    vocabulary = tokenizer.get_vocab()
+    tokenizer_ids = set(vocabulary.values())
     special_ids = set(tokenizer.all_special_ids)
     known_ids = tokenizer_ids | special_ids
     if not known_ids:
@@ -37,18 +40,19 @@ def build_token_byte_vocabulary(
             f"size {logits_vocab_size}"
         )
 
-    token_bytes: list[bytes] = []
-    for token_id in range(logits_vocab_size):
+    backend = getattr(tokenizer, "backend_tokenizer", None)
+    decoder = getattr(backend, "decoder", None)
+    if decoder is None or json.loads(decoder.__getstate__()).get("type") != "ByteLevel":
+        raise ValueError("Grammar constraints currently require a ByteLevel tokenizer")
+    byte_decoder = {character: byte for byte, character in bytes_to_unicode().items()}
+    token_bytes = [b""] * logits_vocab_size
+    for token, token_id in vocabulary.items():
+        if token_id in special_ids:
+            continue  # These disappear with skip_special_tokens=True and cannot satisfy a grammar.
         try:
-            text = tokenizer.decode(
-                [token_id],
-                skip_special_tokens=False,
-                clean_up_tokenization_spaces=False,
-            )
-            value = b"" if "\ufffd" in text else text.encode("utf-8")
-        except Exception:
-            value = b""
-        token_bytes.append(value)
+            token_bytes[token_id] = bytes(byte_decoder[character] for character in token)
+        except KeyError as error:
+            raise ValueError(f"Token {token_id} is not a ByteLevel byte sequence") from error
 
     return TokenByteVocabulary(
         token_bytes=token_bytes,

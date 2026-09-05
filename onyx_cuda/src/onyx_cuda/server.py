@@ -7,11 +7,12 @@ import queue
 import sys
 import threading
 from contextlib import asynccontextmanager
+from decimal import Decimal
 from time import time
 from typing import Any, Callable
 from uuid import uuid4
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
@@ -207,6 +208,24 @@ def _build_metrics(timings, grammar_constrained: bool) -> OnyxMetrics:
     )
 
 
+def _validate_json_response(schema: dict[str, Any], output: str) -> str:
+    from onyx_cuda import _rust
+
+    return _rust.validate_json_output(json.dumps(schema), output)
+
+
+def _validate_schema_number_precision(value: Any) -> None:
+    if isinstance(value, Decimal):
+        if not value.is_finite() or Decimal(str(float(value))) != value:
+            raise ValueError("JSON schema number loses precision in the HTTP request parser")
+    elif isinstance(value, dict):
+        for child in value.values():
+            _validate_schema_number_precision(child)
+    elif isinstance(value, list):
+        for child in value:
+            _validate_schema_number_precision(child)
+
+
 def _generate(arguments: dict[str, Any]):
     from onyx_cuda.speculative import generate_speculative
 
@@ -292,6 +311,7 @@ def _sse_events(request: ChatCompletionRequest, engine):
         arguments["measure"] = True
         events = _completion_event_iter(arguments, engine.target.tokenizer, request.stop)
         finish_reason = None
+        json_parts = []
         for event in events:
             result = getattr(event, "result", None)
             if result is not None:
@@ -299,9 +319,13 @@ def _sse_events(request: ChatCompletionRequest, engine):
                 continue
             text = getattr(event, "text", None)
             if text:
+                if request.json_schema is not None:
+                    json_parts.append(text)
                 yield _sse(_chunk_json(completion_id, created, model, content=text))
         if finish_reason is None:
             raise Exception("Generation ended without a terminal event")
+        if request.json_schema is not None:
+            _validate_json_response(request.json_schema, "".join(json_parts))
         yield _sse(_chunk_json(completion_id, created, model, finish_reason=finish_reason))
         yield _sse("[DONE]")
     except Exception as error:
@@ -433,7 +457,10 @@ def create_app(
         }
 
     @app.post("/v1/chat/completions", response_model=ChatCompletionResponse)
-    async def create_chat_completion(request: ChatCompletionRequest):
+    async def create_chat_completion(request: ChatCompletionRequest, http_request: Request):
+        if request.json_schema is not None:
+            raw_schema = json.loads(await http_request.body(), parse_float=Decimal)["json_schema"]
+            _validate_schema_number_precision(raw_schema)
         if request.stream:
             if request.n != 1:
                 raise HTTPException(status_code=400, detail="stream=true supports only n=1")
@@ -464,11 +491,10 @@ def create_app(
                 last_timings = result.timings
                 output = tokenizer.decode(result.token_ids, skip_special_tokens=True)
                 output = truncate_at_stop(output, request.stop)
-                if request.json_schema is not None and request.compact_json:
-                    try:
-                        output = json.dumps(json.loads(output), separators=(",", ":"))
-                    except json.JSONDecodeError:
-                        pass
+                if request.json_schema is not None:
+                    compact_output = _validate_json_response(request.json_schema, output)
+                    if request.compact_json:
+                        output = compact_output
                 choices.append(
                     ChatCompletionChoice(
                         index=index,

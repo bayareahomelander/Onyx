@@ -136,14 +136,14 @@ def test_load_model_prompt_prefill_and_generation_on_cuda(monkeypatch):
     assert vocabulary == repeated_vocabulary
     assert len(vocabulary.token_bytes) == result.logits.shape[-1]
     assert vocabulary.special_token_count == 14
-    assert vocabulary.empty_token_count == 1728
+    assert vocabulary.empty_token_count == 285
     assert vocabulary.token_bytes[11] == b","
     assert vocabulary.token_bytes[13] == b"."
     assert vocabulary.token_bytes[198] == b"\n"
     assert vocabulary.token_bytes[220] == b" "
     assert vocabulary.token_bytes[80285] == b"CUDA"
-    assert vocabulary.token_bytes[151643] == b"<|endoftext|>"
-    assert vocabulary.token_bytes[94] == b""
+    assert vocabulary.token_bytes[151643] == b""
+    assert vocabulary.token_bytes[94] == b"\xa1"
     assert vocabulary.token_bytes[151665] == b""
     assert vocabulary.token_bytes[-1] == b""
 
@@ -378,15 +378,16 @@ def test_load_model_prompt_prefill_and_generation_on_cuda(monkeypatch):
             assert completed.timings.mask_transfer_seconds > 0
         constrained.append(completed)
 
-    with pytest.raises(ValueError, match="no valid token continuation"):
-        generate_tokens(
-            loaded.model,
-            prompt.token_ids,
-            max_tokens=8,
-            eos_token_ids=eos_token_id,
-            regex=r"\u{10FFFF}",
-            token_byte_vocabulary=vocabulary,
-        )
+    unicode_result = generate_tokens(
+        loaded.model,
+        prompt.token_ids,
+        max_tokens=8,
+        eos_token_ids=eos_token_id,
+        regex=r"\u{10FFFF}",
+        token_byte_vocabulary=vocabulary,
+    )
+    assert loaded.tokenizer.decode(unicode_result.token_ids) == "\U0010ffff"
+    assert unicode_result.finish_reason == "stop"
 
     json_prompt = format_prompt(
         loaded.tokenizer,
