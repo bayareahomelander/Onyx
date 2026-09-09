@@ -124,7 +124,7 @@ def test_server_defaults_to_target_only_and_allows_explicit_speculation(monkeypa
     calls = []
     monkeypatch.delenv("ONYX_SPECULATIVE_GAMMA", raising=False)
     monkeypatch.setattr(
-        server, "_load_configured_engine", lambda gamma: calls.append(gamma) or object()
+        server, "_load_configured_engine", lambda gamma, selection: calls.append(gamma) or object()
     )
     with TestClient(create_app()) as client:
         assert client.app.state.speculative_gamma == 0

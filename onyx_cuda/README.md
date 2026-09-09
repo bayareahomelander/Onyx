@@ -36,6 +36,8 @@ Start the server:
 
 Model weights download on first startup. Use one worker and trusted local
 clients; stop with Ctrl+C. The server defaults to target-only generation.
+Optional [startup model settings](REPORT.md#selecting-models-at-startup) let you
+choose a compatible target and draft; existing defaults stay unchanged.
 
 ## Example
 

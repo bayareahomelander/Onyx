@@ -54,7 +54,8 @@ def test_target_only_loading_never_loads_or_validates_a_draft(monkeypatch):
     calls = []
     target = _loaded_model()
 
-    def load(model_id):
+    def load(model_id, *, revision):
+        assert revision == model_module.MODEL_REVISIONS[model_id]
         calls.append(model_id)
         return target
 

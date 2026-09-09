@@ -3,6 +3,7 @@
 import asyncio
 import gc
 import json
+import logging
 import os
 import queue
 import sys
@@ -18,7 +19,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from onyx_cuda.config import initialize_greedy_backend, resolve_greedy_backend
+from onyx_cuda.config import initialize_greedy_backend, resolve_greedy_backend, resolve_model_selection
 
 MODEL_ID = "onyx-speculative"
 SERVICE_VERSION = "0.1.0"
@@ -198,10 +199,10 @@ class ChatCompletionChunk(BaseModel):
     choices: list[ChatCompletionChunkChoice]
 
 
-def _load_configured_engine(gamma: int = GAMMA) -> Any:
+def _load_configured_engine(gamma: int = GAMMA, selection=None) -> Any:
     from onyx_cuda.model import load_model_pair
 
-    return load_model_pair(include_draft=gamma > 0)
+    return load_model_pair(include_draft=gamma > 0, selection=selection)
 
 
 def _release_cuda_memory() -> None:
@@ -559,6 +560,10 @@ def create_app(
     load_engine: Callable[[], Any] | None = None,
     gamma: int | None = None,
     greedy_backend: str | None = None,
+    target_model: str | None = None,
+    target_revision: str | None = None,
+    draft_model: str | None = None,
+    draft_revision: str | None = None,
 ) -> FastAPI:
     greedy_backend = resolve_greedy_backend(greedy_backend)
     if gamma is None:
@@ -568,6 +573,14 @@ def create_app(
             raise ValueError("ONYX_SPECULATIVE_GAMMA must be a nonnegative integer") from error
     if isinstance(gamma, bool) or not isinstance(gamma, int) or gamma < 0:
         raise ValueError("gamma must be a nonnegative integer (0 disables speculation)")
+    model_options = dict(target_model=target_model, target_revision=target_revision,
+                         draft_model=draft_model, draft_revision=draft_revision)
+    if engine is not None or load_engine is not None:
+        if any(value is not None for value in model_options.values()):
+            raise ValueError("Model selection cannot be combined with an injected engine or load_engine")
+        selection = None
+    else:
+        selection = resolve_model_selection(**model_options)
     loader = load_engine
     if loader is None:
         loaded = engine
@@ -582,12 +595,19 @@ def create_app(
                 # would retain GPU weights even after lifespan shutdown.
                 result, loaded = loaded, None
                 return result
-            return _load_configured_engine(gamma)
+            return _load_configured_engine(gamma, selection)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         initialize_greedy_backend(greedy_backend)
         app.state.engines = {MODEL_ID: loader()}
+        from onyx_cuda.model import describe_model_pair
+
+        app.state.model_configuration = describe_model_pair(app.state.engines[MODEL_ID])
+        logging.getLogger("uvicorn.error").info(
+            "Onyx CUDA loaded models: %s; gamma=%s; selector=%s",
+            json.dumps(app.state.model_configuration), gamma, greedy_backend,
+        )
         app.state.engine_locks = {model_id: asyncio.Lock() for model_id in app.state.engines}
         # Reuse CUDA/cuBLAS thread-local state across every generation mode.
         app.state.inference_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="onyx-inference")
@@ -622,6 +642,7 @@ def create_app(
             "version": SERVICE_VERSION,
             "speculative_gamma": app.state.speculative_gamma,
             "greedy_backend": app.state.greedy_backend,
+            "models": app.state.model_configuration,
             "limits": {
                 "max_output_tokens": MAX_OUTPUT_TOKENS,
                 "max_context_tokens": MAX_CONTEXT_TOKENS,
@@ -641,6 +662,7 @@ def create_app(
                     "id": model_id,
                     "object": "model",
                     "owned_by": "onyx-cuda",
+                    "configuration": app.state.model_configuration,
                 }
                 for model_id in getattr(app.state, "engines", {})
             ],

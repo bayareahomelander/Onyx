@@ -27,7 +27,7 @@ function Invoke-Checked {
 }
 
 $savedEnvironment = @{}
-foreach ($name in @("PYTHONPATH", "PYTHONHOME", "PYTHONNOUSERSITE", "CARGO_TARGET_DIR", "RUSTUP_TOOLCHAIN", "ONYX_SPECULATIVE_GAMMA", "ONYX_GREEDY_BACKEND", "CUPY_CACHE_IN_MEMORY")) {
+foreach ($name in @("PYTHONPATH", "PYTHONHOME", "PYTHONNOUSERSITE", "CARGO_TARGET_DIR", "RUSTUP_TOOLCHAIN", "ONYX_SPECULATIVE_GAMMA", "ONYX_GREEDY_BACKEND", "CUPY_CACHE_IN_MEMORY", "ONYX_TARGET_MODEL", "ONYX_TARGET_REVISION", "ONYX_DRAFT_MODEL", "ONYX_DRAFT_REVISION")) {
     $savedEnvironment[$name] = [Environment]::GetEnvironmentVariable($name, "Process")
 }
 Push-Location $project
@@ -36,6 +36,10 @@ try {
     $env:PYTHONHOME = $null
     $env:PYTHONNOUSERSITE = "1"
     $env:ONYX_SPECULATIVE_GAMMA = $null
+    $env:ONYX_TARGET_MODEL = $null
+    $env:ONYX_TARGET_REVISION = $null
+    $env:ONYX_DRAFT_MODEL = $null
+    $env:ONYX_DRAFT_REVISION = $null
     $env:ONYX_GREEDY_BACKEND = "torch"
     $env:CUPY_CACHE_IN_MEMORY = "1"
     $env:CARGO_TARGET_DIR = Join-Path $runRoot "cargo-target"

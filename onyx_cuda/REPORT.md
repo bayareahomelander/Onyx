@@ -6,6 +6,91 @@ reproduction instructions for Windows/NVIDIA. Start with the
 validation results; generated artifacts and implementation notes are excluded
 from version control.
 
+## Selecting models at startup
+
+Model selection applies only to Windows. With no settings, the API still loads
+the pinned Qwen2.5 1.5B target; gamma 0 avoids loading any draft. A positive
+`ONYX_SPECULATIVE_GAMMA` loads the selected draft as well.
+
+| Environment variable | Default |
+| --- | --- |
+| `ONYX_TARGET_MODEL` | `Qwen/Qwen2.5-1.5B-Instruct` |
+| `ONYX_TARGET_REVISION` | The bundled target's pinned snapshot |
+| `ONYX_DRAFT_MODEL` | `Qwen/Qwen2.5-0.5B-Instruct` |
+| `ONYX_DRAFT_REVISION` | The bundled draft's pinned snapshot |
+| `ONYX_SPECULATIVE_GAMMA` | `0` |
+
+For example, this uses the bundled 0.5B model as a smaller target without a draft:
+
+```powershell
+$env:ONYX_TARGET_MODEL = "Qwen/Qwen2.5-0.5B-Instruct"
+$env:ONYX_SPECULATIVE_GAMMA = "0"
+.\.venv\Scripts\python.exe -m uvicorn onyx_cuda.server:create_app --factory --host 127.0.0.1 --port 8000
+```
+
+Set the model variables to other Hugging Face repository IDs to experiment with
+compatible models. Local directories, URLs, prequantized models, and models
+requiring custom remote code are outside this loader's supported scope. All
+weights use FP16 on CUDA; the loader does not fall back to CPU or substitute a
+different model if loading fails. Changing selection requires a server restart.
+
+Python callers can use `create_app(target_model=..., target_revision=...,
+draft_model=..., draft_revision=..., gamma=...)`. Each explicit non-`None`
+argument overrides its corresponding environment variable. Settings are captured
+when the application is created. Explicit model settings cannot be combined
+with an injected `engine` or `load_engine`; injected engines supply their own
+models and their actual identities are reported where available.
+
+Revision defaults are looked up for the selected repository ID, not its role.
+A custom repository without a revision resolves its current default-branch
+commit once; that immutable commit is then used for tokenizer and weight loads.
+Branches and tags supplied as revisions are resolved the same way. Pin the
+reported commit for repeatable runs. Clear inherited revision variables when
+switching repositories, since each setting has independent precedence. Missing
+files download automatically; cached files are reused.
+
+Before accepting requests, each loaded model must have a supported ByteLevel
+tokenizer, usable chat template and EOS token, and pass a short forward/cache
+extension/rollback/replay check. A speculative pair must also have matching
+token bytes, vocabulary widths, special tokens, EOS IDs, and compatible chat
+formatting. These checks catch unsupported execution contracts; they do not
+establish correctness or a speedup for every model, prompt, or context length.
+
+`GET /` reports `models.target` and `models.draft` (null when absent).
+`GET /v1/models` exposes the same data under `configuration`. Startup logs also
+record these identities, actual resolved revisions, precision, gamma, and
+selector backend. `validated_snapshot` means an individual repository/revision
+matches a bundled validation pin; it does not certify a custom pair or its
+performance. The request model ID remains `onyx-speculative`; HTTP requests
+cannot switch models or initiate model downloads.
+
+The existing 2048-token API context envelope and other service limits still
+apply, even on larger GPUs. Select models that fit alongside KV caches and
+temporary tensors; parameter count alone is not a memory guarantee.
+
+### Benchmarking a selected configuration
+
+Both benchmark tools read the same model/revision environment settings as the
+server. `benchmark --target` uses the selected target; its default single-model
+mode uses the selected draft. `--compare` and `--speculative` load both models
+and compare gamma 0/1/2/4 regardless of the server's gamma setting.
+`benchmark_masking --models` loads the selected pair for gamma 0/2 comparisons.
+
+```powershell
+# After setting the desired model/revision environment variables:
+.\.venv\Scripts\python.exe -m onyx_cuda.benchmark --compare --output benchmarks/results/custom-comparison.json
+.\.venv\Scripts\python.exe -m onyx_cuda.benchmark_masking --models --output benchmarks/results/custom-masking.json
+```
+
+Reports record actual selected repository IDs and resolved revisions. The
+file-based target/constraint/speculation gates reject baselines with a different
+target identity or revision; regenerate the chain after changing models or
+settings. Use separate output paths for experiments. The full regression suite
+and `validate_windows.ps1` deliberately isolate model-selection variables so
+release validation continues to use bundled pins. The script restores the
+caller's environment afterward. Custom configurations remain experimental until
+their own target-baseline, structured-output, and resource checks pass.
+
 ## Installing a prebuilt wheel
 
 If using a wheel from `validation/results/<run-id>/artifacts/`, install that
@@ -430,7 +515,7 @@ alone has not established faster speculative generation.
 
 ## Current limitations
 
-- The model pair is currently fixed to Qwen2.5 0.5B and 1.5B Instruct.
+- Bundled validation covers Qwen2.5 0.5B and 1.5B Instruct; other startup-selected models are experimental.
 - Speculative decoding is greedy; positive-temperature requests use the target
   model directly.
 - Beam search, batching, and repetition penalties are not implemented.

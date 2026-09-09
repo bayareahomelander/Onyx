@@ -126,8 +126,8 @@ def compare_models():
             os.environ.pop("ONYX_GREEDY_BACKEND", None)
         else:
             os.environ["ONYX_GREEDY_BACKEND"] = previous
-    return {"models": {"draft": {"id": pair.draft.model.config._name_or_path, "revision": pair.draft.revision},
-                       "target": {"id": pair.target.model.config._name_or_path, "revision": pair.target.revision}},
+    return {"models": {"draft": {"id": pair.draft.model_id, "revision": pair.draft.revision},
+                       "target": {"id": pair.target.model_id, "revision": pair.target.revision}},
             "cases": results}
 
 

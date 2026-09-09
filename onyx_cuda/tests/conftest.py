@@ -11,6 +11,15 @@ import pytest
 import torch
 
 
+@pytest.fixture(autouse=True)
+def isolate_model_selection(monkeypatch):
+    """The regression suite always starts with bundled, pinned models."""
+    from onyx_cuda.config import MODEL_ENVIRONMENT_VARIABLES
+
+    for name in MODEL_ENVIRONMENT_VARIABLES:
+        monkeypatch.delenv(name, raising=False)
+
+
 def pytest_addoption(parser):
     parser.addoption("--require-kernels", action="store_true", help="Require CUDA and initialize custom kernels")
     parser.addoption("--require-cuda", action="store_true", help="Fail if CUDA is unavailable")

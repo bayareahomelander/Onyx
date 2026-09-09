@@ -16,8 +16,6 @@ import transformers
 from onyx_cuda.generation import generate_tokens
 from onyx_cuda.config import resolve_greedy_backend
 from onyx_cuda.model import (
-    MODEL_ID,
-    TARGET_MODEL_ID,
     load_model,
     load_model_pair,
 )
@@ -342,7 +340,7 @@ def _run_constraint_prompts(
     return [regex_result, json_result]
 
 
-def _run_speculative_gate(baseline_path: Path | None, output: Path, device) -> None:
+def _run_speculative_gate(baseline_path: Path | None, output: Path, device, selection=None) -> None:
     if baseline_path is not None and not baseline_path.is_file():
         raise RuntimeError(
             f"target constraint baseline not found at {baseline_path}; "
@@ -351,7 +349,7 @@ def _run_speculative_gate(baseline_path: Path | None, output: Path, device) -> N
     baseline = (
         json.loads(baseline_path.read_text(encoding="utf-8")) if baseline_path is not None else None
     )
-    pair = load_model_pair()
+    pair = load_model_pair(selection=selection)
     # Report the API's reusable CPU setup separately from GPU generation.
 
     cold_setup, warm_setup = [], []
@@ -369,7 +367,7 @@ def _run_speculative_gate(baseline_path: Path | None, output: Path, device) -> N
     if baseline is None:
         print("Measuring target baseline in the same process", flush=True)
         baseline = {
-            "model": {"id": TARGET_MODEL_ID, "revision": pair.target.revision},
+            "model": {"id": pair.target.model_id, "revision": pair.target.revision},
             "settings": _comparison_settings(),
             "device": {
                 "name": torch.cuda.get_device_name(device),
@@ -384,7 +382,7 @@ def _run_speculative_gate(baseline_path: Path | None, output: Path, device) -> N
             ),
         }
     target_model = {
-        "id": TARGET_MODEL_ID,
+        "id": pair.target.model_id,
         "revision": pair.target.revision,
     }
     if baseline.get("model") != target_model:
@@ -486,7 +484,7 @@ def _run_speculative_gate(baseline_path: Path | None, output: Path, device) -> N
     results = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "models": {
-            "draft": {"id": MODEL_ID, "revision": pair.draft.revision},
+            "draft": {"id": pair.draft.model_id, "revision": pair.draft.revision},
             "target": target_model,
         },
         "dependencies": {
@@ -549,12 +547,15 @@ def main() -> None:
     parser.add_argument("--baseline", type=Path)
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
+    from onyx_cuda.config import resolve_model_selection
+
+    selection = resolve_model_selection()
     device = torch.device("cuda:0")
     torch.cuda.set_device(device)
     if args.compare:
         if args.target or args.constraints or args.speculative or args.baseline:
             parser.error("--compare cannot be combined with other modes or --baseline")
-        _run_speculative_gate(None, args.output or COMPARISON_OUTPUT, device)
+        _run_speculative_gate(None, args.output or COMPARISON_OUTPUT, device, selection)
         return
     if args.speculative:
         if args.target or args.constraints:
@@ -563,9 +564,11 @@ def main() -> None:
             args.baseline or TARGET_CONSTRAINT_OUTPUT,
             args.output or SPECULATIVE_OUTPUT,
             device,
+            selection,
         )
         return
-    model_id = TARGET_MODEL_ID if args.target else MODEL_ID
+    model_id = selection.target_model if args.target else selection.draft_model
+    revision = selection.target_revision if args.target else selection.draft_revision
     baseline = args.baseline or (TARGET_OUTPUT if args.target else DEFAULT_OUTPUT)
     if args.target:
         default_output = (
@@ -575,7 +578,7 @@ def main() -> None:
         default_output = CONSTRAINT_OUTPUT if args.constraints else DEFAULT_OUTPUT
     output = args.output or default_output
 
-    loaded = load_model(model_id)
+    loaded = load_model(model_id, revision=revision)
     prompts = [
         _run_prompt(loaded.model, loaded.tokenizer, device, name, prompt)
         for name, prompt in PROMPTS.items()
