@@ -48,3 +48,23 @@ def test_model_pair_rejects_each_compatibility_mismatch(monkeypatch):
     for target, message in cases:
         with pytest.raises(RuntimeError, match=message):
             model_module._require_compatible_models(draft, target)
+
+
+def test_target_only_loading_never_loads_or_validates_a_draft(monkeypatch):
+    calls = []
+    target = _loaded_model()
+
+    def load(model_id):
+        calls.append(model_id)
+        return target
+
+    monkeypatch.setattr(model_module, "load_model", load)
+    monkeypatch.setattr(
+        model_module,
+        "_require_compatible_models",
+        lambda *_: pytest.fail("draft validation is unnecessary"),
+    )
+    pair = model_module.load_model_pair(include_draft=False)
+    assert calls == [model_module.TARGET_MODEL_ID]
+    assert pair.draft is None
+    assert pair.target is target

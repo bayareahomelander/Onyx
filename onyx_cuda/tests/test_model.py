@@ -8,7 +8,7 @@ from transformers.cache_utils import DynamicCache
 from onyx_cuda import _rust
 import onyx_cuda.generation as generation_module
 from onyx_cuda.generation import generate_tokens
-from onyx_cuda.model import load_model_pair
+from onyx_cuda.model import MODEL_ID, TARGET_MODEL_ID, load_model_pair
 from onyx_cuda.prefill import prefill
 from onyx_cuda.prompt import format_prompt
 from onyx_cuda.vocabulary import build_token_byte_vocabulary
@@ -52,7 +52,8 @@ EXPECTED_PROMPT_TOKEN_IDS = [
 ]
 
 
-def test_load_model_prompt_prefill_and_generation_on_cuda(monkeypatch):
+@pytest.mark.gpu
+def test_load_model_prompt_prefill_and_generation_on_cuda(monkeypatch, record_model_revision):
     device = torch.device("cuda:0")
     torch.cuda.set_device(device)
     torch.cuda.empty_cache()
@@ -63,6 +64,8 @@ def test_load_model_prompt_prefill_and_generation_on_cuda(monkeypatch):
     load_peak_allocated = torch.cuda.max_memory_allocated(device)
     loaded = loaded_pair.draft
     target = loaded_pair.target
+    record_model_revision(MODEL_ID, loaded)
+    record_model_revision(TARGET_MODEL_ID, target)
     target_revision = target.revision
 
     assert loaded.revision == loaded.model.config._commit_hash

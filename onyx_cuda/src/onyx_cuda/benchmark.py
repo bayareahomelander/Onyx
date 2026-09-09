@@ -5,6 +5,7 @@ import gc
 import json
 import platform
 import statistics
+import time
 from datetime import datetime, timezone
 from importlib.metadata import version
 from pathlib import Path
@@ -13,6 +14,7 @@ import torch
 import transformers
 
 from onyx_cuda.generation import generate_tokens
+from onyx_cuda.config import resolve_greedy_backend
 from onyx_cuda.model import (
     MODEL_ID,
     TARGET_MODEL_ID,
@@ -21,12 +23,13 @@ from onyx_cuda.model import (
 )
 from onyx_cuda.prompt import format_prompt
 from onyx_cuda.speculative import generate_speculative
-from onyx_cuda.vocabulary import build_token_byte_vocabulary
+from onyx_cuda.vocabulary import build_token_byte_vocabulary, get_token_byte_vocabulary
 
 WARMUPS = 1
 REPETITIONS = 3
 MAX_TOKENS = 32
 SPECULATIVE_GAMMAS = (1, 2, 4)
+COMPARISON_OUTPUT = Path("benchmarks/results/performance_comparison.json")
 PROMPTS = {
     "cuda_ready": "Reply with CUDA ready.",
     "gpu_summary": "In one concise sentence, explain what a GPU does.",
@@ -39,6 +42,23 @@ TARGET_CONSTRAINT_OUTPUT = Path(
     "benchmarks/results/phase4_target_constraint_gate.json"
 )
 SPECULATIVE_OUTPUT = Path("benchmarks/results/phase4_speculative_gate.json")
+
+
+def _comparison_settings() -> dict:
+    backend = resolve_greedy_backend()
+    return {
+        "warmups": WARMUPS, "repetitions": REPETITIONS, "max_tokens": MAX_TOKENS,
+        "temperature": 0.0, "top_p": 1.0, "greedy_backend": backend,
+        "dtype": "float16", "timing_contract": "generation-includes-validation-v2",
+        "cupy": version("cupy-cuda12x") if backend == "cuda" else None,
+    }
+
+
+def _require_matching_settings(baseline: dict) -> None:
+    if baseline.get("settings") != _comparison_settings():
+        raise RuntimeError(
+            "baseline settings, greedy backend, or timing contract differ; regenerate the baseline"
+        )
 
 
 def _run_prompt(
@@ -95,7 +115,11 @@ def _run_prompt(
     expected_reason = None
     for _ in range(REPETITIONS):
         torch.cuda.reset_peak_memory_stats(device)
+        torch.cuda.synchronize(device)
+        wall_started = time.perf_counter()
         result = run_generation(True)
+        torch.cuda.synchronize(device)
+        generation_wall_seconds = time.perf_counter() - wall_started
         if result.timings is None:
             raise RuntimeError("timing was not recorded")
 
@@ -119,6 +143,7 @@ def _run_prompt(
                 result.timings.decode_tokens_per_second
             ),
             "total_seconds": result.timings.total_seconds,
+            "generation_wall_seconds": generation_wall_seconds,
             "output_tokens_per_second": (
                 len(token_ids) / result.timings.total_seconds
             ),
@@ -181,15 +206,14 @@ def _run_prompt(
             run["time_to_first_token_seconds"] for run in runs
         ),
         "median_decode_tokens_per_second": statistics.median(decode_rates),
-        "median_total_seconds": statistics.median(
-            run["total_seconds"] for run in runs
+        "median_generation_wall_seconds": statistics.median(
+            run["generation_wall_seconds"] for run in runs
         ),
+        "median_total_seconds": statistics.median(run["total_seconds"] for run in runs),
         "median_output_tokens_per_second": statistics.median(
             run["output_tokens_per_second"] for run in runs
         ),
-        "peak_allocated_vram_bytes": max(
-            run["peak_allocated_vram_bytes"] for run in runs
-        ),
+        "peak_allocated_vram_bytes": max(run["peak_allocated_vram_bytes"] for run in runs),
         "stable": True,
     }
     if "grammar_compile_seconds" in runs[0]:
@@ -318,29 +342,54 @@ def _run_constraint_prompts(
     return [regex_result, json_result]
 
 
-def _run_speculative_gate(baseline_path: Path, output: Path, device) -> None:
-    if not baseline_path.is_file():
+def _run_speculative_gate(baseline_path: Path | None, output: Path, device) -> None:
+    if baseline_path is not None and not baseline_path.is_file():
         raise RuntimeError(
             f"target constraint baseline not found at {baseline_path}; "
             "run the target and target-constraint benchmarks first"
         )
-    baseline = json.loads(baseline_path.read_text(encoding="utf-8"))
+    baseline = (
+        json.loads(baseline_path.read_text(encoding="utf-8")) if baseline_path is not None else None
+    )
     pair = load_model_pair()
+    # Report the API's reusable CPU setup separately from GPU generation.
+
+    cold_setup, warm_setup = [], []
+    for _ in range(REPETITIONS):
+        get_token_byte_vocabulary.cache_clear()
+        started = time.perf_counter()
+        vocabulary = get_token_byte_vocabulary(pair.target.tokenizer, pair.target.model.config.vocab_size)
+        cold_setup.append(time.perf_counter() - started)
+        started = time.perf_counter()
+        assert (
+            get_token_byte_vocabulary(pair.target.tokenizer, pair.target.model.config.vocab_size)
+            is vocabulary
+        )
+        warm_setup.append(time.perf_counter() - started)
+    if baseline is None:
+        print("Measuring target baseline in the same process", flush=True)
+        baseline = {
+            "model": {"id": TARGET_MODEL_ID, "revision": pair.target.revision},
+            "settings": _comparison_settings(),
+            "device": {
+                "name": torch.cuda.get_device_name(device),
+                "total_vram_bytes": torch.cuda.get_device_properties(device).total_memory,
+            },
+            "unconstrained_prompts": [
+                _run_prompt(pair.target.model, pair.target.tokenizer, device, name, prompt)
+                for name, prompt in PROMPTS.items()
+            ],
+            "constraint_prompts": _run_constraint_prompts(
+                pair.target.model, pair.target.tokenizer, device, vocabulary=vocabulary
+            ),
+        }
     target_model = {
         "id": TARGET_MODEL_ID,
         "revision": pair.target.revision,
     }
     if baseline.get("model") != target_model:
         raise RuntimeError("target constraint baseline model or revision does not match")
-    expected_settings = {
-        "warmups": WARMUPS,
-        "repetitions": REPETITIONS,
-        "max_tokens": MAX_TOKENS,
-        "temperature": 0.0,
-        "top_p": 1.0,
-    }
-    if baseline.get("settings") != expected_settings:
-        raise RuntimeError("target constraint baseline settings do not match")
+    _require_matching_settings(baseline)
     baseline_device = baseline.get("device", {})
     if (
         baseline_device.get("name") != torch.cuda.get_device_name(device)
@@ -350,38 +399,36 @@ def _run_speculative_gate(baseline_path: Path, output: Path, device) -> None:
         raise RuntimeError("target constraint baseline device does not match")
     target_prompts = baseline.get("unconstrained_prompts")
     target_constraints = baseline.get("constraint_prompts")
-    if not isinstance(target_prompts, list) or not isinstance(
-        target_constraints, list
-    ):
+    if not isinstance(target_prompts, list) or not isinstance(target_constraints, list):
         raise RuntimeError("target constraint baseline is missing prompt results")
     expected_prompts = target_prompts + target_constraints
     expected_by_name = {prompt["name"]: prompt for prompt in expected_prompts}
-    vocabulary = build_token_byte_vocabulary(
-        pair.target.tokenizer, pair.target.model.config.vocab_size
-    )
-
     gamma_results = []
-    for gamma in SPECULATIVE_GAMMAS:
-        prompts = [
-            _run_prompt(
+    for gamma in (0, *SPECULATIVE_GAMMAS):
+        print(f"Measuring gamma={gamma}", flush=True)
+        if gamma == 0:
+            prompts, constraint_prompts = target_prompts, target_constraints
+        else:
+            prompts = [
+                _run_prompt(
+                    pair.target.model,
+                    pair.target.tokenizer,
+                    device,
+                    name,
+                    prompt,
+                    draft_model=pair.draft.model,
+                    gamma=gamma,
+                )
+                for name, prompt in PROMPTS.items()
+            ]
+            constraint_prompts = _run_constraint_prompts(
                 pair.target.model,
                 pair.target.tokenizer,
                 device,
-                name,
-                prompt,
                 draft_model=pair.draft.model,
                 gamma=gamma,
+                vocabulary=vocabulary,
             )
-            for name, prompt in PROMPTS.items()
-        ]
-        constraint_prompts = _run_constraint_prompts(
-            pair.target.model,
-            pair.target.tokenizer,
-            device,
-            draft_model=pair.draft.model,
-            gamma=gamma,
-            vocabulary=vocabulary,
-        )
         measured_prompts = prompts + constraint_prompts
         _assert_baseline(
             measured_prompts,
@@ -390,20 +437,17 @@ def _run_speculative_gate(baseline_path: Path, output: Path, device) -> None:
         )
         for prompt in measured_prompts:
             target_prompt = expected_by_name[prompt["name"]]
-            target_seconds = statistics.median(
-                run["total_seconds"] for run in target_prompt["runs"]
+            timing_key = (
+                "median_generation_wall_seconds"
+                if "median_generation_wall_seconds" in target_prompt
+                else "median_total_seconds"
             )
+            target_seconds = target_prompt[timing_key]
             prompt["target_median_total_seconds"] = target_seconds
-            prompt["speedup_vs_target"] = (
-                target_seconds / prompt["median_total_seconds"]
-            )
+            prompt["speedup_vs_target"] = target_seconds / prompt[timing_key]
 
-        proposed = sum(
-            prompt["proposed_token_count"] for prompt in measured_prompts
-        )
-        accepted = sum(
-            prompt["accepted_proposal_count"] for prompt in measured_prompts
-        )
+        proposed = sum(prompt.get("proposed_token_count", 0) for prompt in measured_prompts)
+        accepted = sum(prompt.get("accepted_proposal_count", 0) for prompt in measured_prompts)
         gamma_results.append(
             {
                 "gamma": gamma,
@@ -413,30 +457,32 @@ def _run_speculative_gate(baseline_path: Path, output: Path, device) -> None:
                 "accepted_proposal_count": accepted,
                 "acceptance_rate": accepted / proposed if proposed else 0.0,
                 "speculative_iteration_count": sum(
-                    prompt["speculative_iteration_count"]
-                    for prompt in measured_prompts
+                    prompt.get("speculative_iteration_count", 0) for prompt in measured_prompts
                 ),
                 "median_output_tokens_per_second": statistics.median(
-                    prompt["median_output_tokens_per_second"]
-                    for prompt in measured_prompts
+                    prompt["median_output_tokens_per_second"] for prompt in measured_prompts
                 ),
                 "median_speedup_vs_target": statistics.median(
                     prompt["speedup_vs_target"] for prompt in measured_prompts
                 ),
                 "peak_allocated_vram_bytes": max(
-                    prompt["peak_allocated_vram_bytes"]
-                    for prompt in measured_prompts
+                    prompt["peak_allocated_vram_bytes"] for prompt in measured_prompts
                 ),
             }
         )
 
-    best = max(
-        gamma_results,
-        key=lambda result: (
-            result["median_output_tokens_per_second"],
-            -result["gamma"],
-        ),
-    )
+    # A general default must beat target-only across every measured case, with
+    # headroom for timing noise. Per-case winners remain visible in the report.
+    eligible = [
+        group
+        for group in gamma_results
+        if group["gamma"] == 0
+        or all(
+            prompt["speedup_vs_target"] >= 1.05
+            for prompt in group["unconstrained_prompts"] + group["constraint_prompts"]
+        )
+    ]
+    best = max(eligible, key=lambda group: group["median_speedup_vs_target"])
     results = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "models": {
@@ -453,24 +499,23 @@ def _run_speculative_gate(baseline_path: Path, output: Path, device) -> None:
         },
         "device": {
             "name": torch.cuda.get_device_name(device),
-            "total_vram_bytes": torch.cuda.get_device_properties(
-                device
-            ).total_memory,
+            "total_vram_bytes": torch.cuda.get_device_properties(device).total_memory,
         },
         "settings": {
-            "warmups": WARMUPS,
-            "repetitions": REPETITIONS,
-            "max_tokens": MAX_TOKENS,
-            "temperature": 0.0,
-            "top_p": 1.0,
-            "gammas": list(SPECULATIVE_GAMMAS),
+            **_comparison_settings(),
+            "gammas": [0, *SPECULATIVE_GAMMAS],
         },
-        "target_constraint_baseline": str(baseline_path),
+        "target_constraint_baseline": str(baseline_path) if baseline_path else "same-process",
+        "vocabulary_setup": {
+            "cold_median_seconds": statistics.median(cold_setup),
+            "warm_median_seconds": statistics.median(warm_setup),
+            "cache_max_entries": get_token_byte_vocabulary.cache_info().maxsize,
+        },
         "gamma_results": gamma_results,
         "best_gamma": best["gamma"],
         "best_gamma_criterion": (
-            "highest median per-prompt output tokens per second across the "
-            "three unconstrained, regex, and JSON cases"
+            "best median speedup among modes at least 5% faster on every case; "
+            "otherwise gamma=0 (target-only)"
         ),
     }
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -487,7 +532,8 @@ def _run_speculative_gate(baseline_path: Path, output: Path, device) -> None:
             f"target_ratio={result['median_speedup_vs_target']:.3f}x "
             f"peak={result['peak_allocated_vram_bytes']} bytes"
         )
-    print(f"best_gamma={best['gamma']} by measured median output throughput")
+    print(f"recommended_gamma={best['gamma']}: {results['best_gamma_criterion']}")
+    print(f"vocabulary_setup={results['vocabulary_setup']}")
 
 
 def main() -> None:
@@ -495,11 +541,21 @@ def main() -> None:
     parser.add_argument("--constraints", action="store_true")
     parser.add_argument("--target", action="store_true")
     parser.add_argument("--speculative", action="store_true")
+    parser.add_argument(
+        "--compare",
+        action="store_true",
+        help="Compare target-only and speculation in one process; no baseline files required",
+    )
     parser.add_argument("--baseline", type=Path)
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
     device = torch.device("cuda:0")
     torch.cuda.set_device(device)
+    if args.compare:
+        if args.target or args.constraints or args.speculative or args.baseline:
+            parser.error("--compare cannot be combined with other modes or --baseline")
+        _run_speculative_gate(None, args.output or COMPARISON_OUTPUT, device)
+        return
     if args.speculative:
         if args.target or args.constraints:
             parser.error("--speculative cannot be combined with --target or --constraints")
@@ -540,11 +596,7 @@ def main() -> None:
             "total_vram_bytes": torch.cuda.get_device_properties(device).total_memory,
         },
         "settings": {
-            "warmups": WARMUPS,
-            "repetitions": REPETITIONS,
-            "max_tokens": MAX_TOKENS,
-            "temperature": 0.0,
-            "top_p": 1.0,
+            **_comparison_settings(),
         },
     }
     printed_prompts = prompts
@@ -556,6 +608,7 @@ def main() -> None:
                 f"run the {'target' if args.target else 'default'} benchmark first"
             )
         baseline_results = json.loads(baseline.read_text(encoding="utf-8"))
+        _require_matching_settings(baseline_results)
         if baseline_results.get("model") != results["model"]:
             raise RuntimeError(f"{baseline_label} model or revision does not match")
         _assert_baseline(prompts, baseline_results, baseline_label)

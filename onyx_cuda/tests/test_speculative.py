@@ -134,7 +134,10 @@ def _run_scripted_constrained_speculation(
         "_initialize_grammar_constraint",
         lambda *args: (grammar, grammar.init_state()),
     )
-    monkeypatch.setattr(speculative_module, "apply_grammar_mask", _cpu_grammar_mask)
+    monkeypatch.setattr(
+        speculative_module, "grammar_argmax",
+        lambda scores, valid, **_: _cpu_grammar_mask(scores, valid).argmax(dim=-1),
+    )
     vocabulary = vocabulary or TokenByteVocabulary([b""] * 16, 0, 16)
     generate = generate_speculative_events if events else generate_speculative
     result = generate(
@@ -240,7 +243,7 @@ def test_speculative_options_fail_before_prefill(monkeypatch):
     )
 
     with pytest.raises(ValueError, match="gamma"):
-        generate_speculative(object(), object(), [0], 1, 0, [])
+        generate_speculative(object(), object(), [0], 1, -1, [])
     with pytest.raises(ValueError, match="max_tokens"):
         generate_speculative(object(), object(), [0], 0, 1, [])
     with pytest.raises(ValueError, match="token_byte_vocabulary"):
@@ -588,6 +591,7 @@ def test_scripted_draft_proposal_bounds_order_and_termination(
     assert cache.inputs == expected_inputs
 
 
+@pytest.mark.gpu
 def test_real_draft_proposal_matches_direct_greedy_prefix():
     pair = load_model_pair()
     prompt = format_prompt(
@@ -655,6 +659,7 @@ def test_scripted_target_verification_acceptance_and_cache_lengths(
     assert draft_cache.inputs == ([4] if accepted == 3 else [])
 
 
+@pytest.mark.gpu
 def test_real_speculation_matches_target_oracle_and_rejects_cleanly():
     pair = load_model_pair()
     prompt = format_prompt(

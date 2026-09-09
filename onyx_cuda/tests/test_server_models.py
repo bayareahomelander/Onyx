@@ -1,7 +1,5 @@
-import os
 import subprocess
 import sys
-from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
@@ -12,16 +10,11 @@ from onyx_cuda.server import (
     ChatCompletionResponse,
 )
 
-SRC_PATH = Path(__file__).resolve().parents[1] / "src"
-
-
 def test_server_import_does_not_load_a_model():
-    env = os.environ.copy()
-    existing = env.get("PYTHONPATH", "")
-    env["PYTHONPATH"] = os.pathsep.join(filter(None, [str(SRC_PATH), existing]))
     result = subprocess.run(
         [
             sys.executable,
+            "-I",
             "-c",
             "import sys\n"
             "import onyx_cuda.server as server\n"
@@ -36,7 +29,6 @@ def test_server_import_does_not_load_a_model():
             "assert hasattr(server, 'create_app')\n"
             "assert not hasattr(server, 'app')\n",
         ],
-        env=env,
         capture_output=True,
         text=True,
         check=False,
@@ -60,7 +52,7 @@ def test_valid_request_and_response_round_trip():
         "seed": None,
         "compact_json": False,
         "top_p": 0.9,
-        "n": 2,
+        "n": 1,
         "stop": ["END"],
     }
     request = ChatCompletionRequest.model_validate(request_payload)

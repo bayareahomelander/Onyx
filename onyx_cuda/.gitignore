@@ -1,2 +1,5 @@
 *.pdb
 benchmarks/results/
+validation/
+V1_PLAN.md
+!rust/Cargo.lock

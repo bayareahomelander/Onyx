@@ -10,7 +10,8 @@ from transformers import PreTrainedModel
 from transformers.cache_utils import Cache
 
 from onyx_cuda.cache import CacheState
-from onyx_cuda.masking import apply_grammar_mask
+from onyx_cuda.config import resolve_greedy_backend
+from onyx_cuda.masking import apply_grammar_mask, grammar_argmax
 from onyx_cuda.prefill import prefill
 from onyx_cuda.vocabulary import TokenByteVocabulary
 
@@ -163,8 +164,10 @@ def generate_token_events(
     regex: str | None = None,
     token_byte_vocabulary: TokenByteVocabulary | None = None,
     json_schema: str | None = None,
+    greedy_backend: str | None = None,
 ) -> Iterator[AcceptedTokenEvent | GenerationFinishedEvent]:
     """Generate at most max_tokens with greedy or top-p sampling."""
+    greedy_backend = resolve_greedy_backend(greedy_backend)
     _validate_generation_options(max_tokens, temperature, top_p, seed)
     grammar_requested = _validate_grammar_request(regex, token_byte_vocabulary, json_schema)
 
@@ -212,6 +215,7 @@ def generate_token_events(
             generator.manual_seed(seed)
 
         for step in range(max_tokens):
+            token_id = None
             if constraint is not None:
                 if constraint.is_match_state(grammar_state):
                     finish_reason = "stop"
@@ -225,13 +229,16 @@ def generate_token_events(
                 if measure:
                     torch.cuda.synchronize(logits.device)
                     mask_started_at = time.perf_counter()
-                    logits = apply_grammar_mask(logits, valid_token_ids)
-                    torch.cuda.synchronize(logits.device)
-                    mask_transfer_seconds += time.perf_counter() - mask_started_at
+                if temperature == 0:
+                    token_id = grammar_argmax(logits, valid_token_ids, backend=greedy_backend)
                 else:
                     logits = apply_grammar_mask(logits, valid_token_ids)
+                if measure:
+                    torch.cuda.synchronize(logits.device)
+                    mask_transfer_seconds += time.perf_counter() - mask_started_at
 
-            token_id = _sample_token(logits, temperature, top_p, generator)
+            if token_id is None:
+                token_id = _sample_token(logits, temperature, top_p, generator)
             token = token_id.item()
             if started_at is not None and time_to_first_token is None:
                 time_to_first_token = time.perf_counter() - started_at
@@ -268,6 +275,9 @@ def generate_token_events(
         if constraint is not None and grammar_state is not None:
             constraint.release_state(grammar_state)
 
+    if json_schema is not None and finish_reason != "length":
+        _validate_json_result(json_schema, token_byte_vocabulary, generated)
+
     timings = None
     if started_at is not None and time_to_first_token is not None:
         torch.cuda.synchronize(result.logits.device)
@@ -288,9 +298,6 @@ def generate_token_events(
             mask_transfer_seconds=mask_transfer_seconds,
         )
 
-    if json_schema is not None and finish_reason != "length":
-        _validate_json_result(json_schema, token_byte_vocabulary, generated)
-
     yield GenerationFinishedEvent(
         GenerationResult(generated, cache.past_key_values, finish_reason, timings)
     )
@@ -309,6 +316,7 @@ def generate_tokens(
     regex: str | None = None,
     token_byte_vocabulary: TokenByteVocabulary | None = None,
     json_schema: str | None = None,
+    greedy_backend: str | None = None,
 ) -> GenerationResult:
     """Collect the same incremental loop used by sampled streaming."""
     events = generate_token_events(
@@ -324,6 +332,7 @@ def generate_tokens(
         regex=regex,
         token_byte_vocabulary=token_byte_vocabulary,
         json_schema=json_schema,
+        greedy_backend=greedy_backend,
     )
     try:
         for event in events:

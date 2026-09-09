@@ -1,0 +1,65 @@
+name: Windows CUDA package
+
+on:
+  push:
+    paths: ["onyx_cuda/**", ".github/workflows/windows-cuda.yml"]
+  pull_request:
+    paths: ["onyx_cuda/**", ".github/workflows/windows-cuda.yml"]
+  workflow_dispatch:
+    inputs:
+      gpu:
+        description: "Run default and custom-kernel checks on a Windows CUDA 12.4 runner labeled onyx-cuda"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-2022
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12.10"
+          architecture: x64
+      - name: Build sdist and wheel; install and test in fresh environments
+        shell: pwsh
+        run: ./onyx_cuda/scripts/validate_windows.ps1 -Mode Cpu -OutputDirectory "${{ runner.temp }}/onyx-validation"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: windows-cpu-validation
+          path: |
+            ${{ runner.temp }}/onyx-validation/*.json
+            ${{ runner.temp }}/onyx-validation/*.xml
+            ${{ runner.temp }}/onyx-validation/*.log
+            ${{ runner.temp }}/onyx-validation/*.txt
+            ${{ runner.temp }}/onyx-validation/artifacts/*
+
+  gpu:
+    if: github.event_name == 'workflow_dispatch' && inputs.gpu
+    runs-on: [self-hosted, Windows, X64, onyx-cuda]
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12.10"
+          architecture: x64
+      - name: Default suite, required custom kernels, and benchmarks
+        shell: pwsh
+        run: ./onyx_cuda/scripts/validate_windows.ps1 -Mode Cuda -Benchmarks -OutputDirectory "${{ runner.temp }}/onyx-validation-${{ github.run_id }}-${{ github.run_attempt }}"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: windows-gpu-validation
+          path: |
+            ${{ runner.temp }}/onyx-validation-*/*.json
+            ${{ runner.temp }}/onyx-validation-*/*.xml
+            ${{ runner.temp }}/onyx-validation-*/*.log
+            ${{ runner.temp }}/onyx-validation-*/*.txt
+            ${{ runner.temp }}/onyx-validation-*/artifacts/*
+            ${{ runner.temp }}/onyx-validation-*/benchmarks/results/*

@@ -1,6 +1,7 @@
 import gc
 import json
 
+import pytest
 import torch
 
 from onyx_cuda.benchmark import MAX_TOKENS, PROMPTS
@@ -10,12 +11,14 @@ from onyx_cuda.prompt import format_prompt
 from onyx_cuda.vocabulary import build_token_byte_vocabulary
 
 
-def test_target_generation_oracle_constraints_and_memory():
+@pytest.mark.gpu
+def test_target_generation_oracle_constraints_and_memory(record_model_revision):
     device = torch.device("cuda:0")
     torch.cuda.set_device(device)
     torch.cuda.empty_cache()
     torch.cuda.reset_peak_memory_stats(device)
     loaded = load_model(TARGET_MODEL_ID)
+    record_model_revision(TARGET_MODEL_ID, loaded)
     eos_token_id = loaded.tokenizer.eos_token_id
     oracle_token_ids = {}
 

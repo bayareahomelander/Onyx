@@ -37,6 +37,7 @@ def test_cache_state_length_and_invalid_rollback():
     assert state.cache_position.tolist() == [0, 1]
 
 
+@pytest.mark.gpu
 def test_draft_and_target_cache_crop_replay_matches_clean_logits():
     pair = load_model_pair()
     prompt = format_prompt(

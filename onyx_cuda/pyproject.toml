@@ -13,6 +13,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+kernels = ["cupy-cuda12x==13.6.0"]
 server = [
     "fastapi==0.141.1",
     "pydantic==2.13.5",
@@ -31,6 +32,8 @@ features = ["extension-module"]
 python-source = "src"
 module-name = "onyx_cuda._rust"
 manifest-path = "rust/Cargo.toml"
+locked = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = ["gpu: requires an NVIDIA CUDA device (real models or CUDA tensors)"]

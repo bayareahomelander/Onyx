@@ -121,6 +121,7 @@ def test_non_streaming_chat_completion_returns_usage_reason_and_metrics(monkeypa
     }
     assert len(calls) == 1
     assert calls[0]["measure"] is True
+    assert calls[0]["greedy_backend"] == client.app.state.greedy_backend
     assert calls[0]["draft_model"] is engine.draft.model
     assert calls[0]["target_model"] is engine.target.model
 
@@ -495,6 +496,26 @@ def test_streaming_chunks_preserve_id_and_real_finish_reason(monkeypatch):
     assert calls[0]["stop"] == ["END"]
 
 
+@pytest.mark.parametrize("stream", [False, True])
+def test_requests_keep_application_backend_after_environment_changes(monkeypatch, stream):
+    engine = _engine(FakeTokenizer({(10,): "Hello"}))
+    if stream:
+        calls = _fake_stream(monkeypatch, [
+            SimpleNamespace(text="Hello"),
+            SimpleNamespace(result=_result([10], "eos")),
+        ])
+    else:
+        calls = _fake_generation(monkeypatch, [_result([10], "eos")])
+    with TestClient(create_app(engine=engine, greedy_backend="torch")) as client:
+        monkeypatch.setenv("ONYX_GREEDY_BACKEND", "invalid-after-startup")
+        response = client.post("/v1/chat/completions", json={
+            "messages": [{"role": "user", "content": "Hi"}], "stream": stream,
+        })
+        assert response.status_code == 200
+    arguments = calls[0]["arguments"] if stream else calls[0]
+    assert arguments["greedy_backend"] == "torch"
+
+
 def test_streaming_rejects_n_and_unknown_model_before_generation(monkeypatch):
     calls = _fake_stream(monkeypatch, [])
 
@@ -516,8 +537,8 @@ def test_streaming_rejects_n_and_unknown_model_before_generation(monkeypatch):
             json={"messages": [{"role": "user", "content": "Hi"}], "stream": True, "top_p": 0},
         )
 
-    assert many.status_code == 400
-    assert many.json() == {"detail": "stream=true supports only n=1"}
+    assert many.status_code == 422
+    assert "stream=true supports only n=1" in many.json()["detail"][0]["msg"]
     assert missing.status_code == 400
     assert "missing" in missing.json()["detail"]
     assert invalid.status_code == 422
@@ -796,6 +817,7 @@ def test_generation_errors_are_mapped_and_next_request_succeeds(
     assert len(calls) == 2
 
 
+@pytest.mark.gpu
 def test_real_cuda_two_client_requests_match_direct_generation_without_model_copies():
     from onyx_cuda.model import load_model_pair
     from onyx_cuda.speculative import generate_speculative
@@ -809,7 +831,7 @@ def test_real_cuda_two_client_requests_match_direct_generation_without_model_cop
         "max_tokens": 4,
     }
 
-    with TestClient(create_app(engine=pair)) as client:
+    with TestClient(create_app(engine=pair, gamma=2)) as client:
         with ThreadPoolExecutor(max_workers=2) as executor:
             responses = list(
                 executor.map(
@@ -823,7 +845,7 @@ def test_real_cuda_two_client_requests_match_direct_generation_without_model_cop
     assert registered.draft.model is pair.draft.model
     assert registered.target.model is pair.target.model
     request = ChatCompletionRequest.model_validate(payload)
-    arguments = prepare_generation(request, pair)
+    arguments = prepare_generation(request, pair, gamma=2)
     arguments["measure"] = True
     direct = generate_speculative(**arguments)
     expected = pair.target.tokenizer.decode(direct.token_ids, skip_special_tokens=True)
@@ -842,6 +864,7 @@ def test_real_cuda_two_client_requests_match_direct_generation_without_model_cop
         }
 
 
+@pytest.mark.gpu
 def test_real_uvicorn_api_phase_gate(monkeypatch):
     import socket
     import time
@@ -851,7 +874,8 @@ def test_real_uvicorn_api_phase_gate(monkeypatch):
     from onyx_cuda.model import load_model_pair
     from onyx_cuda.speculative import generate_speculative
 
-    pair = load_model_pair()
+    pair = load_model_pair(include_draft=False)
+    assert pair.draft is None
     app = create_app(engine=pair)
     sock = socket.socket()
     sock.bind(("127.0.0.1", 0))

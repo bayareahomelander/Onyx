@@ -3,6 +3,8 @@ import torch
 
 from onyx_cuda.masking import apply_grammar_mask
 
+pytestmark = pytest.mark.gpu
+
 
 @pytest.mark.parametrize(
     ("valid_token_ids", "expected"),

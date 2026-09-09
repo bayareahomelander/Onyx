@@ -3,9 +3,11 @@
 import asyncio
 import gc
 import json
+import os
 import queue
 import sys
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from decimal import Decimal
 from time import time
@@ -16,9 +18,44 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from onyx_cuda.config import initialize_greedy_backend, resolve_greedy_backend
+
 MODEL_ID = "onyx-speculative"
 SERVICE_VERSION = "0.1.0"
-GAMMA = 4
+GAMMA = 0
+# Conservative single-device API envelope. Programmatic generators are separate.
+MAX_OUTPUT_TOKENS = 1024
+MAX_CONTEXT_TOKENS = 2048
+MAX_CHOICES = 4
+MAX_ACTIVE_REQUESTS = 8
+STREAM_BUFFER_CHUNKS = 64
+
+
+class RequestCapacityMiddleware:
+    """Count requests through completion, including streaming and cancellation."""
+
+    def __init__(self, app, *, capacity: int):
+        self.app = app
+        self.capacity = capacity
+        self.active = 0
+
+    async def __call__(self, scope, receive, send):
+        if (scope["type"] != "http" or scope.get("method") != "POST"
+                or scope.get("path", "").rstrip("/") != "/v1/chat/completions"):
+            return await self.app(scope, receive, send)
+        # No await between checking and incrementing: admission is atomic on
+        # the application's event loop. Each process owns its own model/counter.
+        if self.active >= self.capacity:
+            response = JSONResponse(
+                status_code=429, content={"detail": "Generation capacity reached; retry later"},
+                headers={"Retry-After": "1"},
+            )
+            return await response(scope, receive, send)
+        self.active += 1
+        try:
+            await self.app(scope, receive, send)
+        finally:
+            self.active -= 1
 
 
 class ChatMessage(BaseModel):
@@ -56,9 +93,10 @@ class SchemaResponseFormat(BaseModel):
 class ChatCompletionRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
     model: str = MODEL_ID
-    messages: list[ChatMessage] = Field(min_length=1)
+    messages: list[ChatMessage] = Field(min_length=1, max_length=128)
     max_tokens: int = Field(
-        default=256, ge=1, validation_alias=AliasChoices("max_tokens", "max_completion_tokens")
+        default=256, ge=1, le=MAX_OUTPUT_TOKENS,
+        validation_alias=AliasChoices("max_tokens", "max_completion_tokens")
     )
     temperature: float = Field(default=0.0, ge=0, allow_inf_nan=False)
     stream: bool = False
@@ -70,7 +108,7 @@ class ChatCompletionRequest(BaseModel):
     compact_json: bool = True
     top_p: float = Field(default=1.0, gt=0, le=1, allow_inf_nan=False)
     seed: int | None = Field(default=None, ge=-(2**63), le=2**64 - 1)
-    n: int = Field(default=1, ge=1)
+    n: int = Field(default=1, ge=1, le=MAX_CHOICES)
     stop: list[str] | None = Field(default=None, max_length=4)
 
     @field_validator("stop", mode="before")
@@ -93,6 +131,10 @@ class ChatCompletionRequest(BaseModel):
 
     @model_validator(mode="after")
     def validate_options(self):
+        if sum(len(message.content) for message in self.messages) > 32768:
+            raise ValueError("Message content exceeds 32768 characters")
+        if self.stream and self.n != 1:
+            raise ValueError("stream=true supports only n=1")
         if (
             sum(value is not None for value in (self.regex, self.json_schema, self.response_format))
             > 1
@@ -156,10 +198,10 @@ class ChatCompletionChunk(BaseModel):
     choices: list[ChatCompletionChunkChoice]
 
 
-def _load_configured_engine() -> Any:
+def _load_configured_engine(gamma: int = GAMMA) -> Any:
     from onyx_cuda.model import load_model_pair
 
-    return load_model_pair()
+    return load_model_pair(include_draft=gamma > 0)
 
 
 def _release_cuda_memory() -> None:
@@ -233,20 +275,38 @@ def resolve_stop_sequences(stop: list[str] | None, tokenizer) -> list[list[int]]
     return sequences or None
 
 
-def prepare_generation(request: ChatCompletionRequest, engine) -> dict[str, Any]:
+def _request_prompt_token_ids(request: ChatCompletionRequest, engine) -> list[int]:
+    _text, token_ids = format_request_messages(request.messages, engine.target.tokenizer)
+    limit = MAX_CONTEXT_TOKENS
+    for loaded in (engine.target, engine.draft):
+        if loaded is not None:
+            context = getattr(getattr(loaded.model, "config", None), "max_position_embeddings", None)
+            if isinstance(context, int) and context > 0:
+                limit = min(limit, context)
+    if not token_ids or len(token_ids) + request.max_tokens > limit:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Prompt plus max_tokens must fit within {limit} tokens (prompt: {len(token_ids)})",
+        )
+    return token_ids
+
+
+def prepare_generation(request: ChatCompletionRequest, engine, *, gamma: int = GAMMA,
+                       prompt_token_ids: list[int] | None = None) -> dict[str, Any]:
     tokenizer = engine.target.tokenizer
-    _text, prompt_token_ids = format_request_messages(request.messages, tokenizer)
+    if prompt_token_ids is None:
+        prompt_token_ids = _request_prompt_token_ids(request, engine)
     json_schema = (
         json.dumps(request.effective_json_schema)
         if request.effective_json_schema is not None
         else None
     )
     arguments = {
-        "draft_model": engine.draft.model,
+        "draft_model": engine.draft.model if engine.draft is not None else None,
         "target_model": engine.target.model,
         "prompt_token_ids": prompt_token_ids,
         "max_tokens": request.max_tokens,
-        "gamma": GAMMA,
+        "gamma": gamma,
         "eos_token_ids": tokenizer.eos_token_id,
         "stop_sequences": resolve_stop_sequences(request.stop, tokenizer),
         "temperature": request.temperature,
@@ -304,20 +364,26 @@ def _generate(arguments: dict[str, Any]):
     return generate_speculative(**arguments)
 
 
-async def _off_event_loop(fn, *args):
-    worker = asyncio.create_task(asyncio.to_thread(fn, *args))
+async def _off_event_loop(fn, *args, executor=None):
+    worker = asyncio.get_running_loop().run_in_executor(executor, fn, *args)
     try:
         return await asyncio.shield(worker)
     except asyncio.CancelledError:
-        try:
-            await worker
-        except Exception:
-            pass
+        # Repeated cancellation must not detach live model work from its lock.
+        while not worker.done():
+            try:
+                await asyncio.shield(worker)
+            except asyncio.CancelledError:
+                continue
+            except Exception:
+                break
+        if not worker.cancelled():
+            worker.exception()  # Retrieve a failure even when the caller disconnected.
         raise
 
 
-async def _generate_off_event_loop(arguments: dict[str, Any]):
-    return await _off_event_loop(_generate, arguments)
+async def _generate_off_event_loop(arguments: dict[str, Any], executor=None):
+    return await _off_event_loop(_generate, arguments, executor=executor)
 
 
 def _completion_event_iter(arguments: dict[str, Any], tokenizer, stop: list[str] | None):
@@ -372,14 +438,16 @@ def _stream_error_payload(error: BaseException) -> str:
     return json.dumps({"error": {"message": "Internal server error", "type": "server_error"}})
 
 
-def _sse_events(request: ChatCompletionRequest, engine):
+def _sse_events(request: ChatCompletionRequest, engine, *, gamma: int = GAMMA,
+                greedy_backend: str | None = None, prompt_token_ids: list[int] | None = None):
     completion_id = f"chatcmpl-{uuid4().hex[:12]}"
     created = int(time())
     model = request.model
     events = None
     try:
         yield _sse(_chunk_json(completion_id, created, model, role="assistant"))
-        arguments = prepare_generation(request, engine)
+        arguments = prepare_generation(request, engine, gamma=gamma, prompt_token_ids=prompt_token_ids)
+        arguments["greedy_backend"] = greedy_backend
         arguments["measure"] = True
         events = _completion_event_iter(arguments, engine.target.tokenizer, request.stop)
         finish_reason = None
@@ -409,49 +477,65 @@ def _sse_events(request: ChatCompletionRequest, engine):
             close()
 
 
-async def _stream_chat_completion(app: FastAPI, request: ChatCompletionRequest, engine):
+async def _stream_chat_completion(app: FastAPI, request: ChatCompletionRequest, engine,
+                                  prompt_token_ids: list[int] | None = None):
     lock = app.state.engine_locks[request.model]
     await lock.acquire()
     cancelled = threading.Event()
-    items: queue.Queue[str | None] = queue.Queue()
+    items: queue.Queue[str | None] = queue.Queue(maxsize=STREAM_BUFFER_CHUNKS)
+
+    def put(chunk: str | None) -> bool:
+        while not cancelled.is_set():
+            try:
+                items.put(chunk, timeout=0.05)
+                return True
+            except queue.Full:
+                continue
+        return False
 
     def worker() -> None:
-        stream = _sse_events(request, engine)
+        stream = _sse_events(
+            request, engine, gamma=app.state.speculative_gamma,
+            greedy_backend=app.state.greedy_backend,
+            prompt_token_ids=prompt_token_ids,
+        )
         try:
             for chunk in stream:
-                if cancelled.is_set():
+                if not put(chunk):
                     break
-                items.put(chunk)
         except Exception as error:
-            items.put(_sse(_stream_error_payload(error)))
-            items.put(_sse("[DONE]"))
+            put(_sse(_stream_error_payload(error)))
+            put(_sse("[DONE]"))
         finally:
             stream.close()
-            items.put(None)
+            put(None)
 
-    thread = threading.Thread(target=worker)
-    thread.start()
+    future = None
     try:
+        future = app.state.inference_executor.submit(worker)
         while True:
-            chunk = await asyncio.to_thread(items.get)
+            try:
+                chunk = await asyncio.to_thread(items.get, True, 0.05)
+            except queue.Empty:
+                continue
             if chunk is None:
                 break
             yield chunk
     finally:
         cancelled.set()
-        # ponytail: poll-join; ASGI cancel scopes cancel executor futures
-        while thread.is_alive():
+        # Keep model ownership until the producer has closed its iterator.
+        while future is not None and not future.done():
             try:
-                await asyncio.sleep(0)
+                await asyncio.sleep(0.01)
             except asyncio.CancelledError:
                 continue
         lock.release()
 
 
 def _build_vocabulary(tokenizer, logits_vocab_size):
-    from onyx_cuda.vocabulary import build_token_byte_vocabulary
+    from onyx_cuda.vocabulary import get_token_byte_vocabulary
 
-    return build_token_byte_vocabulary(tokenizer, logits_vocab_size)
+    return get_token_byte_vocabulary(tokenizer, logits_vocab_size)
 
 
 async def _invalid_request(_request, error: ValueError) -> JSONResponse:
@@ -473,23 +557,45 @@ def create_app(
     *,
     engine: Any | None = None,
     load_engine: Callable[[], Any] | None = None,
+    gamma: int | None = None,
+    greedy_backend: str | None = None,
 ) -> FastAPI:
+    greedy_backend = resolve_greedy_backend(greedy_backend)
+    if gamma is None:
+        try:
+            gamma = int(os.environ.get("ONYX_SPECULATIVE_GAMMA", str(GAMMA)))
+        except ValueError as error:
+            raise ValueError("ONYX_SPECULATIVE_GAMMA must be a nonnegative integer") from error
+    if isinstance(gamma, bool) or not isinstance(gamma, int) or gamma < 0:
+        raise ValueError("gamma must be a nonnegative integer (0 disables speculation)")
     loader = load_engine
     if loader is None:
         loaded = engine
+        injected = engine is not None
 
         def loader() -> Any:
-            if loaded is not None:
-                return loaded
-            return _load_configured_engine()
+            nonlocal loaded
+            if injected:
+                if loaded is None:
+                    raise RuntimeError("Injected engine already consumed; use load_engine to restart the app")
+                # Transfer ownership to app.state. Keeping this closure's copy
+                # would retain GPU weights even after lifespan shutdown.
+                result, loaded = loaded, None
+                return result
+            return _load_configured_engine(gamma)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
+        initialize_greedy_backend(greedy_backend)
         app.state.engines = {MODEL_ID: loader()}
         app.state.engine_locks = {model_id: asyncio.Lock() for model_id in app.state.engines}
+        # Reuse CUDA/cuBLAS thread-local state across every generation mode.
+        app.state.inference_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="onyx-inference")
         try:
             yield
         finally:
+            app.state.inference_executor.shutdown(wait=True)
+            del app.state.inference_executor
             app.state.engine_locks.clear()
             app.state.engines.clear()
             _release_cuda_memory()
@@ -500,6 +606,9 @@ def create_app(
         version=SERVICE_VERSION,
         lifespan=lifespan,
     )
+    app.state.speculative_gamma = gamma
+    app.state.greedy_backend = greedy_backend
+    app.add_middleware(RequestCapacityMiddleware, capacity=MAX_ACTIVE_REQUESTS)
     app.add_exception_handler(ValueError, _invalid_request)
     app.add_exception_handler(OSError, _service_unavailable)
     app.add_exception_handler(RuntimeError, _service_unavailable)
@@ -511,6 +620,15 @@ def create_app(
             "status": "ok",
             "service": "Onyx CUDA API",
             "version": SERVICE_VERSION,
+            "speculative_gamma": app.state.speculative_gamma,
+            "greedy_backend": app.state.greedy_backend,
+            "limits": {
+                "max_output_tokens": MAX_OUTPUT_TOKENS,
+                "max_context_tokens": MAX_CONTEXT_TOKENS,
+                "max_choices": MAX_CHOICES,
+                "max_active_requests": MAX_ACTIVE_REQUESTS,
+                "stream_buffer_chunks": STREAM_BUFFER_CHUNKS,
+            },
             "endpoints": ["/", "/v1/models", "/v1/chat/completions"],
         }
 
@@ -530,6 +648,8 @@ def create_app(
 
     @app.post("/v1/chat/completions", response_model=ChatCompletionResponse)
     async def create_chat_completion(request: ChatCompletionRequest, http_request: Request):
+        engine = get_engine(app, request.model)
+        prompt_token_ids = _request_prompt_token_ids(request, engine)
         if request.regex is not None:
             from onyx_cuda import _rust
 
@@ -546,11 +666,8 @@ def create_app(
 
             _rust.validate_json_schema(json.dumps(request.effective_json_schema))
         if request.stream:
-            if request.n != 1:
-                raise HTTPException(status_code=400, detail="stream=true supports only n=1")
-            engine = get_engine(app, request.model)
             return StreamingResponse(
-                _stream_chat_completion(app, request, engine),
+                _stream_chat_completion(app, request, engine, prompt_token_ids),
                 media_type="text/event-stream",
                 headers={
                     "Cache-Control": "no-cache",
@@ -559,10 +676,11 @@ def create_app(
                 },
             )
 
-        engine = get_engine(app, request.model)
         async with app.state.engine_locks[request.model]:
             tokenizer = engine.target.tokenizer
-            arguments = prepare_generation(request, engine)
+            arguments = prepare_generation(request, engine, gamma=app.state.speculative_gamma,
+                                           prompt_token_ids=prompt_token_ids)
+            arguments["greedy_backend"] = app.state.greedy_backend
             arguments["measure"] = True
             prompt_tokens = len(arguments["prompt_token_ids"])
             completion_tokens = 0
@@ -570,7 +688,7 @@ def create_app(
             last_timings = None
 
             for index in range(request.n):
-                result = await _generate_off_event_loop(arguments)
+                result = await _generate_off_event_loop(arguments, app.state.inference_executor)
                 completion_tokens += len(result.token_ids)
                 last_timings = result.timings
                 output = tokenizer.decode(result.token_ids, skip_special_tokens=True)

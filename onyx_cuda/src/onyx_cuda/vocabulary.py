@@ -1,6 +1,7 @@
 """Tokenizer ID to UTF-8 byte vocabulary mapping."""
 
 import json
+from functools import lru_cache
 from typing import NamedTuple
 
 from transformers import PreTrainedTokenizerBase
@@ -11,6 +12,12 @@ class TokenByteVocabulary(NamedTuple):
     token_bytes: list[bytes]
     special_token_count: int
     empty_token_count: int
+
+
+@lru_cache(maxsize=2)
+def get_token_byte_vocabulary(tokenizer, logits_vocab_size) -> TokenByteVocabulary:
+    """Reuse vocabulary bytes for up to two immutable loaded tokenizer/width pairs."""
+    return build_token_byte_vocabulary(tokenizer, logits_vocab_size)
 
 
 def build_token_byte_vocabulary(

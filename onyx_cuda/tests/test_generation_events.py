@@ -38,6 +38,10 @@ def scripted_target(monkeypatch, tokens):
             ~torch.tensor([[index in valid for index in range(8)]]), -torch.inf
         ),
     )
+    monkeypatch.setattr(
+        generation, "grammar_argmax",
+        lambda scores, valid, **_: generation.apply_grammar_mask(scores, valid).argmax(dim=-1),
+    )
     return calls
 
 
@@ -88,6 +92,10 @@ def test_sampled_stop_tokens_are_never_emitted(monkeypatch):
 @pytest.mark.parametrize("budget,reason", [(1, "length"), (4, "stop")])
 def test_sampled_json_budget_and_split_unicode(monkeypatch, budget, reason):
     scripted_target(monkeypatch, [0, 1, 2, 3])
+    monkeypatch.setattr(
+        generation, "grammar_argmax",
+        lambda *_, **__: pytest.fail("Sampling must not call the greedy CUDA selector"),
+    )
     raw = [b'"', b"\xc3", b"\xa9", b'"', b"", b"", b"", b""]
     tokenizer = SimpleNamespace(
         decode=lambda ids, **_: b"".join(raw[i] for i in ids).decode("utf-8", errors="replace")
@@ -143,3 +151,52 @@ def test_closing_sampled_json_stream_releases_grammar_state(monkeypatch):
         with pytest.raises(ValueError):
             constraint.get_valid_token_ids(handle)
     assert calls == []
+
+
+@pytest.mark.parametrize("temperature", [0.0, 0.8])
+def test_gamma_zero_uses_the_target_stream_without_a_draft(monkeypatch, temperature):
+    calls = scripted_target(monkeypatch, [0, 1, 2])
+    events = generate_speculative_events(
+        None,
+        object(),
+        [0],
+        max_tokens=3,
+        gamma=0,
+        eos_token_ids=[],
+        temperature=temperature,
+    )
+    assert next(events).token_id == 0
+    assert calls == []
+    remaining = list(events)
+    assert [event.token_id for event in remaining[:-1]] == [1, 2]
+    assert remaining[-1].result.token_ids == [0, 1, 2]
+    assert remaining[-1].result.finish_reason == "length"
+
+
+def test_target_timing_includes_final_schema_validation(monkeypatch):
+    scripted_target(monkeypatch, [0, 1, 2, 3])
+    clock = [0.0]
+
+    def now():
+        clock[0] += 0.001
+        return clock[0]
+
+    original = generation._validate_json_result
+
+    def validate(*args):
+        original(*args)
+        clock[0] += 10.0
+
+    monkeypatch.setattr(generation.time, "perf_counter", now)
+    monkeypatch.setattr(generation.torch.cuda, "synchronize", lambda *_: None)
+    monkeypatch.setattr(generation, "_validate_json_result", validate)
+    model = SimpleNamespace(parameters=lambda: iter([torch.tensor(0)]))
+    result = generation.generate_tokens(
+        model, [0], 4, [], measure=True,
+        json_schema='{"type":"string","enum":["é"]}',
+        token_byte_vocabulary=TokenByteVocabulary(
+            [b'"', b"\xc3", b"\xa9", b'"'] + [b""] * 4, 0, 4
+        ),
+    )
+    assert result.finish_reason == "stop"
+    assert result.timings.total_seconds >= 10.0

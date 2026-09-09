@@ -13,6 +13,7 @@ from transformers import (
 
 from onyx_cuda.device import require_cuda
 from onyx_cuda.prompt import format_prompt
+from onyx_cuda.revisions import MODEL_REVISIONS
 from onyx_cuda.vocabulary import build_token_byte_vocabulary
 
 MODEL_ID = "Qwen/Qwen2.5-0.5B-Instruct"
@@ -30,17 +31,20 @@ class LoadedModel(NamedTuple):
 
 
 class LoadedModelPair(NamedTuple):
-    draft: LoadedModel
+    draft: LoadedModel | None
     target: LoadedModel
 
 
-def load_model(model_id: str = MODEL_ID) -> LoadedModel:
-    """Load one tokenizer and FP16 model on cuda:0 at a resolved revision."""
+def load_model(model_id: str = MODEL_ID, *, revision: str | None = None) -> LoadedModel:
+    """Load a pinned bundled model, or resolve an explicitly selected model/revision."""
     device = require_cuda()
-    config = AutoConfig.from_pretrained(model_id)
+    requested_revision = revision or MODEL_REVISIONS.get(model_id)
+    config = AutoConfig.from_pretrained(model_id, revision=requested_revision)
     revision = getattr(config, "_commit_hash", None)
     if not revision:
         raise RuntimeError(f"Could not resolve a revision for {model_id}")
+    if requested_revision in MODEL_REVISIONS.values() and revision != requested_revision:
+        raise RuntimeError(f"Resolved revision for {model_id} differs from the validation pin")
 
     tokenizer = AutoTokenizer.from_pretrained(model_id, revision=revision)
     model = AutoModelForCausalLM.from_pretrained(
@@ -88,8 +92,10 @@ def _require_compatible_models(draft: LoadedModel, target: LoadedModel) -> None:
         raise RuntimeError("Draft and target chat-template output differs")
 
 
-def load_model_pair() -> LoadedModelPair:
-    """Load and validate the fixed draft/target model pair on cuda:0."""
+def load_model_pair(*, include_draft: bool = True) -> LoadedModelPair:
+    """Load the target and, when requested, a compatible draft on cuda:0."""
+    if not include_draft:
+        return LoadedModelPair(None, load_model(TARGET_MODEL_ID))
     draft = load_model(MODEL_ID)
     target = load_model(TARGET_MODEL_ID)
     _require_compatible_models(draft, target)

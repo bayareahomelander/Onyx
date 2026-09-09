@@ -2,6 +2,7 @@ import json
 from types import SimpleNamespace
 
 import onyx_cuda.server as server
+import onyx_cuda.vocabulary as vocabulary_module
 from onyx_cuda.server import (
     ChatCompletionRequest,
     ChatMessage,
@@ -168,3 +169,26 @@ def test_prepare_generation_forwards_exact_arguments_and_json_schema(
     assert json.loads(constrained["json_schema"]) == schema
     assert constrained["token_byte_vocabulary"] is vocabulary
     assert captured == [(vocab_tokenizer, 4)]
+
+
+def test_vocabulary_cache_reuses_only_matching_tokenizer_and_width(monkeypatch):
+    calls = []
+
+    def build(tokenizer, width):
+        calls.append((tokenizer, width))
+        return object()
+
+    monkeypatch.setattr(vocabulary_module, "build_token_byte_vocabulary", build)
+    vocabulary_module.get_token_byte_vocabulary.cache_clear()
+    first, second = object(), object()
+    try:
+        value = server._build_vocabulary(first, 4)
+        assert server._build_vocabulary(first, 4) is value
+        assert len(calls) == 1
+        assert server._build_vocabulary(first, 5) is not value
+        server._build_vocabulary(second, 4)
+        assert vocabulary_module.get_token_byte_vocabulary.cache_info().currsize == 2
+        assert server._build_vocabulary(first, 4) is not value  # oldest entry was evicted
+        assert calls == [(first, 4), (first, 5), (second, 4), (first, 4)]
+    finally:
+        vocabulary_module.get_token_byte_vocabulary.cache_clear()

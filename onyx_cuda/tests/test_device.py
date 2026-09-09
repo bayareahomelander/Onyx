@@ -6,6 +6,7 @@ from onyx_cuda.generation import generate_tokens
 from onyx_cuda.prefill import prefill
 
 
+@pytest.mark.gpu
 def test_require_cuda_returns_first_cuda_device():
     assert require_cuda() == torch.device("cuda:0")
 

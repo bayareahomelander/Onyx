@@ -7,7 +7,6 @@
 use regex_automata::dfa::{dense, Automaton};
 use regex_automata::util::primitives::StateID;
 use serde_json::Value;
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::constraint::{ConstraintEngine, ConstraintError};
@@ -326,7 +325,7 @@ pub enum Scope {
 
 /// a JSON schema constraint engine using stack-based scopes
 pub struct JsonEngine {
-    vocab: Arc<HashMap<usize, Vec<u8>>>,
+    vocab: Arc<Vec<Vec<u8>>>,
     vocab_size: usize,
     root_blueprint: Arc<SchemaBlueprint>,
     root_value_blueprint: Arc<PropertyBlueprint>,
@@ -348,15 +347,11 @@ impl JsonEngine {
         let root_value_blueprint = Arc::new(PropertyBlueprint::from_value("_root", &schema));
 
         let vocab_size = vocabulary.len();
-        let mut vocab = HashMap::with_capacity(vocab_size);
-        for (id, bytes) in vocabulary.into_iter().enumerate() {
-            vocab.insert(id, bytes);
-        }
 
         let stack = vec![Scope::Root];
 
         Ok(JsonEngine {
-            vocab: Arc::new(vocab),
+            vocab: Arc::new(vocabulary),
             vocab_size,
             root_blueprint,
             root_value_blueprint,
@@ -1081,12 +1076,27 @@ impl ConstraintEngine for JsonEngine {
         }
 
         let mut valid_tokens = Vec::new();
-
-        for token_id in 0..self.vocab_size {
-            if let Some(bytes) = self.vocab.get(&token_id) {
-                if !bytes.is_empty() && self.validate_token(bytes) {
-                    valid_tokens.push(token_id);
-                }
+        let mut first_bytes = [None; 256];
+        for (token_id, bytes) in self.vocab.iter().enumerate() {
+            let Some(&first) = bytes.first() else {
+                continue;
+            };
+            // Reject impossible initial bytes once, rather than cloning the parser
+            // for every token with that prefix. Surviving tokens still receive the
+            // full parser and completed-document validation.
+            let allowed = *first_bytes[first as usize].get_or_insert_with(|| {
+                let mut stack = self.stack.clone();
+                let mut finished = self.finished;
+                Self::validate_byte_static(
+                    &self.root_blueprint,
+                    &self.root_value_blueprint,
+                    &mut stack,
+                    &mut finished,
+                    first,
+                )
+            });
+            if allowed && self.validate_token(bytes) {
+                valid_tokens.push(token_id);
             }
         }
 
@@ -1096,7 +1106,7 @@ impl ConstraintEngine for JsonEngine {
     fn advance(&mut self, token_id: usize) -> Result<(), ConstraintError> {
         let bytes = self
             .vocab
-            .get(&token_id)
+            .get(token_id)
             .ok_or_else(|| ConstraintError::InvalidTokenId {
                 token_id,
                 vocab_size: self.vocab_size,
@@ -1150,6 +1160,53 @@ impl ConstraintEngine for JsonEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prefix_filter_matches_full_token_validation() {
+        let mut vocabulary: Vec<Vec<u8>> = (0..=255).map(|byte| vec![byte]).collect();
+        vocabulary.extend([
+            vec![],
+            b"true".to_vec(),
+            b"null".to_vec(),
+            b"1e+2".to_vec(),
+            b"01".to_vec(),
+            b"\"\\u00e9\"".to_vec(),
+            "\"é🚀\"".as_bytes().to_vec(),
+            b"[1,]".to_vec(),
+            b"{} \n".to_vec(),
+            b"\"a\":1}".to_vec(),
+        ]);
+        for (schema, document) in [
+            (r#"{"type":"string","maxLength":2}"#, "\"é🚀\""),
+            (r#"{"type":"string","pattern":"^é$"}"#, "\"\\u00e9\""),
+            (r#"{"enum":[1,10]}"#, "10"),
+            (r#"{"type":"number"}"#, "1e+2"),
+            (
+                r#"{"type":"object","properties":{"a":{"type":"array","items":{"enum":[1,10]},"minItems":2}},"required":["a"]}"#,
+                "{\"a\":[1,10]}",
+            ),
+        ] {
+            let mut engine = JsonEngine::new(vocabulary.clone(), schema).unwrap();
+            for byte in document.bytes().map(Some).chain(std::iter::once(None)) {
+                let reference: Vec<usize> = engine
+                    .vocab
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(id, token)| engine.validate_token(token).then_some(id))
+                    .collect();
+                assert_eq!(
+                    engine.get_valid_tokens(),
+                    reference,
+                    "{schema}: {:?}",
+                    engine.output
+                );
+                if let Some(byte) = byte {
+                    engine.advance(byte as usize).unwrap();
+                }
+            }
+            assert!(engine.is_finished());
+        }
+    }
 
     fn make_typed_vocab() -> Vec<Vec<u8>> {
         vec![
