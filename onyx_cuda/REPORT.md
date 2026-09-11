@@ -12,6 +12,12 @@ Model selection applies only to Windows. With no settings, the API still loads
 the pinned Qwen2.5 1.5B target; gamma 0 avoids loading any draft. A positive
 `ONYX_SPECULATIVE_GAMMA` loads the selected draft as well.
 
+Available VRAM does not change these defaults, and the server does not prompt
+you to choose a larger model. To use a larger compatible target or draft/target
+pair, explicitly configure the settings below before startup. Start with
+[preflight and GPU validation](#model-validation-and-support-levels) to check
+your chosen configuration.
+
 | Environment variable | Default |
 | --- | --- |
 | `ONYX_TARGET_MODEL` | `Qwen/Qwen2.5-1.5B-Instruct` |
@@ -90,6 +96,131 @@ and `validate_windows.ps1` deliberately isolate model-selection variables so
 release validation continues to use bundled pins. The script restores the
 caller's environment afterward. Custom configurations remain experimental until
 their own target-baseline, structured-output, and resource checks pass.
+
+## Model validation and support levels
+
+Model size and family name alone do not establish compatibility. These commands
+let a small-GPU machine check metadata and a larger-GPU machine supply runtime
+evidence. They do not change server defaults or automatically choose models.
+
+| Level | Evidence |
+| --- | --- |
+| Prechecked | Configuration/tokenizer checks, causal-LM construction on the meta device, and pair compatibility if requested; no weights or CUDA execution |
+| Startup-verified | Actual selected weights passed the loader's CUDA forward, cache extension, crop, and replay checks |
+| Tested | The selected-model validator completed every recorded case on the reported OS/GPU, revisions, and settings |
+
+These are scoped results, not universal certifications. A failed report can show
+`support_level: startup-verified` because startup passed before a later case
+failed. Always inspect `status` and the individual `checks`. A precheck failure
+may be an access/download problem or a limitation of the installed runtime;
+it does not necessarily mean the model can never work.
+
+### Preflight without model weights
+
+From an installed `onyx_cuda` environment (CPU PyTorch is sufficient):
+
+```powershell
+.\.venv\Scripts\python.exe -m onyx_cuda.preflight --target-model Qwen/Qwen2.5-7B-Instruct --vram-gib 32 --output validation/7b-preflight.json
+```
+
+Only configuration and tokenizer assets download. The command reuses the loader's
+repository-ID, revision, quantization, tokenizer, and chat-template checks. It
+constructs a weightless model skeleton with the installed Transformers to check
+architecture support and count parameters. Custom remote code is disabled.
+It does not download pretrained weights, run a forward pass, or initialize CUDA.
+
+`--gamma 0` (the default) checks only the target. Positive gamma also checks the
+draft and applies the exact pair compatibility checks used at startup. Both
+commands accept `--target-model`, `--target-revision`, `--draft-model`, and
+`--draft-revision`; explicit values override their corresponding environment
+variables, then bundled defaults apply. Gamma defaults to 0 and the runtime
+validator's selector defaults to `torch`, independently of environment variables.
+Select speculation with `--gamma`; select the optional kernel explicitly with
+`--greedy-backend cuda` on the runtime validator.
+
+The memory report separates FP16 parameter storage, model buffers, and a
+conventional full-attention KV estimate for known cache layouts. Unknown KV
+layouts report null. The KV estimate assumes batch 1 and the chosen context
+size plus gamma; sliding/hybrid implementations can use different amounts.
+`--context-tokens` defaults to 2048. Activations, attention workspaces, allocator
+reserve, driver/desktop use, and other processes are not estimated. `--vram-gib`
+is an optional hypothetical capacity in binary GiB: weights exceeding that
+capacity are flagged, but remaining capacity never produces a guarantee of fit.
+A successful precheck returns exit code 0 even when its memory advisory says
+the weights exceed capacity; failed checks return 1.
+
+### Runtime validation on the intended GPU
+
+Install the package with its `[server]` extra and CUDA PyTorch, or use the
+documented development environment. Stop other model processes and run serially.
+The runtime command performs its own preflight and uses those resolved immutable
+revisions for all subsequent weight loads. To reproduce a preflight from another
+machine, transfer its JSON report and explicitly reuse its model IDs/revisions:
+
+```powershell
+$preflight = Get-Content validation/7b-preflight.json -Raw | ConvertFrom-Json
+.\.venv\Scripts\python.exe -m onyx_cuda.validate_model --target-model $preflight.models.target.id --target-revision $preflight.models.target.revision --output validation/7b-runtime.json
+
+# Bundled speculative pair; use explicit draft ID/revision flags for a custom pair:
+.\.venv\Scripts\python.exe -m onyx_cuda.validate_model --gamma 2 --output validation/bundled-pair-runtime.json
+```
+
+Every report path must be new; existing evidence is never overwritten. An
+interrupted run leaves an incomplete marker. On failure, the terminal gives the
+exception details and the report records the failing stage and exception type.
+An unsuccessful runtime validation returns exit code 1.
+
+The runtime checks use production code and the existing benchmark prompt corpus:
+
+- Model loading and startup cache probes, with actual identities and precision.
+- A synthetic batch-1 cache extension/crop/replay probe at `--context-tokens`
+  (default 2048; runtime range 64 through 2048), separately for target and draft.
+- Ordinary greedy generation, regex, supported JSON Schema, and seeded top-p
+  sampling; constrained cases must finish successfully, not merely return partial
+  output with a `length` finish reason.
+- Exact selected-generator token IDs and finish reasons against a same-process
+  target-only oracle, plus incremental text decoding agreement.
+- In-process HTTP completion and SSE agreement, including a required successful
+  finish event before `[DONE]`; an SSE error never counts as success.
+- For positive gamma, a deliberately rejected proposal followed by target and
+  draft cache replay comparisons, even if the two models are identical.
+
+All generation checks share the API's persistent inference worker. Reports
+contain dependency versions, OS, GPU/VRAM, CUDA runtime, model revisions,
+settings, per-case outcomes, and peak allocated/reserved PyTorch memory. They
+include the source commit and dirty flag when run from a checkout; installed
+wheels without Git metadata report null and always include hashes of the actual
+Python/native package files. They omit local paths, private prompts, generated
+text, and raw exception messages. Output hashes and token counts permit comparison.
+Reports stay under the Git-ignored `validation/` directory unless another path
+is explicitly supplied. Nothing is uploaded automatically.
+
+This selected-model check is distinct from the full bundled regression suite and
+fresh-install delivery gate. It does not exhaust the schema subset, stress every
+context/workload, measure network streaming latency/disconnections, or establish
+a performance gain. Use the existing benchmark commands for timings and the
+full regression suite for cancellation, backpressure, and other service contracts.
+A Linux CUDA result is Linux evidence; Windows support needs a Windows run.
+
+### Current evidence and larger-model contributions
+
+The bundled Qwen2.5 1.5B target and 0.5B draft have prior full Windows validation
+on the 6 GB RTX 4050 at the pins in `src/onyx_cuda/revisions.py`. Target-only
+remains the default. The selected-model workflow can extend the evidence to new
+configurations without changing those release tests.
+
+A metadata-only check of Qwen2.5 7B Instruct at revision
+`a09a35458c702b33eeacc393d103063234e8bc28` passed locally. This is **prechecked**,
+not GPU-tested. Its estimated FP16 weights alone occupy 15,231,233,024 bytes.
+Pairing that target with the bundled 0.5B draft fails the current compatibility
+contract: their logits widths are 152064 and 151936. More VRAM does not resolve
+that mismatch, and the engine does not remap or pad their vocabularies.
+
+To contribute a larger-model result, run the validator on the intended Windows
+GPU and share its JSON report after reviewing it. Identify the exact revisions,
+gamma, selector, context size, and source version. A result becomes an entry in
+the tested list only after its evidence is reviewed; model-family similarity or
+a preflight pass alone does not promote it.
 
 ## Installing a prebuilt wheel
 

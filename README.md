@@ -43,6 +43,11 @@ Windows defaults to Qwen2.5 1.5B target-only FP16 generation. The 0.5B draft
 model and custom CUDA token selector are optional; the tested Windows workload
 is fastest with target-only generation on the 6 GB RTX 4050.
 
+With more VRAM, you can explicitly select a larger compatible target or
+draft/target pair. Onyx does not automatically switch models or prompt you based
+on available VRAM. See the [Windows model-selection and validation guide](onyx_cuda/REPORT.md#model-validation-and-support-levels)
+to check a configuration and configure it at startup.
+
 Model weights download on first use. Run one server at a time on port 8000.
 
 ## Example

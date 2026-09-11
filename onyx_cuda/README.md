@@ -3,9 +3,15 @@
 The Windows/NVIDIA implementation of [Onyx](../README.md): structured LLM output
 with regex and JSON Schema constraints, an OpenAI-compatible API, and streaming.
 
-The default is Qwen2.5 1.5B target-only FP16 generation. A 0.5B draft model and
+By default, Onyx CUDA loads only the Qwen2.5 1.5B target in FP16. A 0.5B draft model and
 custom CUDA token selection are optional. Windows v1 (package 0.1.0) targets
 a 6 GB RTX 4050; see the [validation guide](REPORT.md#repeatable-windows-delivery-check).
+
+**To use a larger model**, select it explicitly with `ONYX_TARGET_MODEL` before
+starting the server. For a speculative pair, also set `ONYX_DRAFT_MODEL` and a
+positive `ONYX_SPECULATIVE_GAMMA`. Onyx does not automatically switch models or
+prompt you based on available VRAM. Use [preflight and GPU validation](REPORT.md#model-validation-and-support-levels)
+to check your chosen configuration, then apply the [startup settings](REPORT.md#selecting-models-at-startup).
 
 ## Requirements
 
@@ -67,6 +73,18 @@ From `onyx_cuda`, run the complete local suite:
 
 Fresh-install gates and benchmark commands are in the
 [validation guide](REPORT.md#repeatable-windows-delivery-check).
+
+To inspect another model without loading weights, then test it on a suitable GPU:
+
+```powershell
+.\.venv\Scripts\python.exe -m onyx_cuda.preflight --target-model Qwen/Qwen2.5-7B-Instruct --vram-gib 32 --output validation/7b-preflight.json
+# On the machine that will run the model; this downloads and loads its weights:
+.\.venv\Scripts\python.exe -m onyx_cuda.validate_model --target-model Qwen/Qwen2.5-7B-Instruct --output validation/7b-runtime.json
+```
+
+Preflight establishes eligibility, not GPU fit. Add `--gamma 2` and
+`--draft-model` to inspect/test a pair. Use the resolved revisions for repeatable
+runs; see [model validation and support levels](REPORT.md#model-validation-and-support-levels).
 
 ## Structure
 

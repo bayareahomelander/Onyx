@@ -45,12 +45,17 @@ class LoadedModelPair(NamedTuple):
     target: LoadedModel
 
 
-def load_model(model_id: str = MODEL_ID, *, revision: str | None = None) -> LoadedModel:
-    """Load a pinned bundled model, or resolve an explicitly selected model/revision."""
+class ModelMetadata(NamedTuple):
+    config: object
+    tokenizer: PreTrainedTokenizerBase
+    revision: str
+
+
+def inspect_model(model_id: str, *, revision: str | None = None) -> ModelMetadata:
+    """Resolve and validate configuration/tokenizer without loading weights or CUDA."""
     validate_model_id(model_id)
     if revision is not None and (not isinstance(revision, str) or not revision.strip() or revision != revision.strip()):
         raise ValueError("Model revision must be a nonempty string without surrounding whitespace")
-    device = require_cuda()
     requested_revision = revision or MODEL_REVISIONS.get(model_id)
     config = AutoConfig.from_pretrained(model_id, revision=requested_revision, trust_remote_code=False)
     revision = getattr(config, "_commit_hash", None)
@@ -66,6 +71,13 @@ def load_model(model_id: str = MODEL_ID, *, revision: str | None = None) -> Load
 
     tokenizer = AutoTokenizer.from_pretrained(model_id, revision=revision, trust_remote_code=False)
     _validate_tokenizer(tokenizer, config)
+    return ModelMetadata(config, tokenizer, revision)
+
+
+def load_model(model_id: str = MODEL_ID, *, revision: str | None = None) -> LoadedModel:
+    """Load a pinned bundled model, or resolve an explicitly selected model/revision."""
+    device = require_cuda()
+    config, tokenizer, revision = inspect_model(model_id, revision=revision)
     model = AutoModelForCausalLM.from_pretrained(
         model_id,
         revision=revision,
@@ -136,8 +148,16 @@ def describe_model_pair(pair) -> dict:
 
 
 def _require_compatible_models(draft: LoadedModel, target: LoadedModel) -> None:
-    draft_width = draft.model.config.vocab_size
-    target_width = target.model.config.vocab_size
+    require_compatible_metadata(
+        ModelMetadata(draft.model.config, draft.tokenizer, draft.revision),
+        ModelMetadata(target.model.config, target.tokenizer, target.revision),
+    )
+
+
+def require_compatible_metadata(draft: ModelMetadata, target: ModelMetadata) -> None:
+    """Apply the same pair contract before or after loading weights."""
+    draft_width = draft.config.vocab_size
+    target_width = target.config.vocab_size
     if draft_width != target_width:
         raise RuntimeError(
             f"Draft and target logits vocabulary sizes differ: "
