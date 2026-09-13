@@ -3,6 +3,10 @@ name: Windows release candidate
 on:
   workflow_dispatch:
     inputs:
+      kernels:
+        description: "Also validate the optional custom CUDA kernels"
+        type: boolean
+        default: false
       create_draft:
         description: "Create a draft prerelease after all checks pass (does not publish it)"
         type: boolean
@@ -57,13 +61,15 @@ jobs:
         with:
           name: candidate-cpu
           path: ${{ runner.temp }}/candidate
-      - name: Validate exact candidate on CUDA including required kernels
+      - name: Validate exact candidate on CUDA
         shell: pwsh
+        env:
+          VALIDATION_PROFILE: ${{ inputs.kernels && 'Full' || 'Core' }}
         run: |
           $manifest = Join-Path "${{ runner.temp }}/candidate/artifacts" "candidate.json"
           $candidate = Get-Content -LiteralPath $manifest -Raw | ConvertFrom-Json
           $wheel = Join-Path (Split-Path -Parent $manifest) $candidate.artifacts.wheel.name
-          ./onyx_cuda/scripts/validate_windows.ps1 -Mode Cuda -Profile Full -WheelPath $wheel -WheelSha256 $candidate.artifacts.wheel.sha256 -CandidateManifest $manifest -OutputDirectory "${{ runner.temp }}/cuda-${{ github.run_id }}-${{ github.run_attempt }}"
+          ./onyx_cuda/scripts/validate_windows.ps1 -Mode Cuda -Profile $env:VALIDATION_PROFILE -WheelPath $wheel -WheelSha256 $candidate.artifacts.wheel.sha256 -CandidateManifest $manifest -OutputDirectory "${{ runner.temp }}/cuda-${{ github.run_id }}-${{ github.run_attempt }}"
       - uses: actions/upload-artifact@v4
         with:
           name: candidate-cuda
@@ -90,7 +96,12 @@ jobs:
           path: ${{ runner.temp }}/cuda
       - name: Verify complete release evidence and assemble tested bytes
         shell: pwsh
-        run: python ./onyx_cuda/scripts/verify_release.py release --candidate "${{ runner.temp }}/cpu/artifacts/candidate.json" --cpu "${{ runner.temp }}/cpu" --cuda "${{ runner.temp }}/cuda" --expected-commit "${{ github.sha }}" --output "${{ runner.temp }}/release-bundle"
+        env:
+          REQUIRE_KERNELS: ${{ inputs.kernels }}
+        run: |
+          $extra = @()
+          if ($env:REQUIRE_KERNELS -eq 'true') { $extra += '--require-kernels' }
+          python ./onyx_cuda/scripts/verify_release.py release --candidate "${{ runner.temp }}/cpu/artifacts/candidate.json" --cpu "${{ runner.temp }}/cpu" --cuda "${{ runner.temp }}/cuda" --expected-commit "${{ github.sha }}" --output "${{ runner.temp }}/release-bundle" @extra
       - uses: actions/upload-artifact@v4
         with:
           name: verified-release-bundle

@@ -149,7 +149,7 @@ def test_corrupted_wheel_is_rejected(candidate_files):
         release.verify_candidate(manifest)
 
 
-def test_report_tampering_and_core_profile_block_promotion(candidate_files, reports, tmp_path):
+def test_report_tampering_and_explicit_kernel_requirement_block_promotion(candidate_files, reports, tmp_path):
     manifest, wheel = candidate_files
     candidate, root = reports
     disk = release.read(manifest)
@@ -181,9 +181,9 @@ def test_report_tampering_and_core_profile_block_promotion(candidate_files, repo
          "checks": [{"name": "cuda.available", "status": "failed"}]})
     release.seal(manifest, cpu, "Cpu", "Full")
     with pytest.raises(ValueError, match="kernel validation"):
-        release.verify_release(manifest, cpu, root, tmp_path / "bundle", "a" * 40)
+        release.verify_release(manifest, cpu, root, tmp_path / "bundle", "a" * 40, require_kernels=True)
     bundle = tmp_path / "development-bundle"
-    release.verify_release(manifest, cpu, root, bundle, "a" * 40, require_kernels=False)
+    release.verify_release(manifest, cpu, root, bundle, "a" * 40)
     assert release.digest(bundle / wheel.name) == release.digest(wheel)
     assert release.read(bundle / "release-evidence.json")["status"] == "passed"
     for line in (bundle / "SHA256SUMS.txt").read_text().splitlines():

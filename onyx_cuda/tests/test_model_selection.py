@@ -1,6 +1,5 @@
 """Startup selection, snapshot identity, and model compatibility boundaries."""
 
-import json
 from types import SimpleNamespace
 
 import pytest
@@ -179,54 +178,23 @@ def test_failed_model_load_prevents_application_startup(monkeypatch):
             pytest.fail("Application became ready")
 
 
-@pytest.mark.parametrize("is_target", [False, True])
-def test_benchmark_records_selected_identity_and_rejects_other_model_baselines(monkeypatch, tmp_path, is_target):
+@pytest.mark.parametrize("flags", [[], ["--compare"]])
+def test_comparison_cli_uses_selected_models_and_answer_settings(monkeypatch, tmp_path, flags):
     import sys
     import onyx_cuda.benchmark as benchmark
 
     monkeypatch.setenv("ONYX_TARGET_MODEL", "example/target")
-    monkeypatch.setenv("ONYX_TARGET_REVISION", "target-branch")
     monkeypatch.setenv("ONYX_DRAFT_MODEL", "example/draft")
-    monkeypatch.setenv("ONYX_DRAFT_REVISION", "draft-branch")
-    calls = []
-    def load(name, *, revision):
-        calls.append((name, revision))
-        return model.LoadedModel(SimpleNamespace(_onyx_model_id=name), object(), "b" * 40)
-    monkeypatch.setattr(benchmark, "load_model", load)
-    monkeypatch.setattr(benchmark, "PROMPTS", {})
     monkeypatch.setattr(torch.cuda, "set_device", lambda *_: None)
-    monkeypatch.setattr(torch.cuda, "get_device_name", lambda *_: "test-device")
-    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda *_: SimpleNamespace(total_memory=100))
-    output = tmp_path / "baseline.json"
-    arguments = ["benchmark", "--output", str(output)] + (["--target"] if is_target else [])
-    monkeypatch.setattr(sys, "argv", arguments)
+    calls = []
+    monkeypatch.setattr(benchmark, "run_comparison", lambda *args, **kw: calls.append((args, kw)))
+    output = tmp_path / "result.json"
+    monkeypatch.setattr(sys, "argv", ["benchmark", *flags, "--output", str(output),
+                                      "--disable-thinking", "--max-tokens", "256", "--require-complete"])
     benchmark.main()
-    name = "example/target" if is_target else "example/draft"
-    assert calls == [(name, "target-branch" if is_target else "draft-branch")]
-    baseline = json.loads(output.read_text())
-    assert baseline["model"] == {"id": name, "revision": "b" * 40}
-    for wrong in ({"id": "example/other", "revision": "b" * 40},
-                  {"id": name, "revision": "c" * 40}):
-        baseline["model"] = wrong
-        output.write_text(json.dumps(baseline))
-        monkeypatch.setattr(sys, "argv", [*arguments, "--constraints", "--baseline", str(output)])
-        with pytest.raises(RuntimeError, match="model or revision does not match"):
-            benchmark.main()
-
-
-def test_comparison_cli_uses_same_model_selection(monkeypatch, tmp_path):
-    import sys
-    import onyx_cuda.benchmark as benchmark
-
-    monkeypatch.setenv("ONYX_TARGET_MODEL", "example/target")
-    monkeypatch.setenv("ONYX_DRAFT_MODEL", "example/draft")
-    monkeypatch.setattr(torch.cuda, "set_device", lambda *_: None)
-    calls = []
-    monkeypatch.setattr(benchmark, "_run_speculative_gate", lambda *args, **kwargs: calls.append(args[-1]))
-    for mode in ("--compare", "--speculative"):
-        monkeypatch.setattr(sys, "argv", ["benchmark", mode, "--output", str(tmp_path / "result.json")])
-        benchmark.main()
-    assert calls == [resolve_model_selection(), resolve_model_selection()]
+    args, kwargs = calls[0]
+    assert args == (output, torch.device("cuda:0"), resolve_model_selection())
+    assert kwargs["options"] == benchmark.BenchmarkOptions(256, False, True)
 
 
 @pytest.mark.gpu

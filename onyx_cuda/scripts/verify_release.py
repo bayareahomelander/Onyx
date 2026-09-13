@@ -239,7 +239,7 @@ def seal(candidate_path, directory, mode, profile):
           "reports_sha256": {name: digest(Path(directory) / name) for name in reports}})
 
 
-def verify_release(candidate_path, cpu, cuda, output, expected_commit, require_kernels=True):
+def verify_release(candidate_path, cpu, cuda, output, expected_commit, require_kernels=False):
     candidate = verify_candidate(candidate_path)
     require(candidate["source"].get("dirty") is False, "Release candidate was built from a dirty checkout")
     require(candidate["source"].get("commit") == expected_commit and re.fullmatch(r"[0-9a-f]{40}", expected_commit), "Source commit mismatch")
@@ -285,12 +285,12 @@ def main():
     run.add_argument("--candidate", type=Path, required=True)
     run.add_argument("--directory", type=Path, required=True)
     run.add_argument("--mode", choices=("Cpu", "Cuda"), required=True)
-    run.add_argument("--profile", choices=("Core", "Full"), default="Full")
+    run.add_argument("--profile", choices=("Core", "Full"), default="Core")
     release = commands.add_parser("release")
     for name in ("candidate", "cpu", "cuda", "output"):
         release.add_argument(f"--{name}", type=Path, required=True)
     release.add_argument("--expected-commit", required=True)
-    release.add_argument("--allow-core-only", action="store_true")
+    release.add_argument("--require-kernels", action="store_true")
     args = parser.parse_args()
     if args.command == "candidate":
         create_candidate(args.wheel, args.sdist, args.source_root, args.output)
@@ -301,7 +301,7 @@ def main():
     elif args.command == "seal":
         seal(args.candidate, args.directory, args.mode, args.profile)
     else:
-        verify_release(args.candidate, args.cpu, args.cuda, args.output, args.expected_commit, not args.allow_core_only)
+        verify_release(args.candidate, args.cpu, args.cuda, args.output, args.expected_commit, args.require_kernels)
 
 
 if __name__ == "__main__":

@@ -3,7 +3,7 @@ param(
     [string]$Python = "python",
     [string]$OutputDirectory,
     [switch]$Benchmarks,
-    [ValidateSet("Core", "Full")][string]$Profile = "Full",
+    [ValidateSet("Core", "Full")][string]$Profile = "Core",
     [string]$WheelPath,
     [string]$WheelSha256,
     [string]$CandidateManifest
@@ -13,7 +13,6 @@ $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
 if ($env:OS -ne "Windows_NT") { throw "This validation entry point requires Windows." }
 if ($Benchmarks -and $Mode -ne "Cuda") { throw "Benchmarks require -Mode Cuda." }
-if ($Benchmarks -and $Profile -ne "Full") { throw "Benchmarks require the Full profile." }
 $project = Split-Path -Parent $PSScriptRoot
 $sourceRoot = Split-Path -Parent $project
 $verifier = Join-Path $PSScriptRoot "verify_release.py"
@@ -140,10 +139,10 @@ try {
             Invoke-Checked $consumerPython @("-I", (Join-Path $PSScriptRoot "smoke_windows_release.py"), "--output", "consumer-smoke.json")
         }
         if ($Benchmarks) {
-            Invoke-Checked $testPython @("-I", "-m", "onyx_cuda.benchmark", "--target")
-            Invoke-Checked $testPython @("-I", "-m", "onyx_cuda.benchmark", "--target", "--constraints")
-            Invoke-Checked $testPython @("-I", "-m", "onyx_cuda.benchmark", "--speculative")
-            Invoke-Checked $testPython @("-I", "-m", "onyx_cuda.benchmark_masking", "--models")
+            Invoke-Checked $testPython @("-I", "-m", "onyx_cuda.benchmark", "--compare")
+            if ($Profile -eq "Full") {
+                Invoke-Checked $testPython @("-I", "-m", "onyx_cuda.benchmark_masking", "--models")
+            }
         }
         Invoke-Checked $testPython @("-I", $verifier, "seal", "--candidate", $CandidateManifest,
             "--directory", $runRoot, "--mode", $Mode, "--profile", $Profile)

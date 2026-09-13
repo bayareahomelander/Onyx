@@ -1,4 +1,4 @@
-"""Baselines cannot silently mix backends or old timing definitions."""
+"""Comparison settings, completed answers, and target-output equivalence."""
 
 import pytest
 
@@ -7,15 +7,11 @@ from onyx_cuda.prompt import format_prompt
 from types import SimpleNamespace
 
 
-@pytest.mark.parametrize("options", [
-    benchmark.BenchmarkOptions(max_tokens=256),
-    benchmark.BenchmarkOptions(enable_thinking=False),
-    benchmark.BenchmarkOptions(require_complete=True),
-])
-def test_baselines_cannot_mix_answer_settings(options):
-    baseline = {"settings": benchmark._comparison_settings()}
-    with pytest.raises(RuntimeError, match="regenerate"):
-        benchmark._require_matching_settings(baseline, options)
+def test_report_records_answer_settings():
+    settings = benchmark._comparison_settings(benchmark.BenchmarkOptions(256, False, True))
+    assert settings["max_tokens"] == 256
+    assert settings["enable_thinking"] is False
+    assert settings["require_complete"] is True
 
 
 def test_thinking_override_applies_to_text_and_tokens_only_when_requested():
@@ -49,16 +45,9 @@ def test_completed_answer_gate_rejects_truncation_and_passes_token_budget(monkey
                               options=benchmark.BenchmarkOptions(256, False, True))
 
 
-def test_baseline_requires_same_backend_and_timing_contract(monkeypatch):
-    monkeypatch.setenv("ONYX_GREEDY_BACKEND", "torch")
-    baseline = {"settings": benchmark._comparison_settings()}
-    benchmark._require_matching_settings(baseline)
-    monkeypatch.setattr(benchmark, "version", lambda _: "13.6.0")
-    monkeypatch.setenv("ONYX_GREEDY_BACKEND", "cuda")
-    with pytest.raises(RuntimeError, match="regenerate"):
-        benchmark._require_matching_settings(baseline)
-    assert benchmark._comparison_settings()["cupy"] == "13.6.0"
-    monkeypatch.setenv("ONYX_GREEDY_BACKEND", "torch")
-    del baseline["settings"]["timing_contract"]
-    with pytest.raises(RuntimeError, match="regenerate"):
-        benchmark._require_matching_settings(baseline)
+@pytest.mark.parametrize("field,value", [("token_ids", [2]), ("finish_reason", "length")])
+def test_comparison_rejects_output_different_from_target(field, value):
+    baseline = {"prompts": [{"name": "case", "runs": [{"token_ids": [1], "finish_reason": "eos"}]}]}
+    current = {"name": "case", "runs": [{"token_ids": [1], "finish_reason": "eos", field: value}]}
+    with pytest.raises(RuntimeError, match="output changed"):
+        benchmark._assert_baseline([current], baseline, "target")

@@ -125,7 +125,11 @@ For a source/development install, run the complete local suite from `onyx_cuda`:
 
 For a fresh Windows build/install check, run
 `./scripts/validate_windows.ps1 -Mode Cuda -Profile Core -Python ./.venv/Scripts/python.exe`.
-See the [validation script](scripts/validate_windows.ps1) for optional profiles and wheel checks.
+Add `-Benchmarks` to run the same-process comparison. `-Profile Full` additionally
+checks the optional CUDA kernels; Core is the default.
+Routine GitHub CI builds the package and runs Rust/CPU tests. The manual
+[release workflow](../.github/workflows/windows-release.yml) verifies a candidate
+wheel on CPU and GPU, with kernel checks available as an opt-in input.
 
 To inspect another model without loading weights, then test it on a suitable GPU:
 
