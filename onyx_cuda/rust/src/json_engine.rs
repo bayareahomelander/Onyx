@@ -148,6 +148,41 @@ impl StringState {
         Some(StringStep::Character(character))
     }
 
+    /// A partial character in a property name must still encode the next
+    /// character of an allowed key, not merely be syntactically valid JSON.
+    fn can_complete_key(&self, remaining: &str) -> bool {
+        if self.pending.is_empty() {
+            return true;
+        }
+        let Some(character) = remaining.chars().next() else {
+            return false;
+        };
+        let mut utf8 = [0; 4];
+        if character
+            .encode_utf8(&mut utf8)
+            .as_bytes()
+            .starts_with(&self.pending)
+        {
+            return true;
+        }
+        let quoted = serde_json::to_string(&character.to_string()).expect("JSON character");
+        if quoted.as_bytes()[1..quoted.len() - 1].starts_with(&self.pending)
+            || (character == '/' && b"\\/".starts_with(&self.pending))
+        {
+            return true;
+        }
+        let mut utf16 = [0; 2];
+        let escaped: String = character
+            .encode_utf16(&mut utf16)
+            .iter()
+            .map(|unit| format!("\\u{unit:04x}"))
+            .collect();
+        escaped
+            .as_bytes()
+            .get(..self.pending.len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(&self.pending))
+    }
+
     fn advance(&mut self, byte: u8) -> Option<StringStep> {
         if self.pending.is_empty()
             && byte != b'"'
@@ -776,7 +811,10 @@ impl JsonEngine {
                                 None => return false,
                             }
                             return blueprint.allowed_keys.iter().any(|key| {
-                                key.starts_with(key_buffer.as_str()) && !used_keys.contains(key)
+                                !used_keys.contains(key)
+                                    && key.strip_prefix(key_buffer.as_str()).is_some_and(
+                                        |remaining| key_state.can_complete_key(remaining),
+                                    )
                             });
                         }
 
