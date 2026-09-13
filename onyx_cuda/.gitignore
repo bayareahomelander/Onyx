@@ -2,4 +2,5 @@
 benchmarks/results/
 validation/
 V1_PLAN.md
+windows-v1-release.md
 !rust/Cargo.lock

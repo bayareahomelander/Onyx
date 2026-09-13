@@ -17,12 +17,33 @@ to check your chosen configuration, then apply the [startup settings](REPORT.md#
 
 - Windows x64 and Python 3.12 x64
 - NVIDIA GPU and driver compatible with CUDA 12.4 PyTorch
-- Rust MSVC toolchain and Visual Studio Build Tools with the C++ workload
+- For source builds: Rust MSVC toolchain and Visual Studio Build Tools with the C++ workload
 
 The optional custom selector also requires CUDA Toolkit 12.4 with NVRTC/headers
 and CuPy. See the [kernel setup](REPORT.md#optional-sparse-cuda-token-selection).
 
 ## Setup
+
+### Install a prebuilt wheel
+
+When a Windows candidate is available on [GitHub Releases](https://github.com/bayareahomelander/Onyx/releases),
+download its CPython 3.12 x64 wheel and compare its SHA-256 with `SHA256SUMS.txt`.
+The release evidence lists the exact artifact and tested configurations. If no
+compatible release is listed, use the source installation below.
+
+From the directory containing the downloaded wheel:
+
+```powershell
+py -3.12 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install pip==26.1.2
+.\.venv\Scripts\python.exe -m pip install torch==2.6.0 --index-url https://download.pytorch.org/whl/cu124
+.\.venv\Scripts\python.exe -m pip install ".\onyx_cuda-0.1.0-cp312-cp312-win_amd64.whl[server]"
+```
+
+Use the filename of the release you downloaded. Installing a matching wheel
+requires no Rust, maturin, pytest, or Visual Studio build tools.
+
+### Build from a clone
 
 From the repository root, in PowerShell:
 
@@ -34,7 +55,9 @@ py -3.12 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -c requirements-validation.txt -e ".[dev]"
 ```
 
-Start the server:
+### Start the server
+
+After either installation method:
 
 ```powershell
 .\.venv\Scripts\python.exe -m uvicorn onyx_cuda.server:create_app --factory --host 127.0.0.1 --port 8000
@@ -63,9 +86,19 @@ Use `json_schema` for JSON constraints and `stream: true` for SSE. The API allow
 up to 1024 output tokens within a 2048-token prompt-plus-output budget. Partial
 output has `finish_reason: "length"`; see the [API contract](REPORT.md#api-options-and-completion-status).
 
+To see live SSE output in PowerShell, set `$body` to a request with `stream = $true`
+before converting it to JSON, then send it using:
+
+```powershell
+$body | curl.exe --no-buffer http://127.0.0.1:8000/v1/chat/completions -H "Content-Type: application/json" --data-binary "@-"
+```
+
+Generated text is in each event's `choices[0].delta.content`. For constrained
+JSON, wait for a successful `stop` finish event; `[DONE]` alone is insufficient.
+
 ## Validation
 
-From `onyx_cuda`, run the complete local suite:
+For a source/development install, run the complete local suite from `onyx_cuda`:
 
 ```powershell
 .\.venv\Scripts\python.exe -m pytest --require-cuda

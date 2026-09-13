@@ -36,7 +36,8 @@ python -m uvicorn onyx.server:app --host 127.0.0.1 --port 8000
 ### Windows setup
 
 Use the separate package in `onyx_cuda`. It requires Python 3.12 x64, an NVIDIA
-GPU, CUDA-enabled PyTorch, Rust MSVC, and Visual Studio C++ Build Tools.
+GPU, and CUDA-enabled PyTorch. Building from source also requires Rust MSVC and
+Visual Studio C++ Build Tools; a matching prebuilt Windows wheel avoids that build step.
 See the [Windows guide](onyx_cuda/README.md) for installation and startup commands.
 
 Windows defaults to Qwen2.5 1.5B target-only FP16 generation. The 0.5B draft

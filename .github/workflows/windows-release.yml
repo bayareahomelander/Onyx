@@ -1,0 +1,127 @@
+name: Windows release candidate
+
+on:
+  workflow_dispatch:
+    inputs:
+      create_draft:
+        description: "Create a draft prerelease after all checks pass (does not publish it)"
+        type: boolean
+        default: false
+      candidate_number:
+        description: "Prerelease candidate number"
+        type: string
+        default: "1"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-release
+  cancel-in-progress: false
+
+jobs:
+  cpu:
+    if: github.ref == 'refs/heads/main'
+    runs-on: windows-2022
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12.10"
+          architecture: x64
+      - name: Build candidate once and validate CPU installation
+        shell: pwsh
+        run: ./onyx_cuda/scripts/validate_windows.ps1 -Mode Cpu -OutputDirectory "${{ runner.temp }}/cpu"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: candidate-cpu
+          path: |
+            ${{ runner.temp }}/cpu/artifacts/*
+            ${{ runner.temp }}/cpu/*.json
+            ${{ runner.temp }}/cpu/*.xml
+            ${{ runner.temp }}/cpu/requirements-resolved.txt
+
+  cuda:
+    needs: cpu
+    if: github.ref == 'refs/heads/main'
+    runs-on: [self-hosted, Windows, X64, onyx-cuda]
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12.10"
+          architecture: x64
+      - uses: actions/download-artifact@v4
+        with:
+          name: candidate-cpu
+          path: ${{ runner.temp }}/candidate
+      - name: Validate exact candidate on CUDA including required kernels
+        shell: pwsh
+        run: |
+          $manifest = Join-Path "${{ runner.temp }}/candidate/artifacts" "candidate.json"
+          $candidate = Get-Content -LiteralPath $manifest -Raw | ConvertFrom-Json
+          $wheel = Join-Path (Split-Path -Parent $manifest) $candidate.artifacts.wheel.name
+          ./onyx_cuda/scripts/validate_windows.ps1 -Mode Cuda -Profile Full -WheelPath $wheel -WheelSha256 $candidate.artifacts.wheel.sha256 -CandidateManifest $manifest -OutputDirectory "${{ runner.temp }}/cuda-${{ github.run_id }}-${{ github.run_attempt }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: candidate-cuda
+          path: |
+            ${{ runner.temp }}/cuda-${{ github.run_id }}-${{ github.run_attempt }}/*.json
+            ${{ runner.temp }}/cuda-${{ github.run_id }}-${{ github.run_attempt }}/*.xml
+            ${{ runner.temp }}/cuda-${{ github.run_id }}-${{ github.run_attempt }}/requirements-resolved.txt
+
+  verify:
+    needs: [cpu, cuda]
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12.10"
+      - uses: actions/download-artifact@v4
+        with:
+          name: candidate-cpu
+          path: ${{ runner.temp }}/cpu
+      - uses: actions/download-artifact@v4
+        with:
+          name: candidate-cuda
+          path: ${{ runner.temp }}/cuda
+      - name: Verify complete release evidence and assemble tested bytes
+        shell: pwsh
+        run: python ./onyx_cuda/scripts/verify_release.py release --candidate "${{ runner.temp }}/cpu/artifacts/candidate.json" --cpu "${{ runner.temp }}/cpu" --cuda "${{ runner.temp }}/cuda" --expected-commit "${{ github.sha }}" --output "${{ runner.temp }}/release-bundle"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: verified-release-bundle
+          path: ${{ runner.temp }}/release-bundle/*
+
+  draft:
+    needs: verify
+    if: inputs.create_draft && github.ref == 'refs/heads/main'
+    runs-on: windows-2022
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: verified-release-bundle
+          path: ${{ runner.temp }}/release-bundle
+      - name: Create draft prerelease without rebuilding
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          CANDIDATE_NUMBER: ${{ inputs.candidate_number }}
+          SOURCE_COMMIT: ${{ github.sha }}
+        run: |
+          if ($env:CANDIDATE_NUMBER -notmatch '^[1-9][0-9]*$') { throw "Candidate number must be a positive integer." }
+          $bundle = "${{ runner.temp }}/release-bundle"
+          $evidence = Get-Content -LiteralPath (Join-Path $bundle "release-evidence.json") -Raw | ConvertFrom-Json
+          if ($evidence.status -ne 'passed' -or $evidence.candidate.source.commit -ne $env:SOURCE_COMMIT) { throw "Release evidence mismatch." }
+          $version = $evidence.candidate.version
+          if ($version -notmatch '^\d+\.\d+\.\d+$') { throw "Invalid package version." }
+          $tag = "onyx-cuda-v$version-rc.$env:CANDIDATE_NUMBER"
+          $assets = @(Get-ChildItem -LiteralPath $bundle -File | Where-Object Name -ne 'release-notes.md' | ForEach-Object FullName)
+          gh release create $tag @assets --draft --prerelease --target $env:SOURCE_COMMIT --title "Onyx CUDA $version RC $env:CANDIDATE_NUMBER" --notes-file (Join-Path $bundle "release-notes.md")
+          if ($LASTEXITCODE -ne 0) { throw "Draft release creation failed." }

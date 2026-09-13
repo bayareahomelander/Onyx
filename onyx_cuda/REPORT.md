@@ -483,6 +483,78 @@ publish packages.
 The required-kernel pass writes `pytest-kernels.xml` and
 `validation-kernels.json`, including the backend and CuPy version.
 
+### One candidate across CPU and CUDA
+
+The delivery script also writes `artifacts/candidate.json`, binding the wheel
+and source archive hashes to the source commit, source inputs, package version,
+build environment, and bundled model pins. Development builds are permitted,
+but a candidate built from a dirty checkout cannot pass release promotion.
+
+After the CPU build, validate the exact same wheel on the Windows GPU machine:
+
+```powershell
+$manifest = "C:\candidate\artifacts\candidate.json"
+$candidate = Get-Content -LiteralPath $manifest -Raw | ConvertFrom-Json
+$wheel = Join-Path (Split-Path -Parent $manifest) $candidate.artifacts.wheel.name
+./scripts/validate_windows.ps1 -Mode Cuda -WheelPath $wheel -WheelSha256 $candidate.artifacts.wheel.sha256 -CandidateManifest $manifest
+```
+
+Transfer the entire artifacts directory, including the source archive. Use the
+same source checkout for the validation harness. Hash and source checks run
+before installation; the existing-wheel mode does not rebuild or need Rust.
+Each environment is fresh, and installed package hashes must match the candidate.
+
+Both modes exercise the installed preflight command. CPU mode requires runtime
+validation to refuse CPU-only execution. CUDA mode also runs the selected-model
+validator with gamma 0 and 2, then creates a separate `[server]` consumer
+environment without pytest or maturin. It launches the normal Uvicorn CLI as
+an owned child, checks text/regex/JSON/SSE over loopback HTTP, and requires the
+child to shut down. Runtime logs stay local; generated reports omit raw errors.
+This smoke check complements the existing controlled incremental-stream test.
+
+`-Profile Full` is the default and retains required custom-kernel validation.
+`-Profile Core` is an explicit development option that omits CuPy and permits
+only optional sparse-kernel test skips. It cannot satisfy a full release gate.
+`-Benchmarks` requires CUDA and the Full profile. CUDA tests and consumer model
+processes run sequentially, including on the 6 GB device.
+
+Successful runs write `release-run.json`, binding the relevant report hashes to
+the candidate digest. Failed or incomplete runs cannot produce a passing receipt.
+To verify both receipts and assemble a release bundle without publishing:
+
+```powershell
+$commit = git rev-parse HEAD
+python scripts/verify_release.py release --candidate C:\candidate\artifacts\candidate.json --cpu C:\evidence\cpu --cuda C:\evidence\cuda --expected-commit $commit --output validation/release-bundle
+```
+
+The verifier requires Windows/Python 3.12 evidence, expected model pins/settings,
+all required checks, matching installed files and artifact hashes, and clean
+source provenance. It rejects changed reports and missing/skipped hardware
+requirements. The bundle copies the already-tested wheel and source archive,
+adds `release-evidence.json`, `SHA256SUMS.txt`, and release notes, and does not rebuild.
+Receipts are consistency checks within the trusted validation process, not
+cryptographic attestations of arbitrary third-party reports.
+
+### Prerelease workflow
+
+`Windows release candidate` is a separate manual workflow, restricted to `main`.
+It builds once on hosted Windows, sends the candidate to the existing trusted
+self-hosted Windows CUDA runner, verifies both results, and uploads a verified
+bundle. The GPU runner still needs the documented CUDA Toolkit/CuPy prerequisites
+for the full kernel gate. It never runs automatically on pull requests.
+
+By default this workflow only validates. Explicit `create_draft=true` creates a
+draft prerelease tagged `onyx-cuda-v<package-version>-rc.<candidate-number>` after
+every gate passes. Only that final job has repository write permission. A failed
+or skipped prerequisite prevents it from running. Publishing the draft remains
+a deliberate maintainer action; no public release is created by ordinary pushes.
+The package stays at 0.1.0; "Windows v1" is the existing product milestone name.
+
+All local environments, caches, plans (including `windows-v1-release.md`),
+validation logs, candidate manifests, and release bundles belong under the
+ignored `onyx_cuda/validation/` directory. Commit permanent scripts, tests,
+workflow definitions, and user documentation only.
+
 ### Model snapshots
 
 The bundled loaders use these immutable revisions from `onyx_cuda.revisions`:

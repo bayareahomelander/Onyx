@@ -866,6 +866,7 @@ def test_real_cuda_two_client_requests_match_direct_generation_without_model_cop
 
 @pytest.mark.gpu
 def test_real_uvicorn_api_phase_gate(monkeypatch):
+    import gc
     import socket
     import time
 
@@ -904,6 +905,22 @@ def test_real_uvicorn_api_phase_gate(monkeypatch):
         "required": ["content"],
     }
 
+    def settled_allocations():
+        # Reading the HTTP body can finish before Uvicorn releases its request
+        # task and the executor drops the completed result (including its KV cache).
+        # Wait for both owners before asserting retained, rather than transient, memory.
+        deadline = time.monotonic() + 30
+        while server.server_state.tasks:
+            assert time.monotonic() < deadline, "HTTP request did not finish cleanup"
+            time.sleep(0.01)
+
+        def measure():
+            gc.collect()
+            torch.cuda.synchronize()
+            return torch.cuda.memory_allocated()
+
+        return app.state.inference_executor.submit(measure).result(timeout=30)
+
     try:
         with httpx.Client(base_url=f"http://127.0.0.1:{port}", timeout=180) as client:
             root = client.get("/")
@@ -930,15 +947,13 @@ def test_real_uvicorn_api_phase_gate(monkeypatch):
             torch.cuda.empty_cache()
             warmup = client.post("/v1/chat/completions", json=payload)
             assert warmup.status_code == 200
-            torch.cuda.synchronize()
+            baseline = settled_allocations()
             torch.cuda.reset_peak_memory_stats()
-            baseline = torch.cuda.memory_allocated()
             allocated = []
             for _ in range(3):
                 repeated = client.post("/v1/chat/completions", json=payload)
                 assert repeated.status_code == 200
-                torch.cuda.synchronize()
-                allocated.append(torch.cuda.memory_allocated())
+                allocated.append(settled_allocations())
             peak = torch.cuda.max_memory_allocated()
             assert allocated == [baseline, baseline, baseline]
             assert peak >= baseline
