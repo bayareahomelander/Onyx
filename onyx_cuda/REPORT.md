@@ -88,6 +88,21 @@ and compare gamma 0/1/2/4 regardless of the server's gamma setting.
 .\.venv\Scripts\python.exe -m onyx_cuda.benchmark_masking --models --output benchmarks/results/custom-masking.json
 ```
 
+For a Qwen3 comparison of completed answers with thinking disabled:
+
+```powershell
+.\.venv\Scripts\python.exe -m onyx_cuda.benchmark --compare --disable-thinking --max-tokens 256 --require-complete --output benchmarks/results/nonthinking-comparison.json
+```
+
+These are benchmark-only options; API startup behavior is unchanged.
+`--disable-thinking` passes `enable_thinking=False` to the chat template; the
+pair comparison checks that this changes the target prompt and that both
+tokenizers produce the same overridden prompt. `--require-complete` rejects
+output that reaches the token limit instead of EOS or a grammar stop. It checks
+termination, not answer quality. Reports record these settings, and older
+file-based baselines without them must be regenerated. Without these options,
+the benchmark preserves the model's default thinking behavior and 32-token cap.
+
 Reports record actual selected repository IDs and resolved revisions. The
 file-based target/constraint/speculation gates reject baselines with a different
 target identity or revision; regenerate the chain after changing models or
@@ -232,6 +247,16 @@ timings cover partial reasoning rather than completed answers. All modes
 matched target-only output; no speculative mode cleared the required 5% gain
 on every case, and the benchmark still recommended gamma 0. Revalidate with
 the intended prompts and output budget before choosing a speculative setting.
+
+A follow-up on the same GPU and model revisions used `--disable-thinking
+--max-tokens 256 --require-complete`. All five cases completed (4, 18, and 30
+tokens to EOS for ordinary prompts; 2 and 7 tokens to grammar stop for regex
+and JSON), with identical output across gamma settings. Median output rates
+were 28.15, 25.63, 28.06, and 23.10 tok/s for gamma 0, 1, 2, and 4. Gamma 4
+made the number sequence 1.79x faster by generation wall time, but was slower
+on every other case. Gamma 0 remained the recommendation for this short-answer
+corpus. The partial-reasoning speedup above does not establish a speedup for
+completed non-thinking answers or longer workloads.
 
 To contribute a larger-model result, run the validator on the intended Windows
 GPU and share its JSON report after reviewing it. Identify the exact revisions,

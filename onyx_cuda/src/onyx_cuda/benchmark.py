@@ -6,6 +6,7 @@ import json
 import platform
 import statistics
 import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from importlib.metadata import version
 from pathlib import Path
@@ -42,18 +43,26 @@ TARGET_CONSTRAINT_OUTPUT = Path(
 SPECULATIVE_OUTPUT = Path("benchmarks/results/phase4_speculative_gate.json")
 
 
-def _comparison_settings() -> dict:
+@dataclass(frozen=True)
+class BenchmarkOptions:
+    max_tokens: int = MAX_TOKENS
+    enable_thinking: bool | None = None
+    require_complete: bool = False
+
+
+def _comparison_settings(options=BenchmarkOptions()) -> dict:
     backend = resolve_greedy_backend()
     return {
-        "warmups": WARMUPS, "repetitions": REPETITIONS, "max_tokens": MAX_TOKENS,
+        "warmups": WARMUPS, "repetitions": REPETITIONS, "max_tokens": options.max_tokens,
+        "enable_thinking": options.enable_thinking, "require_complete": options.require_complete,
         "temperature": 0.0, "top_p": 1.0, "greedy_backend": backend,
         "dtype": "float16", "timing_contract": "generation-includes-validation-v2",
         "cupy": version("cupy-cuda12x") if backend == "cuda" else None,
     }
 
 
-def _require_matching_settings(baseline: dict) -> None:
-    if baseline.get("settings") != _comparison_settings():
+def _require_matching_settings(baseline: dict, options=BenchmarkOptions()) -> None:
+    if baseline.get("settings") != _comparison_settings(options):
         raise RuntimeError(
             "baseline settings, greedy backend, or timing contract differ; regenerate the baseline"
         )
@@ -70,13 +79,14 @@ def _run_prompt(
     generation_options: dict | None = None,
     draft_model=None,
     gamma: int | None = None,
+    options=BenchmarkOptions(),
 ) -> dict:
     generation_options = generation_options or {}
     messages = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_prompt},
     ]
-    prompt = format_prompt(tokenizer, messages)
+    prompt = format_prompt(tokenizer, messages, enable_thinking=options.enable_thinking)
     eos_token_id = tokenizer.eos_token_id
 
     def run_generation(measure: bool):
@@ -84,7 +94,7 @@ def _run_prompt(
             return generate_tokens(
                 model,
                 prompt.token_ids,
-                max_tokens=MAX_TOKENS,
+                max_tokens=options.max_tokens,
                 eos_token_ids=eos_token_id,
                 measure=measure,
                 **generation_options,
@@ -93,7 +103,7 @@ def _run_prompt(
             draft_model,
             model,
             prompt.token_ids,
-            max_tokens=MAX_TOKENS,
+            max_tokens=options.max_tokens,
             gamma=gamma,
             eos_token_ids=eos_token_id,
             measure=measure,
@@ -123,6 +133,8 @@ def _run_prompt(
 
         token_ids = result.token_ids.copy()
         finish_reason = result.finish_reason
+        if options.require_complete and finish_reason not in ("eos", "stop"):
+            raise RuntimeError(f"{name} did not complete within {options.max_tokens} tokens")
         if expected_tokens is None:
             expected_tokens = token_ids
             expected_reason = finish_reason
@@ -291,6 +303,7 @@ def _run_constraint_prompts(
     draft_model=None,
     gamma: int | None = None,
     vocabulary=None,
+    options=BenchmarkOptions(),
 ) -> list[dict]:
     vocabulary = vocabulary or build_token_byte_vocabulary(
         tokenizer, model.config.vocab_size
@@ -308,6 +321,7 @@ def _run_constraint_prompts(
         },
         draft_model=draft_model,
         gamma=gamma,
+        options=options,
     )
     if regex_result["runs"][0]["text"] != regex_pattern:
         raise RuntimeError("regex-constrained output did not match exactly")
@@ -330,6 +344,7 @@ def _run_constraint_prompts(
         },
         draft_model=draft_model,
         gamma=gamma,
+        options=options,
     )
     parsed = json.loads(json_result["runs"][0]["text"])
     if set(parsed) != {"content"} or parsed["content"] not in {
@@ -340,7 +355,7 @@ def _run_constraint_prompts(
     return [regex_result, json_result]
 
 
-def _run_speculative_gate(baseline_path: Path | None, output: Path, device, selection=None) -> None:
+def _run_speculative_gate(baseline_path: Path | None, output: Path, device, selection=None, *, options=BenchmarkOptions()) -> None:
     if baseline_path is not None and not baseline_path.is_file():
         raise RuntimeError(
             f"target constraint baseline not found at {baseline_path}; "
@@ -350,6 +365,15 @@ def _run_speculative_gate(baseline_path: Path | None, output: Path, device, sele
         json.loads(baseline_path.read_text(encoding="utf-8")) if baseline_path is not None else None
     )
     pair = load_model_pair(selection=selection)
+    if options.enable_thinking is not None:
+        messages = [{"role": "user", "content": "Reply with CUDA ready."}]
+        target_prompt = format_prompt(pair.target.tokenizer, messages,
+                                      enable_thinking=options.enable_thinking)
+        if target_prompt == format_prompt(pair.target.tokenizer, messages):
+            raise RuntimeError("The selected thinking override did not change the target chat prompt")
+        if target_prompt != format_prompt(pair.draft.tokenizer, messages,
+                                          enable_thinking=options.enable_thinking):
+            raise RuntimeError("Draft and target chat prompts differ with the thinking override")
     # Report the API's reusable CPU setup separately from GPU generation.
 
     cold_setup, warm_setup = [], []
@@ -368,17 +392,17 @@ def _run_speculative_gate(baseline_path: Path | None, output: Path, device, sele
         print("Measuring target baseline in the same process", flush=True)
         baseline = {
             "model": {"id": pair.target.model_id, "revision": pair.target.revision},
-            "settings": _comparison_settings(),
+            "settings": _comparison_settings(options),
             "device": {
                 "name": torch.cuda.get_device_name(device),
                 "total_vram_bytes": torch.cuda.get_device_properties(device).total_memory,
             },
             "unconstrained_prompts": [
-                _run_prompt(pair.target.model, pair.target.tokenizer, device, name, prompt)
+                _run_prompt(pair.target.model, pair.target.tokenizer, device, name, prompt, options=options)
                 for name, prompt in PROMPTS.items()
             ],
             "constraint_prompts": _run_constraint_prompts(
-                pair.target.model, pair.target.tokenizer, device, vocabulary=vocabulary
+                pair.target.model, pair.target.tokenizer, device, vocabulary=vocabulary, options=options
             ),
         }
     target_model = {
@@ -387,7 +411,7 @@ def _run_speculative_gate(baseline_path: Path | None, output: Path, device, sele
     }
     if baseline.get("model") != target_model:
         raise RuntimeError("target constraint baseline model or revision does not match")
-    _require_matching_settings(baseline)
+    _require_matching_settings(baseline, options)
     baseline_device = baseline.get("device", {})
     if (
         baseline_device.get("name") != torch.cuda.get_device_name(device)
@@ -416,6 +440,7 @@ def _run_speculative_gate(baseline_path: Path | None, output: Path, device, sele
                     prompt,
                     draft_model=pair.draft.model,
                     gamma=gamma,
+                    options=options,
                 )
                 for name, prompt in PROMPTS.items()
             ]
@@ -426,12 +451,13 @@ def _run_speculative_gate(baseline_path: Path | None, output: Path, device, sele
                 draft_model=pair.draft.model,
                 gamma=gamma,
                 vocabulary=vocabulary,
+                options=options,
             )
         measured_prompts = prompts + constraint_prompts
         _assert_baseline(
             measured_prompts,
             {"prompts": expected_prompts},
-            "1.5B target-only baseline",
+            "selected target-only baseline",
         )
         for prompt in measured_prompts:
             target_prompt = expected_by_name[prompt["name"]]
@@ -501,7 +527,7 @@ def _run_speculative_gate(baseline_path: Path | None, output: Path, device, sele
             "total_vram_bytes": torch.cuda.get_device_properties(device).total_memory,
         },
         "settings": {
-            **_comparison_settings(),
+            **_comparison_settings(options),
             "gammas": [0, *SPECULATIVE_GAMMAS],
         },
         "target_constraint_baseline": str(baseline_path) if baseline_path else "same-process",
@@ -547,7 +573,16 @@ def main() -> None:
     )
     parser.add_argument("--baseline", type=Path)
     parser.add_argument("--output", type=Path)
+    parser.add_argument("--max-tokens", type=int, default=MAX_TOKENS)
+    parser.add_argument("--disable-thinking", action="store_true",
+                        help="Pass enable_thinking=False to the model chat template")
+    parser.add_argument("--require-complete", action="store_true",
+                        help="Fail rather than report timings for truncated answers")
     args = parser.parse_args()
+    if not 1 <= args.max_tokens <= 2048:
+        parser.error("--max-tokens must be between 1 and 2048")
+    options = BenchmarkOptions(args.max_tokens, False if args.disable_thinking else None,
+                               args.require_complete)
     from onyx_cuda.config import resolve_model_selection
 
     selection = resolve_model_selection()
@@ -556,7 +591,7 @@ def main() -> None:
     if args.compare:
         if args.target or args.constraints or args.speculative or args.baseline:
             parser.error("--compare cannot be combined with other modes or --baseline")
-        _run_speculative_gate(None, args.output or COMPARISON_OUTPUT, device, selection)
+        _run_speculative_gate(None, args.output or COMPARISON_OUTPUT, device, selection, options=options)
         return
     if args.speculative:
         if args.target or args.constraints:
@@ -566,6 +601,7 @@ def main() -> None:
             args.output or SPECULATIVE_OUTPUT,
             device,
             selection,
+            options=options,
         )
         return
     model_id = selection.target_model if args.target else selection.draft_model
@@ -581,7 +617,7 @@ def main() -> None:
 
     loaded = load_model(model_id, revision=revision)
     prompts = [
-        _run_prompt(loaded.model, loaded.tokenizer, device, name, prompt)
+        _run_prompt(loaded.model, loaded.tokenizer, device, name, prompt, options=options)
         for name, prompt in PROMPTS.items()
     ]
     results = {
@@ -601,7 +637,7 @@ def main() -> None:
             "total_vram_bytes": torch.cuda.get_device_properties(device).total_memory,
         },
         "settings": {
-            **_comparison_settings(),
+            **_comparison_settings(options),
         },
     }
     printed_prompts = prompts
@@ -613,12 +649,12 @@ def main() -> None:
                 f"run the {'target' if args.target else 'default'} benchmark first"
             )
         baseline_results = json.loads(baseline.read_text(encoding="utf-8"))
-        _require_matching_settings(baseline_results)
+        _require_matching_settings(baseline_results, options)
         if baseline_results.get("model") != results["model"]:
             raise RuntimeError(f"{baseline_label} model or revision does not match")
         _assert_baseline(prompts, baseline_results, baseline_label)
         constraint_prompts = _run_constraint_prompts(
-            loaded.model, loaded.tokenizer, device
+            loaded.model, loaded.tokenizer, device, options=options
         )
         baseline_key = "target_baseline" if args.target else "phase2_baseline"
         results.update(

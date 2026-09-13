@@ -222,7 +222,7 @@ def test_comparison_cli_uses_same_model_selection(monkeypatch, tmp_path):
     monkeypatch.setenv("ONYX_DRAFT_MODEL", "example/draft")
     monkeypatch.setattr(torch.cuda, "set_device", lambda *_: None)
     calls = []
-    monkeypatch.setattr(benchmark, "_run_speculative_gate", lambda *args: calls.append(args[-1]))
+    monkeypatch.setattr(benchmark, "_run_speculative_gate", lambda *args, **kwargs: calls.append(args[-1]))
     for mode in ("--compare", "--speculative"):
         monkeypatch.setattr(sys, "argv", ["benchmark", mode, "--output", str(tmp_path / "result.json")])
         benchmark.main()
