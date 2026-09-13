@@ -13,6 +13,11 @@ positive `ONYX_SPECULATIVE_GAMMA`. Onyx does not automatically switch models or
 prompt you based on available VRAM. Use [preflight and GPU validation](REPORT.md#model-validation-and-support-levels)
 to check your chosen configuration, then apply the [startup settings](REPORT.md#selecting-models-at-startup).
 
+Weights load directly onto `cuda:0` through Accelerate, avoiding a complete FP16
+model in system RAM before GPU transfer. Loading still needs host memory for
+checkpoint I/O and temporary tensors; the model and generation caches must fit
+in VRAM. CPU/disk offloading and quantized loading are not supported.
+
 ## Requirements
 
 - Windows x64 and Python 3.12 x64

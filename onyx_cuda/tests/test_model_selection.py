@@ -92,12 +92,12 @@ def test_custom_revision_resolves_once_and_pins_tokenizer_and_weights(monkeypatc
                         observed.append(("tokenizer", name, kw["revision"])) or object())
     class Weights:
         def to(self, device):
-            assert device == "cuda:0"
-            return self
+            pytest.fail("Model must load directly on CUDA, not be moved after CPU loading")
         def eval(self):
             return self
     def weights(name, **kw):
         assert kw["dtype"] == torch.float16
+        assert kw["device_map"] == {"": "cuda:0"}
         observed.append(("weights", name, kw["revision"]))
         return Weights()
     monkeypatch.setattr(model.AutoModelForCausalLM, "from_pretrained", weights)

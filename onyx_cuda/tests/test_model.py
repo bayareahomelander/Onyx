@@ -71,11 +71,13 @@ def test_load_model_prompt_prefill_and_generation_on_cuda(monkeypatch, record_mo
     assert loaded.revision == loaded.model.config._commit_hash
     assert len(loaded.revision) == 40
     assert not loaded.model.training
+    assert loaded.model.hf_device_map == {"": device}
     assert all(parameter.device == device for parameter in loaded.model.parameters())
     assert all(parameter.dtype == torch.float16 for parameter in loaded.model.parameters())
     assert target.revision == target.model.config._commit_hash
     assert len(target.revision) == 40
     assert not target.model.training
+    assert target.model.hf_device_map == {"": device}
     assert all(parameter.device == device for parameter in target.model.parameters())
     assert all(parameter.dtype == torch.float16 for parameter in target.model.parameters())
     assert loaded.model.config.vocab_size == target.model.config.vocab_size

@@ -216,6 +216,23 @@ Pairing that target with the bundled 0.5B draft fails the current compatibility
 contract: their logits widths are 152064 and 151936. More VRAM does not resolve
 that mismatch, and the engine does not remap or pad their vocabularies.
 
+On 2026-09-13, Linux validation on an RTX 2080 Ti reporting 22 GiB VRAM passed
+for `Qwen/Qwen3-8B` at `b968826d9c46dd6066d109eabc6255188de91218`, both target-only
+and with `Qwen/Qwen3-0.6B` at `c1899de289a04d12100db370d81485cdf75e47ca` (gamma 2).
+This used direct CUDA weight loading, FP16, the torch selector, a 2,048-token
+context, Python 3.12.14, torch 2.6.0+cu124, transformers 4.57.6, and accelerate
+1.12.0. Pair validation peaked at 19,338,968,576 allocated bytes and passed
+generation, API/SSE, context-cache, and forced-rejection/replay checks. These
+are Linux results; the bundled Windows defaults and release matrix are unchanged.
+
+The same-process comparison measured median output rates of 28.97, 31.75,
+36.68, and 37.30 tok/s for gamma 0, 1, 2, and 4. However, Qwen3's default
+thinking mode consumed the 32-token budget in the unconstrained cases, so those
+timings cover partial reasoning rather than completed answers. All modes
+matched target-only output; no speculative mode cleared the required 5% gain
+on every case, and the benchmark still recommended gamma 0. Revalidate with
+the intended prompts and output budget before choosing a speculative setting.
+
 To contribute a larger-model result, run the validator on the intended Windows
 GPU and share its JSON report after reviewing it. Identify the exact revisions,
 gamma, selector, context size, and source version. A result becomes an entry in

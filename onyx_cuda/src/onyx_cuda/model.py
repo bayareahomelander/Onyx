@@ -84,7 +84,10 @@ def load_model(model_id: str = MODEL_ID, *, revision: str | None = None) -> Load
         config=config,
         dtype=torch.float16,
         trust_remote_code=False,
-    ).to(device)
+        # Materialize checkpoint tensors on CUDA as they are loaded, avoiding a
+        # complete FP16 model in host RAM. The explicit map never CPU-offloads.
+        device_map={"": device},
+    )
     model.eval()
     model._onyx_model_id = model_id
     loaded = LoadedModel(model, tokenizer, revision)

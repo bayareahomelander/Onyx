@@ -54,7 +54,7 @@ def write_report(path, report):
 
 def evidence(kind):
     dependencies = {}
-    for name in ("onyx-cuda", "torch", "transformers", "tokenizers", "huggingface-hub",
+    for name in ("onyx-cuda", "torch", "transformers", "accelerate", "tokenizers", "huggingface-hub",
                  "fastapi", "pydantic", "httpx", "cupy-cuda12x"):
         try:
             dependencies[name] = version(name)
