@@ -37,7 +37,7 @@ python -m uvicorn onyx.server:app --host 127.0.0.1 --port 8000
 
 Use the separate package in `onyx_cuda`. It requires Python 3.12 x64, an NVIDIA
 GPU, and CUDA-enabled PyTorch. Building from source also requires Rust MSVC and
-Visual Studio C++ Build Tools; a matching prebuilt Windows wheel avoids that build step.
+Visual Studio C++ Build Tools.
 See the [Windows guide](onyx_cuda/README.md) for installation and startup commands.
 
 Windows defaults to Qwen2.5 1.5B target-only FP16 generation. The 0.5B draft
@@ -46,7 +46,7 @@ is fastest with target-only generation on the 6 GB RTX 4050.
 
 With more VRAM, you can explicitly select a larger compatible target or
 draft/target pair. Onyx does not automatically switch models or prompt you based
-on available VRAM. See the [Windows model-selection and validation guide](onyx_cuda/REPORT.md#model-validation-and-support-levels)
+on available VRAM. See the [Windows model-selection and validation guide](onyx_cuda/README.md#model-selection)
 to check a configuration and configure it at startup.
 
 Model weights download on first use. Run one server at a time on port 8000.
@@ -63,7 +63,8 @@ curl http://127.0.0.1:8000/v1/chat/completions \
 
 Both editions accept `json_schema` for structured JSON and `stream: true` for
 streaming. See the [Windows PowerShell example](onyx_cuda/README.md#example).
-A token budget may leave output incomplete; consult the relevant API contract.
+A token budget may leave output incomplete. Check the finish reason before using
+constrained output; see the [Windows example](onyx_cuda/README.md#example).
 
 ## Repository structure
 
@@ -73,17 +74,7 @@ rust/          Apple Silicon package's native grammar engine
 examples/      Python usage examples
 tests/         Apple Silicon tests
 onyx_cuda/     Windows package: Python source, native engine, tests, and build tools
-REPORT.md      Apple Silicon architecture, API reference, and benchmarks
 ```
-
-## Documentation
-
-- [Apple Silicon technical report](REPORT.md)
-- [Windows technical report](onyx_cuda/REPORT.md)
-- [Windows reproducibility guide](onyx_cuda/REPORT.md#repeatable-windows-delivery-check)
-
-Performance results and reproduction commands live in the reports. Speedups
-vary with hardware, model configuration, and workload.
 
 ## License
 

@@ -5,13 +5,13 @@ with regex and JSON Schema constraints, an OpenAI-compatible API, and streaming.
 
 By default, Onyx CUDA loads only the Qwen2.5 1.5B target in FP16. A 0.5B draft model and
 custom CUDA token selection are optional. Windows v1 (package 0.1.0) targets
-a 6 GB RTX 4050; see the [validation guide](REPORT.md#repeatable-windows-delivery-check).
+a 6 GB RTX 4050; see [validation](#validation).
 
 **To use a larger model**, select it explicitly with `ONYX_TARGET_MODEL` before
 starting the server. For a speculative pair, also set `ONYX_DRAFT_MODEL` and a
 positive `ONYX_SPECULATIVE_GAMMA`. Onyx does not automatically switch models or
-prompt you based on available VRAM. Use [preflight and GPU validation](REPORT.md#model-validation-and-support-levels)
-to check your chosen configuration, then apply the [startup settings](REPORT.md#selecting-models-at-startup).
+prompt you based on available VRAM. Use [preflight and GPU validation](#validation)
+to check your chosen configuration, then apply the [startup settings](#model-selection).
 
 Weights load directly onto `cuda:0` through Accelerate, avoiding a complete FP16
 model in system RAM before GPU transfer. Loading still needs host memory for
@@ -25,28 +25,12 @@ in VRAM. CPU/disk offloading and quantized loading are not supported.
 - For source builds: Rust MSVC toolchain and Visual Studio Build Tools with the C++ workload
 
 The optional custom selector also requires CUDA Toolkit 12.4 with NVRTC/headers
-and CuPy. See the [kernel setup](REPORT.md#optional-sparse-cuda-token-selection).
+and CuPy. Install `.[kernels]` and set `ONYX_GREEDY_BACKEND=cuda` to opt in;
+the default `torch` selector needs neither.
 
 ## Setup
 
-### Install a prebuilt wheel
-
-When a Windows candidate is available on [GitHub Releases](https://github.com/bayareahomelander/Onyx/releases),
-download its CPython 3.12 x64 wheel and compare its SHA-256 with `SHA256SUMS.txt`.
-The release evidence lists the exact artifact and tested configurations. If no
-compatible release is listed, use the source installation below.
-
-From the directory containing the downloaded wheel:
-
-```powershell
-py -3.12 -m venv .venv
-.\.venv\Scripts\python.exe -m pip install pip==26.1.2
-.\.venv\Scripts\python.exe -m pip install torch==2.6.0 --index-url https://download.pytorch.org/whl/cu124
-.\.venv\Scripts\python.exe -m pip install ".\onyx_cuda-0.1.0-cp312-cp312-win_amd64.whl[server]"
-```
-
-Use the filename of the release you downloaded. Installing a matching wheel
-requires no Rust, maturin, pytest, or Visual Studio build tools.
+Install from source; no prebuilt Windows release is currently published.
 
 ### Build from a clone
 
@@ -62,7 +46,7 @@ py -3.12 -m venv .venv
 
 ### Start the server
 
-After either installation method:
+From `onyx_cuda`, after installation:
 
 ```powershell
 .\.venv\Scripts\python.exe -m uvicorn onyx_cuda.server:create_app --factory --host 127.0.0.1 --port 8000
@@ -70,8 +54,38 @@ After either installation method:
 
 Model weights download on first startup. Use one worker and trusted local
 clients; stop with Ctrl+C. The server defaults to target-only generation.
-Optional [startup model settings](REPORT.md#selecting-models-at-startup) let you
+Optional [startup model settings](#model-selection) let you
 choose a compatible target and draft; existing defaults stay unchanged.
+
+## Model selection
+
+Set these environment variables in the server's terminal **before startup**:
+
+| Variable | Default / purpose |
+| --- | --- |
+| `ONYX_TARGET_MODEL` | `Qwen/Qwen2.5-1.5B-Instruct` |
+| `ONYX_DRAFT_MODEL` | `Qwen/Qwen2.5-0.5B-Instruct` |
+| `ONYX_TARGET_REVISION`, `ONYX_DRAFT_REVISION` | Bundled models use pinned revisions; set commit hashes to reproduce a custom selection. |
+| `ONYX_SPECULATIVE_GAMMA` | `0` loads only the target; a positive value loads the draft for greedy speculation. |
+
+For example, after validating the selected pair on your GPU:
+
+```powershell
+$env:ONYX_TARGET_MODEL = "Qwen/Qwen2.5-3B-Instruct"
+$env:ONYX_DRAFT_MODEL = "Qwen/Qwen2.5-0.5B-Instruct"
+$env:ONYX_SPECULATIVE_GAMMA = "2"
+```
+
+Models must be compatible Hugging Face repository IDs. More VRAM alone does
+not establish compatibility. Run [validation](#validation) before switching;
+restart the server to apply changes. Benchmark to choose gamma:
+
+```powershell
+.\.venv\Scripts\python.exe -m onyx_cuda.benchmark --compare --output benchmarks/results/custom-comparison.json
+```
+
+For Qwen3, add `--disable-thinking --max-tokens 256 --require-complete` to compare
+completed non-thinking answers. These flags affect the benchmark only.
 
 ## Example
 
@@ -89,7 +103,7 @@ Invoke-RestMethod -Uri http://127.0.0.1:8000/v1/chat/completions -Method Post -C
 
 Use `json_schema` for JSON constraints and `stream: true` for SSE. The API allows
 up to 1024 output tokens within a 2048-token prompt-plus-output budget. Partial
-output has `finish_reason: "length"`; see the [API contract](REPORT.md#api-options-and-completion-status).
+output has `finish_reason: "length"` and may not satisfy the constraint.
 
 To see live SSE output in PowerShell, set `$body` to a request with `stream = $true`
 before converting it to JSON, then send it using:
@@ -109,8 +123,9 @@ For a source/development install, run the complete local suite from `onyx_cuda`:
 .\.venv\Scripts\python.exe -m pytest --require-cuda
 ```
 
-Fresh-install gates and benchmark commands are in the
-[validation guide](REPORT.md#repeatable-windows-delivery-check).
+For a fresh Windows build/install check, run
+`./scripts/validate_windows.ps1 -Mode Cuda -Profile Core -Python ./.venv/Scripts/python.exe`.
+See the [validation script](scripts/validate_windows.ps1) for optional profiles and wheel checks.
 
 To inspect another model without loading weights, then test it on a suitable GPU:
 
@@ -122,7 +137,9 @@ To inspect another model without loading weights, then test it on a suitable GPU
 
 Preflight establishes eligibility, not GPU fit. Add `--gamma 2` and
 `--draft-model` to inspect/test a pair. Use the resolved revisions for repeatable
-runs; see [model validation and support levels](REPORT.md#model-validation-and-support-levels).
+runs. A successful preflight checks metadata compatibility; runtime validation
+checks generation, constraints, API streaming, and caches on that GPU and OS.
+Neither guarantees a speedup. Reports must use a new output filename.
 
 ## Structure
 
@@ -132,10 +149,6 @@ rust/          Native regex and JSON Schema engine
 tests/         Unit, API, and real-GPU tests
 scripts/       Windows package validation
 ```
-
-## Documentation
-
-- [Technical report: API, limits, kernels, and benchmarks](REPORT.md)
 
 ## License
 
