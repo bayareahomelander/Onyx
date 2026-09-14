@@ -615,19 +615,17 @@ def test_real_draft_proposal_matches_direct_greedy_prefix():
         remaining_tokens=4,
         eos_token_ids=pair.draft.tokenizer.eos_token_id,
     )
+    # A draft need not predict the target's first token. Compare its continuation
+    # conditioned on the actual target-selected prefix, without golden wording.
     direct = generate_tokens(
-        pair.draft.model,
-        prompt.token_ids,
-        max_tokens=5,
-        eos_token_ids=pair.draft.tokenizer.eos_token_id,
+        pair.draft.model, prompt.token_ids + [target_token], max_tokens=4,
+        eos_token_ids=pair.target.tokenizer.eos_token_id,
     )
-
-    assert direct.token_ids[0] == target_token
-    assert proposal.token_ids == direct.token_ids[1:]
+    assert proposal.token_ids == direct.token_ids
     assert proposal == ProposalResult(
-        [30982, 151645], len(prompt.token_ids), len(prompt.token_ids) + 2
+        direct.token_ids, len(prompt.token_ids), len(prompt.token_ids) + len(direct.token_ids)
     )
-    assert draft_cache.attention_mask.shape == (1, len(prompt.token_ids) + 2)
+    assert draft_cache.attention_mask.shape == (1, len(prompt.token_ids) + len(direct.token_ids))
     print(f"target_first_token_id={target_token}")
     print(f"draft_proposal_token_ids={proposal.token_ids}")
 

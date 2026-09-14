@@ -17,7 +17,7 @@ class Tokenizer:
     def __init__(self, prompt_length=3):
         self.prompt_length = prompt_length
 
-    def apply_chat_template(self, messages, tokenize, add_generation_prompt):
+    def apply_chat_template(self, messages, tokenize, add_generation_prompt, **kwargs):
         return [1] * self.prompt_length if tokenize else "prompt"
 
     def decode(self, tokens, skip_special_tokens=False):
@@ -43,8 +43,8 @@ def result():
 
 @pytest.mark.parametrize("stream", [False, True])
 @pytest.mark.parametrize("extra", [
-    {"max_tokens": 1025}, {"max_completion_tokens": 1025}, {"n": 5},
-    {"messages": [{"role": "user", "content": "x" * 32769}]},
+    {"max_tokens": 4097}, {"max_completion_tokens": 4097}, {"n": 5},
+    {"messages": [{"role": "user", "content": "x" * 131073}]},
     {"messages": [{"role": "user", "content": "x"}] * 129},
 ])
 def test_excess_work_rejected_before_generation(monkeypatch, stream, extra):
@@ -60,7 +60,7 @@ def test_excess_work_rejected_before_generation(monkeypatch, stream, extra):
 
 
 @pytest.mark.parametrize("stream", [False, True])
-@pytest.mark.parametrize("prompt_length,context", [(2048, 32768), (100, 100), (0, 32768)])
+@pytest.mark.parametrize("prompt_length,context", [(server.MAX_CONTEXT_TOKENS, 32768), (100, 100), (0, 32768)])
 def test_context_rejected_before_stream_or_generation(monkeypatch, stream, prompt_length, context):
     monkeypatch.setattr(server, "_generate", lambda _: pytest.fail("Generation started"))
     with TestClient(server.create_app(engine=engine(prompt_length, context))) as client:
@@ -71,16 +71,16 @@ def test_context_rejected_before_stream_or_generation(monkeypatch, stream, promp
 
 def test_context_boundary_and_max_choices_accepted(monkeypatch):
     monkeypatch.setattr(server, "_generate", lambda _: result())
-    with TestClient(server.create_app(engine=engine(1024))) as client:
+    with TestClient(server.create_app(engine=engine(server.MAX_CONTEXT_TOKENS - server.MAX_OUTPUT_TOKENS))) as client:
         response = client.post("/v1/chat/completions", json={
-            **PAYLOAD, "max_tokens": 1024, "n": 4,
+            **PAYLOAD, "max_tokens": server.MAX_OUTPUT_TOKENS, "n": 4,
         })
     assert response.status_code == 200
     assert len(response.json()["choices"]) == 4
 
 
 def test_overload_rejects_before_work_and_capacity_recovers(monkeypatch):
-    monkeypatch.setattr(server, "MAX_ACTIVE_REQUESTS", 2)
+    monkeypatch.setenv("ONYX_MAX_ACTIVE_REQUESTS", "2")
     started, release = threading.Event(), threading.Event()
 
     def generate(_arguments):
@@ -161,7 +161,7 @@ def test_repeated_cancellation_keeps_model_owned_until_worker_finishes(monkeypat
 
 
 def test_disconnecting_full_stream_buffer_closes_producer_and_releases_lock(monkeypatch):
-    monkeypatch.setattr(server, "STREAM_BUFFER_CHUNKS", 2)
+    monkeypatch.setenv("ONYX_STREAM_BUFFER_CHUNKS", "2")
     saturated, closed = threading.Event(), threading.Event()
     produced = []
 
@@ -254,7 +254,7 @@ def test_repeated_cuda_requests_keep_live_allocations_stable(gamma):
                     assert json.loads(text) == "OK"
                 else:
                     assert re.fullmatch(r"[0-9]{4}", text)
-            assert client.post("/v1/chat/completions", json={**PAYLOAD, "max_tokens": 1025}).status_code == 422
+            assert client.post("/v1/chat/completions", json={**PAYLOAD, "max_tokens": server.MAX_OUTPUT_TOKENS + 1}).status_code == 422
             gc.collect()
             torch.cuda.synchronize()
             allocated = torch.cuda.memory_allocated()
@@ -262,3 +262,46 @@ def test_repeated_cuda_requests_keep_live_allocations_stable(gamma):
                 baseline = allocated
             else:
                 assert allocated == baseline, "Live CUDA allocations grew across request cycles"
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_configured_limits_are_frozen_and_enforced_before_streaming(monkeypatch, stream):
+    monkeypatch.setenv("ONYX_MAX_CONTEXT_TOKENS", "4096")
+    monkeypatch.setenv("ONYX_MAX_OUTPUT_TOKENS", "2048")
+    monkeypatch.setattr(server, "_generate", lambda _: result())
+    app = server.create_app(engine=engine(3072))
+    monkeypatch.setenv("ONYX_MAX_CONTEXT_TOKENS", "8192")
+    with TestClient(app) as client:
+        assert client.get("/").json()["limits"]["max_context_tokens"] == 4096
+        response = client.post("/v1/chat/completions", json={**PAYLOAD, "max_tokens": 1025, "stream": stream})
+        assert response.status_code == 422
+        assert "text/event-stream" not in response.headers.get("content-type", "")
+        response = client.post("/v1/chat/completions", json={**PAYLOAD, "max_tokens": 2049})
+        assert response.status_code == 422
+
+
+@pytest.mark.parametrize("name,value", [("ONYX_MAX_CONTEXT_TOKENS", "0"),
+    ("ONYX_MAX_OUTPUT_TOKENS", "-1"), ("ONYX_MAX_ACTIVE_REQUESTS", "abc"),
+    ("ONYX_STREAM_BUFFER_CHUNKS", "0"), ("ONYX_MAX_OUTPUT_TOKENS", "8192")])
+def test_invalid_capacity_settings_fail_at_startup(monkeypatch, name, value):
+    monkeypatch.setenv(name, value)
+    with pytest.raises(ValueError):
+        server.create_app(engine=engine())
+
+
+def test_omitted_output_budget_respects_smaller_configured_limit(monkeypatch):
+    monkeypatch.setenv("ONYX_MAX_OUTPUT_TOKENS", "128")
+    budgets = []
+
+    def generate(arguments):
+        budgets.append(arguments["max_tokens"])
+        return result()
+
+    monkeypatch.setattr(server, "_generate", generate)
+    with TestClient(server.create_app(engine=engine())) as client:
+        response = client.post("/v1/chat/completions", json={"messages": PAYLOAD["messages"]})
+        assert response.status_code == 200, response.text
+        for field in ("max_tokens", "max_completion_tokens"):
+            response = client.post("/v1/chat/completions", json={"messages": PAYLOAD["messages"], field: 129})
+            assert response.status_code == 422
+    assert budgets == [128]

@@ -16,7 +16,8 @@ def isolate_model_selection(monkeypatch):
     """The regression suite always starts with bundled, pinned models."""
     from onyx_cuda.config import MODEL_ENVIRONMENT_VARIABLES
 
-    for name in MODEL_ENVIRONMENT_VARIABLES:
+    for name in (*MODEL_ENVIRONMENT_VARIABLES, "ONYX_MAX_CONTEXT_TOKENS", "ONYX_MAX_OUTPUT_TOKENS",
+                 "ONYX_MAX_ACTIVE_REQUESTS", "ONYX_STREAM_BUFFER_CHUNKS"):
         monkeypatch.delenv(name, raising=False)
 
 

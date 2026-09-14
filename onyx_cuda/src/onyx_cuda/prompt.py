@@ -12,7 +12,7 @@ class FormattedPrompt(NamedTuple):
 
 def format_prompt(
     tokenizer: PreTrainedTokenizerBase, messages: list[dict[str, str]], *,
-    enable_thinking: bool | None = None,
+    enable_thinking: bool | None = False,
 ) -> FormattedPrompt:
     """Apply the model chat template and preserve its generation prompt."""
     options = {} if enable_thinking is None else {"enable_thinking": enable_thinking}

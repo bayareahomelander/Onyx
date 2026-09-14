@@ -52,7 +52,7 @@ function Invoke-Checked {
 }
 
 $savedEnvironment = @{}
-foreach ($name in @("PYTHONPATH", "PYTHONHOME", "PYTHONNOUSERSITE", "CARGO_TARGET_DIR", "RUSTUP_TOOLCHAIN", "ONYX_SPECULATIVE_GAMMA", "ONYX_GREEDY_BACKEND", "CUPY_CACHE_IN_MEMORY", "ONYX_TARGET_MODEL", "ONYX_TARGET_REVISION", "ONYX_DRAFT_MODEL", "ONYX_DRAFT_REVISION")) {
+foreach ($name in @("PYTHONPATH", "PYTHONHOME", "PYTHONNOUSERSITE", "CARGO_TARGET_DIR", "RUSTUP_TOOLCHAIN", "ONYX_SPECULATIVE_GAMMA", "ONYX_GREEDY_BACKEND", "CUPY_CACHE_IN_MEMORY", "ONYX_TARGET_MODEL", "ONYX_TARGET_REVISION", "ONYX_DRAFT_MODEL", "ONYX_DRAFT_REVISION", "ONYX_MAX_CONTEXT_TOKENS", "ONYX_MAX_OUTPUT_TOKENS", "ONYX_MAX_ACTIVE_REQUESTS", "ONYX_STREAM_BUFFER_CHUNKS")) {
     $savedEnvironment[$name] = [Environment]::GetEnvironmentVariable($name, "Process")
 }
 Push-Location $project
@@ -61,6 +61,10 @@ try {
     $env:PYTHONHOME = $null
     $env:PYTHONNOUSERSITE = "1"
     $env:ONYX_SPECULATIVE_GAMMA = $null
+    $env:ONYX_MAX_CONTEXT_TOKENS = $null
+    $env:ONYX_MAX_OUTPUT_TOKENS = $null
+    $env:ONYX_MAX_ACTIVE_REQUESTS = $null
+    $env:ONYX_STREAM_BUFFER_CHUNKS = $null
     $env:ONYX_TARGET_MODEL = $null
     $env:ONYX_TARGET_REVISION = $null
     $env:ONYX_DRAFT_MODEL = $null
@@ -122,12 +126,12 @@ try {
             Invoke-Checked $testPython @("-I", "-m", "pytest", "tests", "-m", "gpu", "-ra", "--require-cuda", "--require-kernels", "--strict-markers", "--junitxml=pytest-kernels.xml", "--validation-report=validation-kernels.json")
             $env:ONYX_GREEDY_BACKEND = "torch"
         }
-        Invoke-Checked $testPython @("-I", "-m", "onyx_cuda.preflight", "--output", "preflight.json")
+        Invoke-Checked $testPython @("-I", "-m", "onyx_cuda.preflight", "--gamma", "0", "--output", "preflight.json")
         if ($Mode -eq "Cpu") {
-            & $testPython -I -m onyx_cuda.validate_model --output cpu-runtime-rejection.json 2>&1 | Tee-Object -FilePath $log -Append | Out-Host
+            & $testPython -I -m onyx_cuda.validate_model --gamma 0 --output cpu-runtime-rejection.json 2>&1 | Tee-Object -FilePath $log -Append | Out-Host
             if ($LASTEXITCODE -ne 1) { throw "Expected the runtime validator to reject CPU-only PyTorch." }
         } else {
-            Invoke-Checked $testPython @("-I", "-m", "onyx_cuda.validate_model", "--output", "selected-target.json")
+            Invoke-Checked $testPython @("-I", "-m", "onyx_cuda.validate_model", "--gamma", "0", "--output", "selected-target.json")
             Invoke-Checked $testPython @("-I", "-m", "onyx_cuda.validate_model", "--gamma", "2", "--output", "selected-pair.json")
             Invoke-Checked $Python @("-m", "venv", (Join-Path $runRoot "consumer-env"))
             $consumerPython = Join-Path $runRoot "consumer-env/Scripts/python.exe"

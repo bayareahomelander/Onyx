@@ -1,38 +1,33 @@
 # Onyx CUDA
 
-The Windows/NVIDIA implementation of [Onyx](../README.md): structured LLM output
+The NVIDIA CUDA implementation of [Onyx](../README.md): structured LLM output
 with regex and JSON Schema constraints, an OpenAI-compatible API, and streaming.
+Windows and Linux use the same inference engine.
 
-By default, Onyx CUDA loads only the Qwen2.5 1.5B target in FP16. A 0.5B draft model and
-custom CUDA token selection are optional. Windows v1 (package 0.1.0) targets
-a 6 GB RTX 4050; see [validation](#validation).
+The default targets a **22 GiB GPU**: pinned **Qwen3 8B** plus a **Qwen2.5 0.5B
+Instruct draft**, FP16, speculative decoding with **gamma 2**, and non-thinking
+answers. Positive-temperature requests use target-model sampling; speculation
+is greedy. No model settings are needed to select the default pair.
 
-**To use a larger model**, select it explicitly with `ONYX_TARGET_MODEL` before
-starting the server. For a speculative pair, also set `ONYX_DRAFT_MODEL` and a
-positive `ONYX_SPECULATIVE_GAMMA`. Onyx does not automatically switch models or
-prompt you based on available VRAM. Use [preflight and GPU validation](#validation)
-to check your chosen configuration, then apply the [startup settings](#model-selection).
-
-Weights load directly onto `cuda:0` through Accelerate, avoiding a complete FP16
-model in system RAM before GPU transfer. Loading still needs host memory for
-checkpoint I/O and temporary tensors; the model and generation caches must fit
-in VRAM. CPU/disk offloading and quantized loading are not supported.
+Weights load directly onto `cuda:0` through Accelerate. Both models and their
+caches must fit in VRAM. Cached prefill processes long prompts in chunks and
+keeps only the final position's logits where supported, bounding attention
+workspace without discarding context. CPU/disk offloading and quantized loading
+are not supported.
 
 ## Requirements
 
-- Windows x64 and Python 3.12 x64
-- NVIDIA GPU and driver compatible with CUDA 12.4 PyTorch
-- For source builds: Rust MSVC toolchain and Visual Studio Build Tools with the C++ workload
+- Windows or Linux x64 and Python 3.12
+- NVIDIA GPU with approximately 22 GiB VRAM for the default configuration and a driver compatible with CUDA 12.4 PyTorch
+- Source builds: Rust; on Windows, the MSVC toolchain and Visual Studio C++ Build Tools
 
-The optional custom selector also requires CUDA Toolkit 12.4 with NVRTC/headers
-and CuPy. Install `.[kernels]` and set `ONYX_GREEDY_BACKEND=cuda` to opt in;
-the default `torch` selector needs neither.
+The optional custom selector requires CUDA Toolkit 12.4 with NVRTC/headers and
+CuPy. Install `.[kernels]` and set `ONYX_GREEDY_BACKEND=cuda` to opt in; the
+default `torch` selector needs neither. No prebuilt Windows release is published.
 
 ## Setup
 
-Install from source; no prebuilt Windows release is currently published.
-
-### Build from a clone
+### Windows
 
 From the repository root, in PowerShell:
 
@@ -42,50 +37,75 @@ py -3.12 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install pip==26.1.2
 .\.venv\Scripts\python.exe -m pip install -c requirements-validation.txt torch==2.6.0 --index-url https://download.pytorch.org/whl/cu124
 .\.venv\Scripts\python.exe -m pip install -c requirements-validation.txt -e ".[dev]"
-```
-
-### Start the server
-
-From `onyx_cuda`, after installation:
-
-```powershell
 .\.venv\Scripts\python.exe -m uvicorn onyx_cuda.server:create_app --factory --host 127.0.0.1 --port 8000
 ```
 
+### Linux
+
+From the repository root, with Python 3.12 and Rust installed:
+
+```sh
+cd onyx_cuda
+python3.12 -m venv .venv
+. .venv/bin/activate
+python -m pip install pip==26.1.2
+python -m pip install -c requirements-validation.txt torch==2.6.0 --index-url https://download.pytorch.org/whl/cu124
+python -m pip install -c requirements-validation.txt -e ".[dev]"
+python -m uvicorn onyx_cuda.server:create_app --factory --host 127.0.0.1 --port 8000
+```
+
 Model weights download on first startup. Use one worker and trusted local
-clients; stop with Ctrl+C. The server defaults to target-only generation.
-Optional [startup model settings](#model-selection) let you
-choose a compatible target and draft; existing defaults stay unchanged.
+clients; stop with Ctrl+C. One inference worker reuses CUDA workspaces and
+serializes GPU execution; extra Uvicorn workers would duplicate both models.
 
 ## Model selection
 
-Set these environment variables in the server's terminal **before startup**:
+Set overrides in the server's terminal **before startup**:
 
 | Variable | Default / purpose |
 | --- | --- |
-| `ONYX_TARGET_MODEL` | `Qwen/Qwen2.5-1.5B-Instruct` |
+| `ONYX_TARGET_MODEL` | `Qwen/Qwen3-8B` |
 | `ONYX_DRAFT_MODEL` | `Qwen/Qwen2.5-0.5B-Instruct` |
-| `ONYX_TARGET_REVISION`, `ONYX_DRAFT_REVISION` | Bundled models use pinned revisions; set commit hashes to reproduce a custom selection. |
-| `ONYX_SPECULATIVE_GAMMA` | `0` loads only the target; a positive value loads the draft for greedy speculation. |
+| `ONYX_TARGET_REVISION`, `ONYX_DRAFT_REVISION` | Bundled models use pinned revisions; use commit hashes for custom selections |
+| `ONYX_SPECULATIVE_GAMMA` | `2` draft tokens per iteration; `0` explicitly selects target-only generation |
 
-For example, after validating the selected pair on your GPU:
+The target tokenizer defines chat prompts, grammar bytes, decoding, and EOS for
+both models. Compatible drafts may omit target-added tokens in unused embedding
+slots, but existing token byte meanings and special tokens must agree and logits
+widths must match. Every proposed token is verified by the target. This supports
+the default Qwen2.5/Qwen3 pair without bypassing compatibility checks.
 
-```powershell
-$env:ONYX_TARGET_MODEL = "Qwen/Qwen2.5-3B-Instruct"
-$env:ONYX_DRAFT_MODEL = "Qwen/Qwen2.5-0.5B-Instruct"
-$env:ONYX_SPECULATIVE_GAMMA = "2"
-```
-
-Models must be compatible Hugging Face repository IDs. More VRAM alone does
-not establish compatibility. Run [validation](#validation) before switching;
-restart the server to apply changes. Benchmark to choose gamma:
+For another configuration, set model IDs and run [validation](#validation)
+before restarting the server. Available VRAM does not trigger automatic model
+selection. To compare proposal lengths 0, 1, 2, 4, and 8:
 
 ```powershell
-.\.venv\Scripts\python.exe -m onyx_cuda.benchmark --compare --output benchmarks/results/custom-comparison.json
+.\.venv\Scripts\python.exe -m onyx_cuda.benchmark --compare --require-complete --output benchmarks/results/custom-comparison.json
 ```
 
-For Qwen3, add `--disable-thinking --max-tokens 256 --require-complete` to compare
-completed non-thinking answers. These flags affect the benchmark only.
+The benchmark defaults to non-thinking answers and a 256-token budget. Use
+`--enable-thinking` or `--max-tokens` to change those settings. `--disable-thinking`
+remains accepted. It reports individual regressions and selects the mode with
+the lowest total generation wall time over its corpus, not a universal winner.
+
+## Capacity and thinking
+
+Capacity is resolved once at application creation. Set overrides before startup:
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `ONYX_MAX_CONTEXT_TOKENS` | `8192` | Prompt plus requested output tokens, also bounded by model context limits |
+| `ONYX_MAX_OUTPUT_TOKENS` | `4096` | Maximum requested output; omitted budgets use the smaller of 1024 and this limit |
+| `ONYX_MAX_ACTIVE_REQUESTS` | `8` | Running or queued completions; excess requests receive HTTP 429 |
+| `ONYX_STREAM_BUFFER_CHUNKS` | `64` | Buffered SSE chunks before the producer waits for the reader |
+
+All values must be positive integers; output must leave room for a prompt within
+context. The health endpoint reports active limits. Larger overrides require
+validation on the selected GPU. Queue depth and buffering bound waiting work;
+they do not allocate concurrent model copies. Choices within `n` run sequentially.
+
+Requests default to `"enable_thinking": false`. Set it to `true` to request the
+model's thinking template. Thinking consumes the same output/context budget.
 
 ## Example
 
@@ -102,66 +122,87 @@ Invoke-RestMethod -Uri http://127.0.0.1:8000/v1/chat/completions -Method Post -C
 ```
 
 Use `json_schema` for JSON constraints and `stream: true` for SSE. The API allows
-up to 1024 output tokens within a 2048-token prompt-plus-output budget. Partial
-output has `finish_reason: "length"` and may not satisfy the constraint.
+up to 4096 output tokens within an 8192-token prompt-plus-output budget by default.
+Partial output has `finish_reason: "length"` and may not satisfy the constraint.
 
-To see live SSE output in PowerShell, set `$body` to a request with `stream = $true`
-before converting it to JSON, then send it using:
+For live SSE output, set `stream = $true` before converting the body to JSON:
 
 ```powershell
 $body | curl.exe --no-buffer http://127.0.0.1:8000/v1/chat/completions -H "Content-Type: application/json" --data-binary "@-"
 ```
 
-Generated text is in each event's `choices[0].delta.content`. For constrained
-JSON, wait for a successful `stop` finish event; `[DONE]` alone is insufficient.
+Generated text is in `choices[0].delta.content`. For constrained JSON, wait for
+a successful `stop` finish event; `[DONE]` alone is insufficient.
 
 ## Validation
 
-For a source/development install, run the complete local suite from `onyx_cuda`:
+From a development install in `onyx_cuda` (on Linux, use the activated `python`):
 
 ```powershell
 .\.venv\Scripts\python.exe -m pytest --require-cuda
+.\.venv\Scripts\python.exe -m onyx_cuda.preflight --vram-gib 22 --output validation/default-preflight.json
+.\.venv\Scripts\python.exe -m onyx_cuda.validate_model --output validation/default-runtime.json
 ```
+
+Preflight checks metadata without loading weights; it does not establish GPU fit.
+Both tools default to the configured pair, gamma 2, and 8192 context tokens.
+Use `--gamma 0` for target-only validation or `--context-tokens` to probe another
+capacity. Runtime validation checks generation, constraints, API/SSE, and caches.
+Neither tool guarantees speedup. Reports require a new output filename.
 
 For a fresh Windows build/install check, run
 `./scripts/validate_windows.ps1 -Mode Cuda -Profile Core -Python ./.venv/Scripts/python.exe`.
-Add `-Benchmarks` to run the same-process comparison. `-Profile Full` additionally
-checks the optional CUDA kernels; Core is the default.
-Routine GitHub CI builds the package and runs Rust/CPU tests. The manual
-[release workflow](../.github/workflows/windows-release.yml) verifies a candidate
-wheel on CPU and GPU, with kernel checks available as an opt-in input.
-
-To inspect another model without loading weights, then test it on a suitable GPU:
-
-```powershell
-.\.venv\Scripts\python.exe -m onyx_cuda.preflight --target-model Qwen/Qwen2.5-7B-Instruct --vram-gib 32 --output validation/7b-preflight.json
-# On the machine that will run the model; this downloads and loads its weights:
-.\.venv\Scripts\python.exe -m onyx_cuda.validate_model --target-model Qwen/Qwen2.5-7B-Instruct --output validation/7b-runtime.json
-```
-
-Preflight establishes eligibility, not GPU fit. Add `--gamma 2` and
-`--draft-model` to inspect/test a pair. Use the resolved revisions for repeatable
-runs. A successful preflight checks metadata compatibility; runtime validation
-checks generation, constraints, API streaming, and caches on that GPU and OS.
-Neither guarantees a speedup. Reports must use a new output filename.
+Add `-Benchmarks` for performance comparisons or `-Profile Full` for the optional
+CUDA kernels. Routine CI builds the package and runs Rust/CPU tests. The manual
+[Windows release workflow](../.github/workflows/windows-release.yml) verifies the
+candidate wheel on Windows CPU and GPU. Linux validation does not replace that
+Windows delivery check.
 
 ## Measured performance
 
-Target-only generation remains the default: the tested Qwen2.5 0.5B draft +
-1.5B target workload was slower with speculation on the 6 GB RTX 4050 laptop.
-More VRAM allows a larger target alongside a small draft, but speedup still
-depends on draft cost, accepted proposals, and response length.
+The revised default passed **511 Python tests and 44 Rust tests** on the Linux
+RTX 2080 Ti reporting 22 GiB VRAM, with three Windows-only tests skipped. The
+Windows CPU suite passed 468 tests. An additional regression for an omitted
+output budget under a smaller configured limit passed on both platforms.
 
-On September 14, 2026 (UTC), commit `6cf435f` passed 497 Python tests and
-43 Rust tests on a Linux server with an RTX 2080 Ti reporting 22 GiB VRAM.
-Three Windows-only tests were skipped. CUDA and optional kernel checks were
-enabled; all 44 GPU tests returned to their starting allocated-memory level
-after cleanup. This Linux run does not replace Windows validation.
+The API completed a **4096-token prompt plus 4096 generated tokens** with gamma
+2, peaking at **17.55 GiB allocated / 18.56 GiB reserved**. Streaming, sampled,
+and thinking requests also succeeded after that long generation. Separate
+runtime validation passed all 20 checks, including both 8192-token caches.
+These checks cover the working-tree implementation; a new Windows GPU wheel
+release still requires the Windows delivery gate above.
 
-An exploratory retest paired **Qwen3-8B** with **Qwen2.5-0.5B-Instruct** and
-**Qwen2.5-1.5B-Instruct**, all in FP16. The numeric cases reproduced the Mac
-benchmark's raw prompts and regex constraints. The counting, JSON, and prose
-cases used the target's chat template with thinking disabled.
+With the production loader and **fixed gamma 2**, the bundled five-case corpus
+ran **1.29x faster in aggregate** than target-only (sum of median full-generation
+wall times). Median reported output throughput was 31.48 versus 28.17 tokens/s;
+the median per-case speedup was 1.09x, and some short cases regressed.
+
+Four additional prompts outside that corpus used the same fixed setting:
+
+| Workload | Speedup versus target-only |
+| --- | --- |
+| Two-sentence cache explanation | 1.17x |
+| Python function | 1.48x |
+| City-name extraction | 1.47x |
+| Customer-support reply | 1.17x |
+
+Their aggregate speedup was **1.27x**. All outputs completed and matched the
+same-run target-only baseline token-for-token. Both comparisons used FP16,
+non-thinking target chat formatting, one warmup, three measured repetitions,
+a 256-token budget, Torch selection, and synchronized full-generation wall
+time with timing instrumentation enabled. These small corpora establish gains
+for the tested workloads, not a general speedup guarantee.
+
+Historically, Qwen2.5 0.5B draft + 1.5B target speculation was slower on a 6 GB
+RTX 4050 laptop, so that configuration used target-only generation. It is no
+longer the default. A larger target makes speculation worthwhile when enough
+draft tokens are accepted; short replies can still be slower.
+
+On September 14, 2026 (UTC), commit `6cf435f` passed 497 Python tests and 43 Rust
+tests on a Linux RTX 2080 Ti reporting 22 GiB VRAM. Three Windows-only tests were
+skipped. All 44 GPU tests returned to their starting allocation after cleanup.
+
+An exploratory FP16 retest paired Qwen3 8B with Qwen2.5 0.5B and 1.5B drafts:
 
 | Workload | 0.5B draft speedup (gamma) | 1.5B draft speedup (gamma) |
 | --- | --- | --- |
@@ -171,23 +212,19 @@ cases used the target's chat template with thinking disabled.
 | Short JSON response | 1.41x (2) | 1.32x (2) |
 | One-sentence GPU explanation | 1.09x (2) | 1.02x (2) |
 
-Each entry selects the best observed draft length from 1, 2, 4, and 8; it is
-not the performance of one fixed configuration. Measurements used one warmup
-and three repetitions, synchronized full-call wall time, and disabled internal
-timing instrumentation. Every speculative output matched its same-run
-target-only baseline token-for-token, completed within its budget, and passed
-the applicable constraint checks. Counting reached 69.7 tokens/s with the 0.5B
-draft versus 28.9 tokens/s target-only. Very short fixed replies still favored
-target-only generation.
+These entries select the best observed gamma per case, not one fixed setting.
+The numeric cases reproduced the Mac's raw prompts and regex constraints; the
+other cases used non-thinking target chat formatting. Each used one warmup,
+three measured repetitions, synchronized full-call wall time, and disabled
+internal timing instrumentation. Every output matched the same-run target-only
+baseline token-for-token and completed successfully. Counting reached 69.7
+output tokens/s with the 0.5B draft versus 28.9 target-only.
 
-**These cross-family pairs are experimental and rejected by the production
-loader's tokenizer compatibility checks.** The isolated benchmark loaded the
-models directly without changing those checks. Four tool/thinking token byte
-mappings differ between the families. Passing these cases does not establish
-general tokenizer compatibility or API support. The weights also differ from
-the Mac's MLX 4-bit artifacts; this comparison does not isolate operating-system
-or quantization effects. The results demonstrate workload-specific CUDA
-speedups, not a general 2x improvement or a reason to change the default.
+The historical retest used an isolated loader because production then rejected
+the cross-family pair. The current loader validates shared token meanings and
+uses the target tokenizer throughout. The weights still differ from the Mac's
+MLX 4-bit artifacts; the comparison does not isolate operating-system or
+quantization effects. These are workload-specific gains, not a general 2x claim.
 
 ## Structure
 

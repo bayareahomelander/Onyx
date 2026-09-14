@@ -30,8 +30,8 @@ def positive_gib(value):
 def add_selection_arguments(parser):
     for setting in ("target-model", "target-revision", "draft-model", "draft-revision"):
         parser.add_argument(f"--{setting}", help="Overrides the corresponding ONYX environment setting")
-    parser.add_argument("--gamma", type=nonnegative_int, default=0,
-                        help="Draft proposal length; default 0 inspects/loads only the target")
+    parser.add_argument("--gamma", type=nonnegative_int, default=2,
+                        help="Draft proposal length; default 2, zero inspects/loads only the target")
     parser.add_argument("--output", type=Path, required=True, help="New JSON report path (never overwritten)")
 
 

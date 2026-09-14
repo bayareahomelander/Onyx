@@ -207,7 +207,7 @@ def validate_run(candidate, directory, mode, profile):
             require(selected.get("source", {}).get("package_sha256") == candidate["package_sha256"], "Selected validation used another package")
             settings = selected.get("settings", {})
             require(settings.get("gamma") == gamma and settings.get("greedy_backend") == "torch" and
-                    settings.get("context_tokens") == 2048 and settings.get("corpus") == "onyx-selected-model-v1", "Selected validation settings mismatch")
+                    settings.get("context_tokens") == 8192 and settings.get("corpus") == "onyx-selected-model-v1", "Selected validation settings mismatch")
             required = ["selection", "preflight", "cuda.validation", "cuda.available", "selector.startup", "target.context_cache"]
             required += [f"{case}.{kind}" for case in ("cuda_ready", "gpu_summary", "number_sequence", "regex", "json_schema", "sampled")
                          for kind in ("generation", "api_and_sse")]
@@ -227,7 +227,7 @@ def validate_run(candidate, directory, mode, profile):
         require(smoke.get("status") == "passed" and smoke.get("source", {}).get("package_sha256") == candidate["package_sha256"], "Consumer smoke used another package or failed")
         passed_checks(smoke, ["readiness", "text", "regex", "json_schema", "stream", "shutdown"])
         check_model(smoke.get("models", {}).get("target"), candidate["models"]["target"])
-        require(smoke.get("models", {}).get("draft") is None, "Consumer smoke changed the default draft setting")
+        check_model(smoke.get("models", {}).get("draft"), candidate["models"]["draft"])
     return reports
 
 
@@ -264,9 +264,9 @@ def verify_release(candidate_path, cpu, cuda, output, expected_commit, require_k
         f"Windows Onyx CUDA {candidate['version']} prerelease\n\n"
         f"Source: {expected_commit}\n\n"
         "CPython 3.12 x64 and CUDA 12.4 PyTorch are required. Install the wheel with its [server] extra. "
-        "The default is the pinned Qwen2.5 1.5B target, gamma 0, FP16, Torch selection. "
+        "The default is pinned Qwen3 8B with a Qwen2.5 0.5B draft, gamma 2, FP16, Torch selection. "
         "See the Windows README for installation and the attached evidence for tested configurations. "
-        "Larger models remain experimental; no general speedup is claimed.\n", encoding="utf-8")
+        "The default targets a 22 GiB GPU. Speedup depends on workload; no general speedup is claimed.\n", encoding="utf-8")
 
 
 def main():

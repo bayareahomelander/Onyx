@@ -6,6 +6,8 @@ import json
 import re
 import sys
 
+from onyx_cuda.config import DEFAULT_CONTEXT_TOKENS
+
 import torch
 
 from onyx_cuda._validation_report import (
@@ -63,7 +65,7 @@ def generation_check(pair, payload, gamma, backend):
     arguments.update(greedy_backend=backend, measure=True)
     baseline = generate_speculative(**arguments)
     expected_ids, expected_reason = baseline.token_ids, baseline.finish_reason
-    # Drop returned caches before running the next mode on a small GPU.
+    # Drop returned caches before running the next mode.
     del baseline
     arguments["gamma"] = gamma
     parts, terminal, timings = [], None, None
@@ -186,7 +188,7 @@ def context_cache_check(loaded, context_tokens):
             "max_replay_logit_difference": (expected - replay).abs().max().item()}
 
 
-def validate_selected(selection, *, gamma, backend, report, context_tokens=2048):
+def validate_selected(selection, *, gamma, backend, report, context_tokens=DEFAULT_CONTEXT_TOKENS):
     from fastapi.testclient import TestClient
     from onyx_cuda.device import require_cuda
     from onyx_cuda.server import create_app
@@ -233,7 +235,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     add_selection_arguments(parser)
     parser.add_argument("--greedy-backend", choices=("torch", "cuda"), default="torch")
-    parser.add_argument("--context-tokens", type=int, choices=range(64, 2049), metavar="64..2048", default=2048)
+    parser.add_argument("--context-tokens", type=int, choices=range(64, 131073), metavar="64..131072", default=DEFAULT_CONTEXT_TOKENS)
     args = parser.parse_args(argv)
     reserve_report(args.output)
     report = evidence("selected-model-validation")

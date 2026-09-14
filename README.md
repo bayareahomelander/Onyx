@@ -9,7 +9,7 @@ There are two independent implementations:
 | Platform | Runtime | Setup |
 | --- | --- | --- |
 | macOS / Apple Silicon | MLX | [Mac setup below](#mac-setup) |
-| Windows / NVIDIA GPU | PyTorch + CUDA | [Windows setup](onyx_cuda/README.md) |
+| Windows or Linux / NVIDIA GPU | PyTorch + CUDA | [CUDA setup](onyx_cuda/README.md) |
 
 ## Setup
 
@@ -33,7 +33,7 @@ python -m maturin develop --release
 python -m uvicorn onyx.server:app --host 127.0.0.1 --port 8000
 ```
 
-For Windows/NVIDIA setup, model selection, and benchmarks, see the
+For NVIDIA CUDA setup, model selection, and benchmarks, see the
 [Onyx CUDA README](onyx_cuda/README.md).
 
 ## Example
@@ -58,7 +58,7 @@ onyx/          Apple Silicon inference and API
 rust/          Apple Silicon package's native grammar engine
 examples/      Python usage examples
 tests/         Apple Silicon tests
-onyx_cuda/     Windows package: Python source, native engine, tests, and build tools
+onyx_cuda/     NVIDIA CUDA package: Python source, native engine, tests, and build tools
 ```
 
 ## License

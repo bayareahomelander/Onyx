@@ -8,7 +8,7 @@ from transformers.cache_utils import DynamicCache
 from onyx_cuda import _rust
 import onyx_cuda.generation as generation_module
 from onyx_cuda.generation import generate_tokens
-from onyx_cuda.model import MODEL_ID, TARGET_MODEL_ID, load_model_pair
+from onyx_cuda.model import MODEL_ID, TARGET_MODEL_ID, load_model_pair, inspect_model
 from onyx_cuda.prefill import prefill
 from onyx_cuda.prompt import format_prompt
 from onyx_cuda.vocabulary import build_token_byte_vocabulary
@@ -22,7 +22,7 @@ EXPECTED_PROMPT_TEXT = (
     "You are a concise assistant.<|im_end|>\n"
     "<|im_start|>user\n"
     "Reply with CUDA ready.<|im_end|>\n"
-    "<|im_start|>assistant\n"
+    "<|im_start|>assistant\n<think>\n\n</think>\n\n"
 )
 EXPECTED_PROMPT_TOKEN_IDS = [
     151644,
@@ -49,6 +49,10 @@ EXPECTED_PROMPT_TOKEN_IDS = [
     151644,
     77091,
     198,
+    151667,
+    271,
+    151668,
+    271,
 ]
 
 
@@ -93,7 +97,7 @@ def test_load_model_prompt_prefill_and_generation_on_cuda(monkeypatch, record_mo
     assert loaded.tokenizer.decode(prompt.token_ids, skip_special_tokens=True) == (
         "system\nYou are a concise assistant.\n"
         "user\nReply with CUDA ready.\n"
-        "assistant\n"
+        "assistant\n<think>\n\n</think>\n\n"
     )
     assert loaded.tokenizer.bos_token_id is None
     assert (loaded.tokenizer.eos_token, loaded.tokenizer.eos_token_id) == (
@@ -104,7 +108,7 @@ def test_load_model_prompt_prefill_and_generation_on_cuda(monkeypatch, record_mo
         "<|endoftext|>",
         151643,
     )
-    assert prompt.token_ids[-3:] == [151644, 77091, 198]
+    assert prompt.token_ids[-4:] == [151667, 271, 151668, 271]
     assert prompt.token_ids[-1] != loaded.tokenizer.eos_token_id
 
     result = prefill(loaded.model, prompt.token_ids)
@@ -141,7 +145,7 @@ def test_load_model_prompt_prefill_and_generation_on_cuda(monkeypatch, record_mo
     assert vocabulary == repeated_vocabulary
     assert len(vocabulary.token_bytes) == result.logits.shape[-1]
     assert vocabulary.special_token_count == 14
-    assert vocabulary.empty_token_count == 285
+    assert vocabulary.empty_token_count == 281
     assert vocabulary.token_bytes[11] == b","
     assert vocabulary.token_bytes[13] == b"."
     assert vocabulary.token_bytes[198] == b"\n"
@@ -149,7 +153,7 @@ def test_load_model_prompt_prefill_and_generation_on_cuda(monkeypatch, record_mo
     assert vocabulary.token_bytes[80285] == b"CUDA"
     assert vocabulary.token_bytes[151643] == b""
     assert vocabulary.token_bytes[94] == b"\xa1"
-    assert vocabulary.token_bytes[151665] == b""
+    assert vocabulary.token_bytes[151665] == b"<tool_response>"
     assert vocabulary.token_bytes[-1] == b""
 
     cache = result.past_key_values
@@ -181,6 +185,12 @@ def test_load_model_prompt_prefill_and_generation_on_cuda(monkeypatch, record_mo
     gc.collect()
     torch.cuda.empty_cache()
 
+    # The pair above uses the target tokenizer. Exercise the standalone draft
+    # oracle below with its own pinned template, rather than expecting its old
+    # wording when conditioned on the Qwen3 thinking delimiters.
+    metadata = inspect_model(MODEL_ID, revision=loaded.revision)
+    loaded = loaded._replace(tokenizer=metadata.tokenizer)
+    prompt = format_prompt(loaded.tokenizer, MESSAGES)
     input_ids = torch.tensor([prompt.token_ids], device=device)
     attention_mask = torch.ones_like(input_ids)
     with torch.inference_mode():

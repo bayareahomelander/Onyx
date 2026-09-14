@@ -32,7 +32,7 @@ class TemplateTokenizer:
     def __init__(self):
         self.calls = []
 
-    def apply_chat_template(self, messages, tokenize, add_generation_prompt):
+    def apply_chat_template(self, messages, tokenize, add_generation_prompt, **kwargs):
         self.calls.append(
             {
                 "messages": messages,
@@ -91,7 +91,7 @@ def test_format_falls_back_without_template_and_on_type_error():
     assert token_ids == [4, 5]
 
     class TypeErrorTokenizer:
-        def apply_chat_template(self, messages, tokenize, add_generation_prompt):
+        def apply_chat_template(self, messages, tokenize, add_generation_prompt, **kwargs):
             raise TypeError("unsupported signature")
 
         def encode(self, text, add_special_tokens=False):
@@ -192,3 +192,15 @@ def test_vocabulary_cache_reuses_only_matching_tokenizer_and_width(monkeypatch):
         assert calls == [(first, 4), (first, 5), (second, 4), (first, 4)]
     finally:
         vocabulary_module.get_token_byte_vocabulary.cache_clear()
+
+
+
+def test_thinking_policy_is_explicit_in_both_template_calls():
+    calls = []
+    tokenizer = SimpleNamespace(apply_chat_template=lambda messages, **kwargs:
+                                calls.append(kwargs) or ([1] if kwargs["tokenize"] else "prompt"))
+    format_request_messages(_messages(), tokenizer)
+    assert all(call["enable_thinking"] is False for call in calls)
+    calls.clear()
+    format_request_messages(_messages(), tokenizer, enable_thinking=True)
+    assert all(call["enable_thinking"] is True for call in calls)

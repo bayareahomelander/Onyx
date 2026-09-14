@@ -22,10 +22,6 @@ from onyx_cuda.vocabulary import build_token_byte_vocabulary, get_token_byte_voc
 
 MODEL_ID = DEFAULT_DRAFT_MODEL
 TARGET_MODEL_ID = DEFAULT_TARGET_MODEL
-_COMPATIBILITY_MESSAGES = [
-    {"role": "system", "content": "You are a concise assistant."},
-    {"role": "user", "content": "Reply with CUDA ready."},
-]
 
 
 class LoadedModel(NamedTuple):
@@ -173,24 +169,23 @@ def require_compatible_metadata(draft: ModelMetadata, target: ModelMetadata) -> 
     target_bytes = build_token_byte_vocabulary(
         target.tokenizer, target_width
     ).token_bytes
-    if draft_bytes != target_bytes:
-        mismatch_id = next(
-            token_id
-            for token_id, values in enumerate(zip(draft_bytes, target_bytes))
-            if values[0] != values[1]
-        )
-        raise RuntimeError(
-            f"Draft and target token bytes differ at token ID {mismatch_id}"
-        )
-
-    if draft.tokenizer.all_special_ids != target.tokenizer.all_special_ids:
-        raise RuntimeError("Draft and target special token IDs differ")
+    # Both models consume target-token IDs. A target may add tokens in unused
+    # draft embedding slots; proposals for those IDs still require target
+    # verification. Existing draft tokens must retain identical byte meanings.
+    draft_ids = set(draft.tokenizer.get_vocab().values())
+    for token_id, (draft_value, target_value) in enumerate(zip(draft_bytes, target_bytes)):
+        if draft_value != target_value and token_id in draft_ids:
+            raise RuntimeError(f"Draft and target token bytes differ at token ID {token_id}")
     if draft.tokenizer.eos_token_id != target.tokenizer.eos_token_id:
         raise RuntimeError("Draft and target EOS token IDs differ")
-    if format_prompt(draft.tokenizer, _COMPATIBILITY_MESSAGES) != format_prompt(
-        target.tokenizer, _COMPATIBILITY_MESSAGES
-    ):
-        raise RuntimeError("Draft and target chat-template output differs")
+    target_special = set(target.tokenizer.all_special_ids)
+    for token_id in draft.tokenizer.all_special_ids:
+        if (token_id not in target_special or
+                draft.tokenizer.convert_ids_to_tokens(token_id) !=
+                target.tokenizer.convert_ids_to_tokens(token_id)):
+            raise RuntimeError("Draft and target special token IDs differ")
+    # Chat templates need not match: the target alone formats prompts, defines
+    # grammar bytes, decodes output, and determines acceptance/termination.
 
 
 def load_model_pair(*, include_draft: bool = True, selection: ModelSelection | None = None) -> LoadedModelPair:
@@ -201,4 +196,7 @@ def load_model_pair(*, include_draft: bool = True, selection: ModelSelection | N
         return LoadedModelPair(None, target)
     draft = load_model(selection.draft_model, revision=selection.draft_revision)
     _require_compatible_models(draft, target)
+    # Publish one canonical tokenizer so all API and programmatic consumers use
+    # target semantics, including thinking markers unknown to the draft tokenizer.
+    draft = draft._replace(tokenizer=target.tokenizer)
     return LoadedModelPair(draft, target)

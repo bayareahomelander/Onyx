@@ -14,7 +14,7 @@ from pathlib import Path
 import httpx
 
 from onyx_cuda._validation_report import check, evidence, reserve_report, write_report
-from onyx_cuda.config import DEFAULT_TARGET_MODEL, MODEL_ENVIRONMENT_VARIABLES
+from onyx_cuda.config import DEFAULT_GAMMA, DEFAULT_DRAFT_MODEL, DEFAULT_TARGET_MODEL, MODEL_ENVIRONMENT_VARIABLES
 from onyx_cuda.revisions import MODEL_REVISIONS
 from onyx_cuda.validate_model import parse_sse, require
 
@@ -62,10 +62,12 @@ def wait_ready(process, client, log, port, timeout):
                 response = client.get("/", timeout=2)
                 if response.status_code == 200:
                     health = response.json()
-                    require(health["speculative_gamma"] == 0 and health["greedy_backend"] == "torch", "Server defaults changed")
+                    require(health["speculative_gamma"] == DEFAULT_GAMMA and health["greedy_backend"] == "torch", "Server defaults changed")
                     target = health["models"]["target"]
                     require(target["id"] == DEFAULT_TARGET_MODEL and target["revision"] == MODEL_REVISIONS[DEFAULT_TARGET_MODEL], "Wrong startup model/revision")
-                    require(health["models"]["draft"] is None, "Default server loaded a draft")
+                    require(health["models"]["draft"]["id"] == DEFAULT_DRAFT_MODEL and
+                            health["models"]["draft"]["revision"] == MODEL_REVISIONS[DEFAULT_DRAFT_MODEL],
+                            "Wrong default draft model/revision")
                     return health["models"]
             except httpx.TransportError:
                 pass
@@ -114,7 +116,8 @@ def main(argv=None):
             reservation.bind(("127.0.0.1", 0))
             port = reservation.getsockname()[1]
         environment = os.environ.copy()
-        for key in (*MODEL_ENVIRONMENT_VARIABLES, "ONYX_SPECULATIVE_GAMMA", "ONYX_GREEDY_BACKEND", "PYTHONPATH", "PYTHONHOME"):
+        for key in (*MODEL_ENVIRONMENT_VARIABLES, "ONYX_SPECULATIVE_GAMMA", "ONYX_GREEDY_BACKEND", "PYTHONPATH", "PYTHONHOME", "ONYX_MAX_CONTEXT_TOKENS", "ONYX_MAX_OUTPUT_TOKENS",
+                    "ONYX_MAX_ACTIVE_REQUESTS", "ONYX_STREAM_BUFFER_CHUNKS"):
             environment.pop(key, None)
         options = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if os.name == "nt" else {}
         log = args.output.with_suffix(".log")

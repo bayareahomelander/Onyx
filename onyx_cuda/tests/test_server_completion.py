@@ -23,7 +23,7 @@ class FakeTokenizer:
     def __init__(self, decoded):
         self.decoded = decoded
 
-    def apply_chat_template(self, messages, tokenize, add_generation_prompt):
+    def apply_chat_template(self, messages, tokenize, add_generation_prompt, **kwargs):
         assert add_generation_prompt is True
         return [1, 2, 3] if tokenize else "prompt"
 
@@ -875,8 +875,8 @@ def test_real_uvicorn_api_phase_gate(monkeypatch):
     from onyx_cuda.model import load_model_pair
     from onyx_cuda.speculative import generate_speculative
 
-    pair = load_model_pair(include_draft=False)
-    assert pair.draft is None
+    pair = load_model_pair()
+    assert pair.draft is not None
     app = create_app(engine=pair)
     sock = socket.socket()
     sock.bind(("127.0.0.1", 0))

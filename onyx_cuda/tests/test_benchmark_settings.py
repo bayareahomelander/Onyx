@@ -17,7 +17,7 @@ def test_report_records_answer_settings():
 def test_thinking_override_applies_to_text_and_tokens_only_when_requested():
     calls = []
     tokenizer = SimpleNamespace(apply_chat_template=lambda messages, **kw: calls.append(kw))
-    format_prompt(tokenizer, [])
+    format_prompt(tokenizer, [], enable_thinking=None)
     assert all("enable_thinking" not in call for call in calls)
     calls.clear()
     format_prompt(tokenizer, [], enable_thinking=False)

@@ -47,7 +47,7 @@ impl RegexEngine {
                     .start_kind(regex_automata::dfa::StartKind::Anchored)
                     .match_kind(regex_automata::MatchKind::LeftmostFirst),
             )
-            .build(pattern)
+            .build(&format!(r"\A(?:{})\z", pattern))
             .map_err(|error| {
                 ConstraintError::CompilationError(format!("Failed to compile regex: {error}"))
             })?;
@@ -215,4 +215,17 @@ mod tests {
         assert!(engine.is_finished());
         assert!(!engine.is_dead());
     }
+    #[test]
+    fn test_complete_marker_rejects_trailing_bytes_in_same_token() {
+        let mut engine = RegexEngine::new(
+            vec![b"<think>".to_vec(), b"ok".to_vec(), b"</think>".to_vec(),
+                 b"</think>\n".to_vec()], "<think>ok</think>"
+        ).unwrap();
+        engine.advance(0).unwrap();
+        engine.advance(1).unwrap();
+        assert_eq!(engine.get_valid_tokens(), vec![2]);
+        engine.advance(2).unwrap();
+        assert!(engine.is_finished());
+    }
+
 }

@@ -7,7 +7,38 @@ from dataclasses import dataclass
 from onyx_cuda.revisions import MODEL_REVISIONS
 
 DEFAULT_DRAFT_MODEL = "Qwen/Qwen2.5-0.5B-Instruct"
-DEFAULT_TARGET_MODEL = "Qwen/Qwen2.5-1.5B-Instruct"
+DEFAULT_TARGET_MODEL = "Qwen/Qwen3-8B"
+DEFAULT_GAMMA = 2
+DEFAULT_CONTEXT_TOKENS = 8192
+DEFAULT_OUTPUT_TOKENS = 4096
+
+
+@dataclass(frozen=True)
+class ServiceLimits:
+    context_tokens: int = DEFAULT_CONTEXT_TOKENS
+    output_tokens: int = DEFAULT_OUTPUT_TOKENS
+    active_requests: int = 8
+    stream_buffer_chunks: int = 64
+
+
+def resolve_service_limits() -> ServiceLimits:
+    values = {}
+    for field, variable in (
+        ("context_tokens", "ONYX_MAX_CONTEXT_TOKENS"),
+        ("output_tokens", "ONYX_MAX_OUTPUT_TOKENS"),
+        ("active_requests", "ONYX_MAX_ACTIVE_REQUESTS"),
+        ("stream_buffer_chunks", "ONYX_STREAM_BUFFER_CHUNKS"),
+    ):
+        raw = os.environ.get(variable)
+        if raw is not None:
+            if not raw.isascii() or not raw.isdecimal() or int(raw) < 1:
+                raise ValueError(f"{variable} must be a positive integer")
+            values[field] = int(raw)
+    limits = ServiceLimits(**values)
+    if limits.output_tokens >= limits.context_tokens:
+        raise ValueError("Output limit must leave room for a prompt within the context limit")
+    return limits
+
 MODEL_ENVIRONMENT_VARIABLES = (
     "ONYX_TARGET_MODEL", "ONYX_TARGET_REVISION", "ONYX_DRAFT_MODEL", "ONYX_DRAFT_REVISION",
 )

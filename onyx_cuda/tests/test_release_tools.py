@@ -56,11 +56,11 @@ def reports(tmp_path):
         if gamma:
             names += ["draft.context_cache", "speculation.forced_rejection_and_replay"]
         save(tmp_path, filename, {"status": "passed", "support_level": "tested", "source": {"package_sha256": package},
-             "settings": {"gamma": gamma, "greedy_backend": "torch", "context_tokens": 2048, "corpus": "onyx-selected-model-v1"},
+             "settings": {"gamma": gamma, "greedy_backend": "torch", "context_tokens": 8192, "corpus": "onyx-selected-model-v1"},
              "models": {"target": candidate["models"]["target"], "draft": candidate["models"]["draft"] if gamma else None},
              "checks": passed(names)})
     save(tmp_path, "consumer-smoke.json", {"status": "passed", "source": {"package_sha256": package},
-         "models": {"target": candidate["models"]["target"], "draft": None},
+         "models": {"target": candidate["models"]["target"], "draft": candidate["models"]["draft"]},
          "checks": passed(["readiness", "text", "regex", "json_schema", "stream", "shutdown"])})
     return candidate, tmp_path
 

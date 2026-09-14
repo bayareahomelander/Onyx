@@ -120,22 +120,22 @@ def test_shutdown_releases_cuda_cache(monkeypatch):
     assert app.state.engines == {}
 
 
-def test_server_defaults_to_target_only_and_allows_explicit_speculation(monkeypatch):
+def test_server_defaults_to_speculation_and_allows_target_only(monkeypatch):
     calls = []
     monkeypatch.delenv("ONYX_SPECULATIVE_GAMMA", raising=False)
     monkeypatch.setattr(
         server, "_load_configured_engine", lambda gamma, selection: calls.append(gamma) or object()
     )
     with TestClient(create_app()) as client:
-        assert client.app.state.speculative_gamma == 0
-        assert client.get("/").json()["speculative_gamma"] == 0
+        assert client.app.state.speculative_gamma == server.GAMMA
+        assert client.get("/").json()["speculative_gamma"] == server.GAMMA
     monkeypatch.setenv("ONYX_SPECULATIVE_GAMMA", "2")
     with TestClient(create_app()) as client:
         assert client.app.state.speculative_gamma == 2
         assert client.get("/").json()["speculative_gamma"] == 2
     with TestClient(create_app(gamma=0)) as client:
         assert client.app.state.speculative_gamma == 0
-    assert calls == [0, 2, 0]
+    assert calls == [server.GAMMA, 2, 0]
     monkeypatch.setenv("ONYX_SPECULATIVE_GAMMA", "auto")
     with pytest.raises(ValueError, match="ONYX_SPECULATIVE_GAMMA"):
         create_app()

@@ -23,8 +23,8 @@ from onyx_cuda.vocabulary import build_token_byte_vocabulary, get_token_byte_voc
 
 WARMUPS = 1
 REPETITIONS = 3
-MAX_TOKENS = 32
-SPECULATIVE_GAMMAS = (1, 2, 4)
+MAX_TOKENS = 256
+SPECULATIVE_GAMMAS = (1, 2, 4, 8)
 COMPARISON_OUTPUT = Path("benchmarks/results/performance_comparison.json")
 PROMPTS = {
     "cuda_ready": "Reply with CUDA ready.",
@@ -34,7 +34,7 @@ PROMPTS = {
 @dataclass(frozen=True)
 class BenchmarkOptions:
     max_tokens: int = MAX_TOKENS
-    enable_thinking: bool | None = None
+    enable_thinking: bool | None = False
     require_complete: bool = False
 
 
@@ -338,15 +338,6 @@ def _run_constraint_prompts(
 
 def run_comparison(output: Path, device, selection=None, *, options=BenchmarkOptions()) -> None:
     pair = load_model_pair(selection=selection)
-    if options.enable_thinking is not None:
-        messages = [{"role": "user", "content": "Reply with CUDA ready."}]
-        target_prompt = format_prompt(pair.target.tokenizer, messages,
-                                      enable_thinking=options.enable_thinking)
-        if target_prompt == format_prompt(pair.target.tokenizer, messages):
-            raise RuntimeError("The selected thinking override did not change the target chat prompt")
-        if target_prompt != format_prompt(pair.draft.tokenizer, messages,
-                                          enable_thinking=options.enable_thinking):
-            raise RuntimeError("Draft and target chat prompts differ with the thinking override")
     # Report the API's reusable CPU setup separately from GPU generation.
 
     cold_setup, warm_setup = [], []
@@ -442,18 +433,15 @@ def run_comparison(output: Path, device, selection=None, *, options=BenchmarkOpt
             }
         )
 
-    # A general default must beat target-only across every measured case, with
-    # headroom for timing noise. Per-case winners remain visible in the report.
-    eligible = [
-        group
-        for group in gamma_results
-        if group["gamma"] == 0
-        or all(
-            prompt["speedup_vs_target"] >= 1.05
-            for prompt in group["unconstrained_prompts"] + group["constraint_prompts"]
+    # Compare total time over the declared corpus. Individual regressions remain
+    # visible; this is a workload result, not a guarantee for every request.
+    baseline_seconds = sum(p["median_generation_wall_seconds"] for p in expected_prompts)
+    for group in gamma_results:
+        group["aggregate_speedup_vs_target"] = baseline_seconds / sum(
+            p["median_generation_wall_seconds"]
+            for p in group["unconstrained_prompts"] + group["constraint_prompts"]
         )
-    ]
-    best = max(eligible, key=lambda group: group["median_speedup_vs_target"])
+    best = max(gamma_results, key=lambda group: group["aggregate_speedup_vs_target"])
     results = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "models": {
@@ -486,8 +474,7 @@ def run_comparison(output: Path, device, selection=None, *, options=BenchmarkOpt
         "gamma_results": gamma_results,
         "best_gamma": best["gamma"],
         "best_gamma_criterion": (
-            "best median speedup among modes at least 5% faster on every case; "
-            "otherwise gamma=0 (target-only)"
+            "lowest total generation wall time across this benchmark corpus"
         ),
     }
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -510,17 +497,18 @@ def run_comparison(output: Path, device, selection=None, *, options=BenchmarkOpt
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--compare", action="store_true", help="Compare gamma 0/1/2/4 (the default)")
+    parser.add_argument("--compare", action="store_true", help="Compare gamma 0/1/2/4/8 (the default)")
     parser.add_argument("--output", type=Path)
     parser.add_argument("--max-tokens", type=int, default=MAX_TOKENS)
+    parser.add_argument("--enable-thinking", action="store_true", help="Enable model thinking for this benchmark")
     parser.add_argument("--disable-thinking", action="store_true",
                         help="Pass enable_thinking=False to the model chat template")
     parser.add_argument("--require-complete", action="store_true",
                         help="Fail rather than report timings for truncated answers")
     args = parser.parse_args()
-    if not 1 <= args.max_tokens <= 2048:
-        parser.error("--max-tokens must be between 1 and 2048")
-    options = BenchmarkOptions(args.max_tokens, False if args.disable_thinking else None,
+    if not 1 <= args.max_tokens <= 131072:
+        parser.error("--max-tokens must be between 1 and 131072")
+    options = BenchmarkOptions(args.max_tokens, bool(args.enable_thinking and not args.disable_thinking),
                                args.require_complete)
     from onyx_cuda.config import resolve_model_selection
 

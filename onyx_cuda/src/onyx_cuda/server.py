@@ -19,17 +19,17 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from onyx_cuda.config import initialize_greedy_backend, resolve_greedy_backend, resolve_model_selection
+from onyx_cuda.config import (initialize_greedy_backend, resolve_greedy_backend, resolve_model_selection,
+                              DEFAULT_GAMMA, DEFAULT_CONTEXT_TOKENS, DEFAULT_OUTPUT_TOKENS,
+                              resolve_service_limits)
 
 MODEL_ID = "onyx-speculative"
 SERVICE_VERSION = "0.1.0"
-GAMMA = 0
-# Conservative single-device API envelope. Programmatic generators are separate.
-MAX_OUTPUT_TOKENS = 1024
-MAX_CONTEXT_TOKENS = 2048
+GAMMA = DEFAULT_GAMMA
+# Default service envelope validated on the 22 GiB server; configurable at startup.
+MAX_OUTPUT_TOKENS = DEFAULT_OUTPUT_TOKENS
+MAX_CONTEXT_TOKENS = DEFAULT_CONTEXT_TOKENS
 MAX_CHOICES = 4
-MAX_ACTIVE_REQUESTS = 8
-STREAM_BUFFER_CHUNKS = 64
 
 
 class RequestCapacityMiddleware:
@@ -96,11 +96,12 @@ class ChatCompletionRequest(BaseModel):
     model: str = MODEL_ID
     messages: list[ChatMessage] = Field(min_length=1, max_length=128)
     max_tokens: int = Field(
-        default=256, ge=1, le=MAX_OUTPUT_TOKENS,
+        default=1024, ge=1,
         validation_alias=AliasChoices("max_tokens", "max_completion_tokens")
     )
     temperature: float = Field(default=0.0, ge=0, allow_inf_nan=False)
     stream: bool = False
+    enable_thinking: bool = False
     regex: str | None = None
     json_schema: dict[str, Any] | None = None
     response_format: (
@@ -132,8 +133,8 @@ class ChatCompletionRequest(BaseModel):
 
     @model_validator(mode="after")
     def validate_options(self):
-        if sum(len(message.content) for message in self.messages) > 32768:
-            raise ValueError("Message content exceeds 32768 characters")
+        if sum(len(message.content) for message in self.messages) > 131072:
+            raise ValueError("Message content exceeds 131072 characters")
         if self.stream and self.n != 1:
             raise ValueError("stream=true supports only n=1")
         if (
@@ -247,14 +248,15 @@ def _encode_text(tokenizer, text: str) -> list[int]:
     return list(token_ids)
 
 
-def format_request_messages(messages: list[ChatMessage], tokenizer) -> tuple[str, list[int]]:
+def format_request_messages(messages: list[ChatMessage], tokenizer, *, enable_thinking: bool = False) -> tuple[str, list[int]]:
     chat_messages = [{"role": message.role, "content": message.content} for message in messages]
     apply_chat_template = getattr(tokenizer, "apply_chat_template", None)
     if apply_chat_template is not None:
         try:
-            text = apply_chat_template(chat_messages, tokenize=False, add_generation_prompt=True)
+            text = apply_chat_template(chat_messages, tokenize=False, add_generation_prompt=True,
+                                       enable_thinking=enable_thinking)
             token_ids = apply_chat_template(
-                chat_messages, tokenize=True, add_generation_prompt=True
+                chat_messages, tokenize=True, add_generation_prompt=True, enable_thinking=enable_thinking
             )
             return text, list(token_ids)
         except TypeError:
@@ -276,9 +278,10 @@ def resolve_stop_sequences(stop: list[str] | None, tokenizer) -> list[list[int]]
     return sequences or None
 
 
-def _request_prompt_token_ids(request: ChatCompletionRequest, engine) -> list[int]:
-    _text, token_ids = format_request_messages(request.messages, engine.target.tokenizer)
-    limit = MAX_CONTEXT_TOKENS
+def _request_prompt_token_ids(request: ChatCompletionRequest, engine, *, context_limit=MAX_CONTEXT_TOKENS) -> list[int]:
+    _text, token_ids = format_request_messages(request.messages, engine.target.tokenizer,
+                                               enable_thinking=request.enable_thinking)
+    limit = context_limit
     for loaded in (engine.target, engine.draft):
         if loaded is not None:
             context = getattr(getattr(loaded.model, "config", None), "max_position_embeddings", None)
@@ -483,7 +486,7 @@ async def _stream_chat_completion(app: FastAPI, request: ChatCompletionRequest, 
     lock = app.state.engine_locks[request.model]
     await lock.acquire()
     cancelled = threading.Event()
-    items: queue.Queue[str | None] = queue.Queue(maxsize=STREAM_BUFFER_CHUNKS)
+    items: queue.Queue[str | None] = queue.Queue(maxsize=app.state.limits.stream_buffer_chunks)
 
     def put(chunk: str | None) -> bool:
         while not cancelled.is_set():
@@ -565,6 +568,7 @@ def create_app(
     draft_model: str | None = None,
     draft_revision: str | None = None,
 ) -> FastAPI:
+    limits = resolve_service_limits()
     greedy_backend = resolve_greedy_backend(greedy_backend)
     if gamma is None:
         try:
@@ -626,9 +630,10 @@ def create_app(
         version=SERVICE_VERSION,
         lifespan=lifespan,
     )
+    app.state.limits = limits
     app.state.speculative_gamma = gamma
     app.state.greedy_backend = greedy_backend
-    app.add_middleware(RequestCapacityMiddleware, capacity=MAX_ACTIVE_REQUESTS)
+    app.add_middleware(RequestCapacityMiddleware, capacity=limits.active_requests)
     app.add_exception_handler(ValueError, _invalid_request)
     app.add_exception_handler(OSError, _service_unavailable)
     app.add_exception_handler(RuntimeError, _service_unavailable)
@@ -644,11 +649,11 @@ def create_app(
             "greedy_backend": app.state.greedy_backend,
             "models": app.state.model_configuration,
             "limits": {
-                "max_output_tokens": MAX_OUTPUT_TOKENS,
-                "max_context_tokens": MAX_CONTEXT_TOKENS,
+                "max_output_tokens": limits.output_tokens,
+                "max_context_tokens": limits.context_tokens,
                 "max_choices": MAX_CHOICES,
-                "max_active_requests": MAX_ACTIVE_REQUESTS,
-                "stream_buffer_chunks": STREAM_BUFFER_CHUNKS,
+                "max_active_requests": limits.active_requests,
+                "stream_buffer_chunks": limits.stream_buffer_chunks,
             },
             "endpoints": ["/", "/v1/models", "/v1/chat/completions"],
         }
@@ -671,7 +676,11 @@ def create_app(
     @app.post("/v1/chat/completions", response_model=ChatCompletionResponse)
     async def create_chat_completion(request: ChatCompletionRequest, http_request: Request):
         engine = get_engine(app, request.model)
-        prompt_token_ids = _request_prompt_token_ids(request, engine)
+        if "max_tokens" not in request.model_fields_set:
+            request.max_tokens = min(request.max_tokens, limits.output_tokens)
+        if request.max_tokens > limits.output_tokens:
+            raise HTTPException(status_code=422, detail=f"max_tokens exceeds output limit {limits.output_tokens}")
+        prompt_token_ids = _request_prompt_token_ids(request, engine, context_limit=limits.context_tokens)
         if request.regex is not None:
             from onyx_cuda import _rust
 

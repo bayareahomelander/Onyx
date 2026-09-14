@@ -56,14 +56,14 @@ def test_valid_request_and_response_round_trip():
         "stop": ["END"],
     }
     request = ChatCompletionRequest.model_validate(request_payload)
-    assert request.model_dump() == request_payload
+    assert request.model_dump() == {**request_payload, "enable_thinking": False}
     assert ChatCompletionRequest.model_validate(request.model_dump()) == request
 
     defaults = ChatCompletionRequest.model_validate(
         {"messages": [{"role": "user", "content": "hi"}]}
     )
     assert defaults.model == "onyx-speculative"
-    assert defaults.max_tokens == 256
+    assert defaults.max_tokens == 1024
     assert defaults.temperature == 0.0
     assert defaults.stream is False
     assert defaults.regex is None

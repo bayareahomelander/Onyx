@@ -4,6 +4,8 @@ import argparse
 import sys
 from dataclasses import replace
 
+from onyx_cuda.config import DEFAULT_CONTEXT_TOKENS
+
 import torch
 from transformers import AutoModelForCausalLM
 
@@ -38,9 +40,9 @@ def estimate_memory(config, context_tokens):
             "buffer_bytes": buffers, "full_attention_kv_bytes": kv_bytes}
 
 
-def precheck(selection, *, gamma=0, context_tokens=2048, vram_gib=None, report=None):
-    if not 1 <= context_tokens <= 2048:
-        raise ValueError("context_tokens must be between 1 and the API limit of 2048")
+def precheck(selection, *, gamma=0, context_tokens=DEFAULT_CONTEXT_TOKENS, vram_gib=None, report=None):
+    if not 1 <= context_tokens <= 131072:
+        raise ValueError("context_tokens must be between 1 and 131072")
     if isinstance(gamma, bool) or not isinstance(gamma, int) or gamma < 0:
         raise ValueError("gamma must be a nonnegative integer")
     report = report if report is not None else evidence("model-preflight")
@@ -85,7 +87,7 @@ def precheck(selection, *, gamma=0, context_tokens=2048, vram_gib=None, report=N
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     add_selection_arguments(parser)
-    parser.add_argument("--context-tokens", type=int, choices=range(1, 2049), metavar="1..2048", default=2048)
+    parser.add_argument("--context-tokens", type=int, choices=range(1, 131073), metavar="1..131072", default=DEFAULT_CONTEXT_TOKENS)
     parser.add_argument("--vram-gib", type=positive_gib, help="Optional hypothetical GPU capacity in GiB")
     args = parser.parse_args(argv)
     reserve_report(args.output)
