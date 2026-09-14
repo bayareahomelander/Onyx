@@ -33,23 +33,8 @@ python -m maturin develop --release
 python -m uvicorn onyx.server:app --host 127.0.0.1 --port 8000
 ```
 
-### Windows setup
-
-Use the separate package in `onyx_cuda`. It requires Python 3.12 x64, an NVIDIA
-GPU, and CUDA-enabled PyTorch. Building from source also requires Rust MSVC and
-Visual Studio C++ Build Tools.
-See the [Windows guide](onyx_cuda/README.md) for installation and startup commands.
-
-Windows defaults to Qwen2.5 1.5B target-only FP16 generation. The 0.5B draft
-model and custom CUDA token selector are optional; the tested Windows workload
-is fastest with target-only generation on the 6 GB RTX 4050.
-
-With more VRAM, you can explicitly select a larger compatible target or
-draft/target pair. Onyx does not automatically switch models or prompt you based
-on available VRAM. See the [Windows model-selection and validation guide](onyx_cuda/README.md#model-selection)
-to check a configuration and configure it at startup.
-
-Model weights download on first use. Run one server at a time on port 8000.
+For Windows/NVIDIA setup, model selection, and benchmarks, see the
+[Onyx CUDA README](onyx_cuda/README.md).
 
 ## Example
 

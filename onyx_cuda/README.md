@@ -145,6 +145,50 @@ runs. A successful preflight checks metadata compatibility; runtime validation
 checks generation, constraints, API streaming, and caches on that GPU and OS.
 Neither guarantees a speedup. Reports must use a new output filename.
 
+## Measured performance
+
+Target-only generation remains the default: the tested Qwen2.5 0.5B draft +
+1.5B target workload was slower with speculation on the 6 GB RTX 4050 laptop.
+More VRAM allows a larger target alongside a small draft, but speedup still
+depends on draft cost, accepted proposals, and response length.
+
+On September 14, 2026 (UTC), commit `6cf435f` passed 497 Python tests and
+43 Rust tests on a Linux server with an RTX 2080 Ti reporting 22 GiB VRAM.
+Three Windows-only tests were skipped. CUDA and optional kernel checks were
+enabled; all 44 GPU tests returned to their starting allocated-memory level
+after cleanup. This Linux run does not replace Windows validation.
+
+An exploratory retest paired **Qwen3-8B** with **Qwen2.5-0.5B-Instruct** and
+**Qwen2.5-1.5B-Instruct**, all in FP16. The numeric cases reproduced the Mac
+benchmark's raw prompts and regex constraints. The counting, JSON, and prose
+cases used the target's chat template with thinking disabled.
+
+| Workload | 0.5B draft speedup (gamma) | 1.5B draft speedup (gamma) |
+| --- | --- | --- |
+| Four-digit year | 1.27x (2) | 1.19x (2) |
+| 32 constrained digits | 1.91x (8) | 2.07x (8) |
+| Counting 1 through 10 | 2.41x (8) | 2.14x (8) |
+| Short JSON response | 1.41x (2) | 1.32x (2) |
+| One-sentence GPU explanation | 1.09x (2) | 1.02x (2) |
+
+Each entry selects the best observed draft length from 1, 2, 4, and 8; it is
+not the performance of one fixed configuration. Measurements used one warmup
+and three repetitions, synchronized full-call wall time, and disabled internal
+timing instrumentation. Every speculative output matched its same-run
+target-only baseline token-for-token, completed within its budget, and passed
+the applicable constraint checks. Counting reached 69.7 tokens/s with the 0.5B
+draft versus 28.9 tokens/s target-only. Very short fixed replies still favored
+target-only generation.
+
+**These cross-family pairs are experimental and rejected by the production
+loader's tokenizer compatibility checks.** The isolated benchmark loaded the
+models directly without changing those checks. Four tool/thinking token byte
+mappings differ between the families. Passing these cases does not establish
+general tokenizer compatibility or API support. The weights also differ from
+the Mac's MLX 4-bit artifacts; this comparison does not isolate operating-system
+or quantization effects. The results demonstrate workload-specific CUDA
+speedups, not a general 2x improvement or a reason to change the default.
+
 ## Structure
 
 ```text
