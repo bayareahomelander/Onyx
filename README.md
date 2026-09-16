@@ -95,6 +95,38 @@ and run `python -m pytest tests`. The HTTP contract tests use fake engines;
 the generation-loop unit tests use simulated MLX operations. They do not
 replace inference and native grammar validation on Apple Silicon.
 
+## Mac benchmarks
+
+These benchmarks used Apple Silicon and 4-bit quantized Qwen models.
+
+### Grammar-aware speculative decoding
+
+| Target | Baseline | Grammar-aware draft | Speedup |
+| --- | ---: | ---: | ---: |
+| 1.5B | 73.5 tokens/s | 69.2 tokens/s | 0.94× |
+| 8B | 15.6 tokens/s | 22.6 tokens/s | **1.45×** |
+
+For the `[0-9]{4}` grammar, reported draft acceptance increased from **75%**
+with an unconstrained draft to **100%** with a grammar-aware draft, for both
+target sizes. Speculation was slower than baseline with the 1.5B target.
+
+### Experimental adaptive gamma
+
+This 8B benchmark used the `[0-9]{32}` constraint. Warmup runs were excluded
+from the reported averages.
+
+| Configuration | Throughput | Speedup over baseline | Acceptance |
+| --- | ---: | ---: | ---: |
+| Target-only | 21.9 tokens/s | 1.00× | — |
+| Fixed gamma 2 | 25.3 tokens/s | 1.16× | 93.8% |
+| Fixed gamma 4 | 29.1 tokens/s | 1.33× | 88.2% |
+| Fixed gamma 8 | 27.6 tokens/s | 1.26× | 78.9% |
+| Adaptive gamma | 29.2 tokens/s | **1.34×** | 88.2% |
+
+The adaptive controller started at gamma 4 with bounds of 1–8, averaged 4.2,
+and finished at 8. It essentially matched fixed gamma 4 on this forced-digits
+workload; these figures do not establish a general adaptive advantage.
+
 ## Repository structure
 
 ```text
