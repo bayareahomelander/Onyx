@@ -1,37 +1,44 @@
 import json
 import time
 import uuid
-from typing import List, Optional, Dict, Any, Generator
-from contextlib import asynccontextmanager
+import os
+from typing import List, Optional, Dict, Any, Generator, Literal, Annotated
+from contextlib import asynccontextmanager, closing
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ConfigDict, model_validator
 
 class ChatMessage(BaseModel):
-    role: str = Field(..., description="The role of the message author (system, user, assistant)")
+    model_config = ConfigDict(extra="forbid")
+    role: Literal["system", "user", "assistant"]
     content: str = Field(..., description="The content of the message")
 
 
 class ChatCompletionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     model: str = Field(
         default="onyx-speculative",
         description="Model identifier. Use 'onyx-speculative' for grammar-aware speculation."
     )
     messages: List[ChatMessage] = Field(
         ...,
+        min_length=1,
         description="List of messages in the conversation"
     )
-    max_tokens: Optional[int] = Field(
+    max_tokens: int = Field(
         default=256,
+        strict=True, gt=0,
         description="Maximum number of tokens to generate"
     )
-    temperature: Optional[float] = Field(
+    temperature: float = Field(
         default=0.0,
+        strict=True, ge=0, le=2, allow_inf_nan=False,
         description="Sampling temperature (0 = greedy, higher = more random)"
     )
-    stream: Optional[bool] = Field(
+    stream: bool = Field(
         default=False,
+        strict=True,
         description="Whether to stream the response token by token"
     )
     regex: Optional[str] = Field(
@@ -42,13 +49,20 @@ class ChatCompletionRequest(BaseModel):
         default=None,
         description="JSON Schema to constrain the output (Onyx extension)"
     )
-    compact_json: Optional[bool] = Field(
-        default=True,
-        description="When json_schema is active, compact the output to remove whitespace (Onyx extension)"
-    )
-    top_p: Optional[float] = Field(default=1.0, description="Nucleus sampling parameter")
-    n: Optional[int] = Field(default=1, description="Number of completions to generate")
-    stop: Optional[List[str]] = Field(default=None, description="Stop sequences")
+    compact_json: bool = Field(default=False, strict=True, deprecated=True,
+                              description="Deprecated; only false is supported. Format JSON in the client.")
+    top_p: float = Field(default=1.0, strict=True, gt=0, le=1, allow_inf_nan=False)
+    n: int = Field(default=1, strict=True, ge=1, le=1, deprecated=True,
+                   description="Compatibility field; only one completion is supported.")
+    stop: Optional[List[Annotated[str, Field(min_length=1)]]] = None
+
+    @model_validator(mode="after")
+    def validate_options(self):
+        if self.regex is not None and self.json_schema is not None:
+            raise ValueError("Specify either regex or json_schema, not both")
+        if self.__dict__["compact_json"]:
+            raise ValueError("compact_json=true is no longer supported; format JSON in the client")
+        return self
 
 
 class ChatCompletionChoice(BaseModel):
@@ -155,6 +169,8 @@ app = FastAPI(
     description="OpenAI-compatible API for grammar-aware speculative decoding",
     version="0.2.0",
     lifespan=lifespan,
+    docs_url="/docs" if os.environ.get("ONYX_API_DOCS", "1") == "1" else None,
+    redoc_url=None,
 )
 
 
@@ -201,18 +217,35 @@ def resolve_stop_tokens(
     stop: Optional[List[str]],
     tokenizer,
 ) -> Optional[List[List[int]]]:
-    if not stop:
-        return None
-
-    stop_sequences = []
-    for sequence in stop:
-        if not sequence:
-            continue
+    eos = getattr(tokenizer, "eos_token_id", None)
+    stop_sequences = [[token] for token in (eos if isinstance(eos, list) else [eos])
+                      if token is not None]
+    for sequence in stop or []:
         ids = tokenizer.encode(sequence)
         if ids:
             stop_sequences.append(ids)
 
     return stop_sequences or None
+
+
+def prepare_generation(request: ChatCompletionRequest, engine) -> dict:
+    return dict(
+        prompt=format_messages_for_engine(request.messages, engine.tokenizer),
+        max_tokens=request.max_tokens, gamma=4,
+        regex=request.regex,
+        json_schema=json.dumps(request.json_schema) if request.json_schema is not None else None,
+        draft_grammar_aware=True, temperature=request.temperature, top_p=request.top_p,
+        stop_tokens=resolve_stop_tokens(request.stop, engine.tokenizer),
+    )
+
+
+def completion_reason(metrics: Dict[str, Any], stopped: bool = False) -> str:
+    if stopped:
+        return "stop"
+    reason = metrics.get("finish_reason")
+    if reason not in ("stop", "length", "grammar_complete"):
+        raise RuntimeError("Generation did not report a valid finish reason")
+    return reason
 
 
 def truncate_at_stop(text: str, stop: Optional[List[str]]) -> str:
@@ -263,110 +296,40 @@ def build_onyx_metrics(last_metrics: Dict[str, Any], grammar_active: bool) -> Di
     }
 
 
-def create_streaming_response(
-    request: ChatCompletionRequest,
-    engine,
-) -> Generator[str, None, None]:
+def create_streaming_response(request: ChatCompletionRequest, engine) -> Generator[str, None, None]:
     completion_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
     created = int(time.time())
-    model = request.model
-    
-    prompt = format_messages_for_engine(request.messages, engine.tokenizer)
-    
-    first_chunk = ChatCompletionChunk(
-        id=completion_id,
-        created=created,
-        model=model,
-        choices=[
-            ChatCompletionChunkChoice(
-                index=0,
-                delta=ChatCompletionChunkDelta(role="assistant"),
-                finish_reason=None,
-            )
-        ],
-    )
-    yield f"data: {first_chunk.model_dump_json()}\n\n"
-    
-    try:
-        json_schema_str = json.dumps(request.json_schema) if request.json_schema else None
-        stop_tokens = resolve_stop_tokens(request.stop, engine.tokenizer)
-        pending_text = ""
-        stopped_by_stop = False
-        
-        for token_text, metrics in engine.stream_generate(
-            prompt=prompt,
-            max_tokens=request.max_tokens or 256,
-            gamma=4,
-            regex=request.regex,
-            json_schema=json_schema_str,
-            draft_grammar_aware=True,
-            temperature=request.temperature or 0.0,
-            top_p=request.top_p or 1.0,
-            stop_tokens=stop_tokens,
-        ):
-            if metrics is not None:
-                if pending_text and not stopped_by_stop:
-                    chunk = ChatCompletionChunk(
-                        id=completion_id,
-                        created=created,
-                        model=model,
-                        choices=[
-                            ChatCompletionChunkChoice(
-                                index=0,
-                                delta=ChatCompletionChunkDelta(content=pending_text),
-                                finish_reason=None,
-                            )
-                        ],
-                    )
-                    yield f"data: {chunk.model_dump_json()}\n\n"
-                break
-            if not token_text:
-                continue
-            pending_text += token_text
-            token_text, pending_text, stopped_by_stop = flush_stream_text(
-                pending_text,
-                request.stop,
-            )
-            chunk = ChatCompletionChunk(
-                id=completion_id,
-                created=created,
-                model=model,
-                choices=[
-                    ChatCompletionChunkChoice(
-                        index=0,
-                        delta=ChatCompletionChunkDelta(content=token_text),
-                        finish_reason=None,
-                    )
-                ],
-            )
-            if token_text:
-                yield f"data: {chunk.model_dump_json()}\n\n"
-            if stopped_by_stop:
-                break
-        
-        final_chunk = ChatCompletionChunk(
-            id=completion_id,
-            created=created,
-            model=model,
-            choices=[
-                ChatCompletionChunkChoice(
-                    index=0,
-                    delta=ChatCompletionChunkDelta(),
-                    finish_reason="stop",
-                )
-            ],
+
+    def chunk(delta, reason=None):
+        payload = ChatCompletionChunk(
+            id=completion_id, created=created, model=request.model,
+            choices=[ChatCompletionChunkChoice(index=0, delta=delta, finish_reason=reason)],
         )
-        yield f"data: {final_chunk.model_dump_json()}\n\n"
-        
-    except Exception as e:
-        error_chunk = {
-            "error": {
-                "message": str(e),
-                "type": "server_error",
-            }
-        }
-        yield f"data: {json.dumps(error_chunk)}\n\n"
-    
+        return f"data: {payload.model_dump_json()}\n\n"
+
+    yield chunk(ChatCompletionChunkDelta(role="assistant"))
+    try:
+        pending = ""
+        stopped = False
+        terminal = None
+        with closing(engine.stream_generate(**prepare_generation(request, engine))) as events:
+            for text, metrics in events:
+                if metrics is not None:
+                    terminal = metrics
+                    break
+                pending += text
+                text, pending, stopped = flush_stream_text(pending, request.stop)
+                if text:
+                    yield chunk(ChatCompletionChunkDelta(content=text))
+                if stopped:
+                    break
+        reason = completion_reason(terminal or {}, stopped)
+        if pending and not stopped:
+            yield chunk(ChatCompletionChunkDelta(content=pending))
+        yield chunk(ChatCompletionChunkDelta(), reason)
+    except Exception as error:
+        payload = {"error": {"message": str(error), "type": "server_error"}}
+        yield f"data: {json.dumps(payload)}\n\n"
     yield "data: [DONE]\n\n"
 
 
@@ -406,76 +369,30 @@ async def list_models():
 @app.post("/v1/chat/completions")
 async def create_chat_completion(request: ChatCompletionRequest):
     engine = get_engine(request.model)
-    if request.stream and request.n and request.n != 1:
-        raise HTTPException(status_code=400, detail="stream=true supports only n=1")
-    
     if request.stream:
         return StreamingResponse(
-            create_streaming_response(request, engine),
-            media_type="text/event-stream",
-            headers={
-                "Cache-Control": "no-cache",
-                "Connection": "keep-alive",
-                "X-Accel-Buffering": "no",
-            },
+            create_streaming_response(request, engine), media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
-    
     try:
-        prompt = format_messages_for_engine(request.messages, engine.tokenizer)
-        json_schema_str = json.dumps(request.json_schema) if request.json_schema else None
-        stop_tokens = resolve_stop_tokens(request.stop, engine.tokenizer)
-        
-        grammar_active = request.regex is not None or request.json_schema is not None
-
-        choices = []
-        usage = UsageInfo(prompt_tokens=0, completion_tokens=0, total_tokens=0)
-        last_metrics = {}
-
-        for index in range(request.n or 1):
-            output, metrics = engine.generate(
-                prompt=prompt,
-                max_tokens=request.max_tokens or 256,
-                gamma=4,
-                regex=request.regex,
-                json_schema=json_schema_str,
-                draft_grammar_aware=True,
-                temperature=request.temperature or 0.0,
-                top_p=request.top_p or 1.0,
-                stop_tokens=stop_tokens,
-            )
-            last_metrics = metrics
-            output = truncate_at_stop(output, request.stop)
-            
-            # compact json output if requested
-            if request.json_schema and request.compact_json:
-                try:
-                    output = json.dumps(json.loads(output), separators=(',', ':'))
-                except json.JSONDecodeError:
-                    pass  # leave as-is if parsing fails
-
-            choices.append(
-                ChatCompletionChoice(
-                    index=index,
-                    message=ChatMessage(role="assistant", content=output),
-                    finish_reason="grammar_complete" if grammar_active else "stop",
-                )
-            )
-
-            usage.prompt_tokens = metrics.get("prompt_tokens", 0)
-            usage.completion_tokens += metrics.get("generated_tokens", 0)
-            usage.total_tokens = usage.prompt_tokens + usage.completion_tokens
-        
-        response = ChatCompletionResponse(
+        output, metrics = engine.generate(**prepare_generation(request, engine))
+        text = truncate_at_stop(output, request.stop)
+        reason = completion_reason(metrics, text != output)
+        prompt_tokens = metrics.get("prompt_tokens", 0)
+        completion_tokens = metrics.get("generated_tokens", 0)
+        return ChatCompletionResponse(
             model=request.model,
-            choices=choices,
-            usage=usage,
-            onyx_metrics=build_onyx_metrics(last_metrics, grammar_active),
+            choices=[ChatCompletionChoice(
+                index=0, message=ChatMessage(role="assistant", content=text), finish_reason=reason,
+            )],
+            usage=UsageInfo(prompt_tokens=prompt_tokens, completion_tokens=completion_tokens,
+                            total_tokens=prompt_tokens + completion_tokens),
+            onyx_metrics=build_onyx_metrics(
+                metrics, request.regex is not None or request.json_schema is not None,
+            ),
         )
-        
-        return response
-        
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except Exception as error:
+        raise HTTPException(status_code=500, detail=str(error)) from error
 
 
 if __name__ == "__main__":

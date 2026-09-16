@@ -8,45 +8,6 @@ import pytest
 
 @pytest.fixture
 def server_with_fake_deps(monkeypatch):
-    fastapi = types.ModuleType("fastapi")
-
-    class FakeFastAPI:
-        def __init__(self, *args, **kwargs):
-            pass
-
-        def get(self, *args, **kwargs):
-            return lambda fn: fn
-
-        def post(self, *args, **kwargs):
-            return lambda fn: fn
-
-    class FakeHTTPException(Exception):
-        def __init__(self, status_code, detail):
-            self.status_code = status_code
-            self.detail = detail
-
-    fastapi.FastAPI = FakeFastAPI
-    fastapi.HTTPException = FakeHTTPException
-
-    responses = types.ModuleType("fastapi.responses")
-    responses.StreamingResponse = type("StreamingResponse", (), {})
-
-    pydantic = types.ModuleType("pydantic")
-
-    class FakeBaseModel:
-        def __init__(self, **kwargs):
-            for key, value in kwargs.items():
-                setattr(self, key, value)
-
-        def model_dump_json(self):
-            return "{}"
-
-    pydantic.BaseModel = FakeBaseModel
-    pydantic.Field = lambda default=None, **_kwargs: default
-
-    monkeypatch.setitem(sys.modules, "fastapi", fastapi)
-    monkeypatch.setitem(sys.modules, "fastapi.responses", responses)
-    monkeypatch.setitem(sys.modules, "pydantic", pydantic)
     monkeypatch.delitem(sys.modules, "onyx.server", raising=False)
 
     module = importlib.import_module("onyx.server")
@@ -60,7 +21,6 @@ def make_messages(server):
         server.ChatMessage(role="system", content="S"),
         server.ChatMessage(role="user", content="U"),
         server.ChatMessage(role="assistant", content="A"),
-        server.ChatMessage(role="tool", content="T"),
     ]
 
 
@@ -92,7 +52,6 @@ def test_format_messages_for_engine_uses_tokenizer_chat_template(server_with_fak
                 {"role": "system", "content": "S"},
                 {"role": "user", "content": "U"},
                 {"role": "assistant", "content": "A"},
-                {"role": "tool", "content": "T"},
             ],
             "tokenize": False,
             "add_generation_prompt": True,
@@ -143,6 +102,7 @@ def test_chat_completion_passes_templated_prompt_to_engine(server_with_fake_deps
                 {
                     "prompt_tokens": 3,
                     "generated_tokens": 1,
+                    "finish_reason": "stop",
                     "tokens_per_second": 1.0,
                     "acceptance_rate": 100.0,
                     "speculative_iterations": 1,
@@ -160,7 +120,7 @@ def test_chat_completion_passes_templated_prompt_to_engine(server_with_fake_deps
         stream=False,
         regex=None,
         json_schema=None,
-        compact_json=True,
+        compact_json=False,
         top_p=1.0,
         n=1,
         stop=None,
@@ -223,6 +183,7 @@ def test_chat_completion_passes_stop_sequences_and_truncates_output(server_with_
                 {
                     "prompt_tokens": 2,
                     "generated_tokens": 3,
+                    "finish_reason": "stop",
                     "tokens_per_second": 1.0,
                     "acceptance_rate": 100.0,
                     "speculative_iterations": 1,
@@ -240,7 +201,7 @@ def test_chat_completion_passes_stop_sequences_and_truncates_output(server_with_
         stream=False,
         regex=None,
         json_schema=None,
-        compact_json=True,
+        compact_json=False,
         top_p=1.0,
         n=1,
         stop=["<END>"],

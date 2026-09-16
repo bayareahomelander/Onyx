@@ -9,6 +9,7 @@ import pytest
 def clean_imported_modules():
     yield
     sys.modules.pop("onyx.speculative", None)
+    sys.modules.pop("onyx.cache", None)
     sys.modules.pop("onyx.server", None)
 
 
@@ -41,6 +42,7 @@ def import_speculative_with_fake_mlx(monkeypatch, compile_fn=None):
     monkeypatch.setitem(sys.modules, "mlx_lm.models", mlx_lm_models)
     monkeypatch.setitem(sys.modules, "mlx_lm.models.cache", mlx_lm_cache)
     monkeypatch.delitem(sys.modules, "onyx.speculative", raising=False)
+    monkeypatch.delitem(sys.modules, "onyx.cache", raising=False)
 
     import onyx.speculative
 
@@ -100,45 +102,6 @@ def test_fake_mx_compile_marks_helper_compilation_active(monkeypatch):
 
 
 def test_api_metrics_do_not_report_jit_active_for_request_only(monkeypatch):
-    fastapi = types.ModuleType("fastapi")
-
-    class FakeFastAPI:
-        def __init__(self, *args, **kwargs):
-            pass
-
-        def get(self, *args, **kwargs):
-            return lambda fn: fn
-
-        def post(self, *args, **kwargs):
-            return lambda fn: fn
-
-    class FakeHTTPException(Exception):
-        def __init__(self, status_code, detail):
-            self.status_code = status_code
-            self.detail = detail
-
-    fastapi.FastAPI = FakeFastAPI
-    fastapi.HTTPException = FakeHTTPException
-
-    responses = types.ModuleType("fastapi.responses")
-    responses.StreamingResponse = type("StreamingResponse", (), {})
-
-    pydantic = types.ModuleType("pydantic")
-
-    class FakeBaseModel:
-        def __init__(self, **kwargs):
-            for key, value in kwargs.items():
-                setattr(self, key, value)
-
-        def model_dump_json(self):
-            return "{}"
-
-    pydantic.BaseModel = FakeBaseModel
-    pydantic.Field = lambda default=None, **_kwargs: default
-
-    monkeypatch.setitem(sys.modules, "fastapi", fastapi)
-    monkeypatch.setitem(sys.modules, "fastapi.responses", responses)
-    monkeypatch.setitem(sys.modules, "pydantic", pydantic)
     monkeypatch.delitem(sys.modules, "onyx.server", raising=False)
 
     try:

@@ -18,6 +18,7 @@ from mlx_lm.models.cache import KVCache, make_prompt_cache
 from onyx.cache import PagedKVCache, make_paged_cache
 
 import onyx
+from onyx.output import finish_reason, TokenTextStream
 _GrammarConstraint = None
 if onyx.RUST_AVAILABLE:
     try:
@@ -58,10 +59,8 @@ def _normalize_stop_sequences(stop_tokens: Optional[List[Any]]) -> List[List[int
 
 
 def _matched_stop_sequence(tokens: List[int], stop_sequences: List[List[int]]) -> Optional[List[int]]:
-    for sequence in stop_sequences:
-        if len(sequence) <= len(tokens) and tokens[-len(sequence):] == sequence:
-            return sequence
-    return None
+    return max((s for s in stop_sequences if s and tokens[-len(s):] == s),
+               key=len, default=None)
 
 
 def _has_stop_suffix(tokens: List[int], stop_sequences: List[List[int]]) -> bool:
@@ -504,7 +503,7 @@ class SpeculativeEngine:
                 draft_logits = self.draft_model(draft_input, cache=self.draft_cache)
                 mx.eval(draft_logits)
                 
-                for _ in range(gamma):
+                for _ in range(min(gamma, max_tokens - len(generated_tokens))):
                     draft_last_logits = draft_logits[:, -1, :]
                     
                     if grammar_constraint is not None and draft_grammar_aware:
@@ -548,6 +547,7 @@ class SpeculativeEngine:
                 target_logits = self.target_model(verify_input, cache=self.target_cache)
                 mx.eval(target_logits)
                 
+                generated_before_verify = len(generated_tokens)
                 accepted_count = 0
                 verify_grammar_state = grammar_state
                 verify_temp_states = []
@@ -605,11 +605,10 @@ class SpeculativeEngine:
                     if release_states:
                         grammar_constraint.release_states(release_states)
                 
-                tokens_added = min(accepted_count + 1, len(draft_tokens))
-                if _has_stop_suffix(generated_tokens, stop_sequences):
-                    tokens_added = accepted_count + (1 if accepted_count < len(draft_tokens) else 0)
+                tokens_added = len(generated_tokens) - generated_before_verify
                 
-                valid_draft_length = cache_position_before_draft + 1 + accepted_count
+                valid_draft_length = min(cache_position_before_draft + 1 + accepted_count,
+                                         self._get_cache_size(self.draft_cache))
                 self._rollback_cache(self.draft_cache, valid_draft_length)
                 
                 valid_target_length = target_cache_position + tokens_added
@@ -625,6 +624,9 @@ class SpeculativeEngine:
                     break
         
         generation_end = time.perf_counter()
+        metrics["finish_reason"] = finish_reason(
+            generated_tokens, stop_sequences, grammar_complete, max_tokens,
+        )
         
         output_tokens = _trim_stop_suffix(generated_tokens, stop_sequences)
         output_text = self.tokenizer.decode(output_tokens) if output_tokens else ""
@@ -887,6 +889,7 @@ class SpeculativeEngine:
             grammar_state = grammar_constraint.init_state()
 
         generated_tokens = []
+        text_stream = TokenTextStream(self.tokenizer, stop_sequences)
         generation_start = time.perf_counter()
         mask_times = []
 
@@ -924,7 +927,7 @@ class SpeculativeEngine:
             if grammar_constraint.is_match_state(grammar_state):
                 grammar_complete = True
 
-        yield self.tokenizer.decode([token_id]), None
+        yield text_stream.update(generated_tokens), None
 
         if not _has_stop_suffix(generated_tokens, stop_sequences) and not grammar_complete:
             while len(generated_tokens) < max_tokens:
@@ -942,7 +945,7 @@ class SpeculativeEngine:
                 draft_logits = self.draft_model(draft_input, cache=self.draft_cache)
                 mx.eval(draft_logits)
 
-                for _ in range(gamma):
+                for _ in range(min(gamma, max_tokens - len(generated_tokens))):
                     draft_last_logits = draft_logits[:, -1, :]
 
                     if grammar_constraint is not None and draft_grammar_aware:
@@ -986,6 +989,7 @@ class SpeculativeEngine:
                 target_logits = self.target_model(verify_input, cache=self.target_cache)
                 mx.eval(target_logits)
 
+                generated_before_verify = len(generated_tokens)
                 accepted_count = 0
                 verify_grammar_state = grammar_state
                 verify_temp_states = []
@@ -1008,7 +1012,6 @@ class SpeculativeEngine:
                     if draft_token == target_pred:
                         accepted_count += 1
                         generated_tokens.append(draft_token)
-                        yield self.tokenizer.decode([draft_token]), None
 
                         if grammar_constraint is not None:
                             verify_grammar_state = grammar_constraint.advance_state(
@@ -1023,7 +1026,6 @@ class SpeculativeEngine:
                             break
                     else:
                         generated_tokens.append(target_pred)
-                        yield self.tokenizer.decode([target_pred]), None
 
                         if grammar_constraint is not None:
                             verify_grammar_state = grammar_constraint.advance_state(
@@ -1045,15 +1047,16 @@ class SpeculativeEngine:
                     if release_states:
                         grammar_constraint.release_states(release_states)
 
-                tokens_added = min(accepted_count + 1, len(draft_tokens))
-                if _has_stop_suffix(generated_tokens, stop_sequences):
-                    tokens_added = accepted_count + (1 if accepted_count < len(draft_tokens) else 0)
+                tokens_added = len(generated_tokens) - generated_before_verify
 
-                valid_draft_length = cache_position_before_draft + 1 + accepted_count
+                valid_draft_length = min(cache_position_before_draft + 1 + accepted_count,
+                                         self._get_cache_size(self.draft_cache))
                 self._rollback_cache(self.draft_cache, valid_draft_length)
 
                 valid_target_length = target_cache_position + tokens_added
                 self._rollback_cache(self.target_cache, valid_target_length)
+
+                yield text_stream.update(generated_tokens), None
 
                 if generated_tokens:
                     token_id = generated_tokens[-1]
@@ -1065,6 +1068,9 @@ class SpeculativeEngine:
                     break
 
         generation_end = time.perf_counter()
+        metrics["finish_reason"] = finish_reason(
+            generated_tokens, stop_sequences, grammar_complete, max_tokens,
+        )
 
         output_tokens = _trim_stop_suffix(generated_tokens, stop_sequences)
         metrics["generated_tokens"] = len(output_tokens)
@@ -1088,5 +1094,8 @@ class SpeculativeEngine:
         if self.cache_mode == "paged":
             metrics["cache_stats"] = self._get_cache_stats()
 
+        tail = text_stream.update(generated_tokens, final=True)
+        if tail:
+            yield tail, None
         yield "", metrics
     
