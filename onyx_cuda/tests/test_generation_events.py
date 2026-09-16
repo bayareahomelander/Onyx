@@ -154,7 +154,8 @@ def test_closing_sampled_json_stream_releases_grammar_state(monkeypatch):
 
 
 @pytest.mark.parametrize("temperature", [0.0, 0.8])
-def test_gamma_zero_uses_the_target_stream_without_a_draft(monkeypatch, temperature):
+@pytest.mark.parametrize("adaptive", [False, True])
+def test_gamma_zero_uses_the_target_stream_without_a_draft(monkeypatch, temperature, adaptive):
     calls = scripted_target(monkeypatch, [0, 1, 2])
     events = generate_speculative_events(
         None,
@@ -164,6 +165,7 @@ def test_gamma_zero_uses_the_target_stream_without_a_draft(monkeypatch, temperat
         gamma=0,
         eos_token_ids=[],
         temperature=temperature,
+        adaptive=adaptive,
     )
     assert next(events).token_id == 0
     assert calls == []

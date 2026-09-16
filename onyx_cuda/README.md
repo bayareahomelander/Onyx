@@ -88,6 +88,61 @@ The benchmark defaults to non-thinking answers and a 256-token budget. Use
 remains accepted. It reports individual regressions and selects the mode with
 the lowest total generation wall time over its corpus, not a universal winner.
 
+## Adaptive decoding (experimental)
+
+Fixed gamma 2 remains the default. Opt into the candidate controller with
+`ONYX_SPECULATIVE_MODE=adaptive`, or pass `adaptive=True` to
+`generate_speculative` / `generate_speculative_events`. The controller starts
+at gamma 2, measures a target-only calibration step, and compares execution
+time per committed token over recent rounds. Measured draft cost and acceptance
+estimate whether expanding a proposal is worthwhile; a failed expansion can
+return to a measured profitable shorter proposal. It can use gamma 1/2/4/8 or pause
+drafting entirely. Failed recovery probes back off from 8 to at most 64 target
+tokens; successful probes resume speculation. Catch-up uses only accepted
+history and its cost is charged to recovery. Decisions use no prompt features
+and reset for each generation.
+
+`ONYX_SPECULATIVE_MODE=fixed` preserves numeric gamma settings.
+`ONYX_SPECULATIVE_GAMMA=0` always disables speculation, and positive-temperature
+requests still use target-only sampling. Adaptive mode uses the same models,
+FP16 precision, grammar rules, and streaming path. Its diagnostic counters are
+available in `result.timings.adaptive_stats`, including when `measure=False`;
+detailed stage profiling still requires `measure=True`.
+
+Both fixed and adaptive verification now guard ambiguous FP16 token scores.
+When scores are close at the dtype's rounding scale, a separate target cache
+replays the accepted prefix with single-token forwards and rechecks the batch.
+The checkpoint is created lazily, advances monotonically, and reuses subsequent
+target-only work. Its execution cost is included in adaptive decisions. It can
+require an additional target KV cache. A replay that discovers an already
+emitted noncanonical token fails explicitly. The rounding-scale trigger is not
+a proof of a universal numerical error bound; exact corpus comparison remains
+a release requirement.
+
+The first ten-repetition candidate passed exact output checks on all 48 cases
+and retained 97% of the original gains, but failed the regression-reduction
+and aggregate-latency gates. The retained controller also passed all 48 exact
+output checks in a subsequent single-repetition screening run, but still
+failed both performance gates. Adaptive remains opt-in: the broader performance
+objective is not yet met. Model weights, FP16 precision, and attention settings
+remain unchanged.
+
+The versioned 48-case corpus includes the original nine measured cases and
+16 held-out cases. The paired benchmark warms every mode, rotates execution
+order, compares every output token and finish reason, and records full-call
+latency and source hashes. It stops on any mismatch or truncated answer:
+
+```sh
+python -m onyx_cuda.benchmark_adaptive --split development --repetitions 10 --output validation/adaptive-development.json
+python -m onyx_cuda.benchmark_adaptive --split all --repetitions 10 --output validation/adaptive-final.json
+python -m onyx_cuda.validate_model --speculative-mode adaptive --output validation/adaptive-runtime.json
+```
+
+Use a new output filename for each run. The default comparison uses normal
+runtime timing; `--measure` requests a separate detailed-profile comparison.
+Promotion requires exact greedy outputs, retained gains, reduced regressions,
+and a completed repeated comparison. Partial reports cannot pass promotion.
+
 ## Capacity and thinking
 
 Capacity is resolved once at application creation. Set overrides before startup:

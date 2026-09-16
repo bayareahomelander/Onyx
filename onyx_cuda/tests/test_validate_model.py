@@ -41,7 +41,7 @@ def test_validation_failure_records_stage_and_does_not_claim_tested(monkeypatch,
     seen = []
     def precheck(selection, **kwargs):
         return selection._replace() if hasattr(selection, "_replace") else selection
-    def fail(selection, *, gamma, backend, context_tokens, report):
+    def fail(selection, *, gamma, backend, context_tokens, report, speculative_mode):
         seen.append((selection, gamma, backend))
         report["support_level"] = "startup-verified"
         raise RuntimeError("secret local path")

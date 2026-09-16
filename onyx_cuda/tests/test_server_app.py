@@ -143,6 +143,17 @@ def test_server_defaults_to_speculation_and_allows_target_only(monkeypatch):
         create_app(gamma=-1)
 
 
+def test_adaptive_mode_is_explicit_and_frozen_at_creation(monkeypatch):
+    monkeypatch.setenv("ONYX_SPECULATIVE_MODE", "adaptive")
+    app = create_app(load_engine=lambda: object())
+    monkeypatch.setenv("ONYX_SPECULATIVE_MODE", "fixed")
+    with TestClient(app) as client:
+        assert client.get("/").json()["speculative_mode"] == "adaptive"
+    assert create_app(speculative_mode="fixed").state.speculative_mode == "fixed"
+    with pytest.raises(ValueError, match="SPECULATIVE_MODE"):
+        create_app(speculative_mode="typo")
+
+
 def test_backend_is_validated_and_frozen_before_startup(monkeypatch):
     monkeypatch.setenv("ONYX_GREEDY_BACKEND", "typo")
     with pytest.raises(ValueError, match="ONYX_GREEDY_BACKEND"):

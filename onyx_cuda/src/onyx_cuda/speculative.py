@@ -1,4 +1,4 @@
-"""Fixed-gamma speculative token generation."""
+"""Fixed and adaptive speculative token generation through one event loop."""
 
 import time
 from collections.abc import Iterable, Iterator
@@ -8,6 +8,8 @@ import torch
 from transformers import PreTrainedModel
 
 from onyx_cuda.cache import CacheState
+from onyx_cuda.adaptive import AdaptiveController
+from onyx_cuda.numerics import GreedyCheckpoint, ambiguous_logits
 from onyx_cuda.config import resolve_greedy_backend
 from onyx_cuda.generation import (
     AcceptedTokenEvent,
@@ -188,6 +190,9 @@ def _verify_proposal(
     live_grammar_states: set[int] | None = None,
     mask_times: list[float] | None = None,
     greedy_backend: str | None = None,
+    maintain_draft: bool = True,
+    checkpoint: GreedyCheckpoint | None = None,
+    generated_token_ids: list[int] | None = None,
 ) -> tuple[VerificationResult, list[int]]:
     """Verify every proposal position in one target forward."""
     input_ids = torch.tensor(
@@ -195,65 +200,79 @@ def _verify_proposal(
         device=target_cache.attention_mask.device,
     )
     target_length_before = target_cache.length
+    if checkpoint is not None:
+        checkpoint.before_forward(target_cache, input_ids, generated_token_ids)
     with torch.inference_mode():
         target_logits = target_cache.extend(target_model, input_ids)
 
-    verified_token_ids: list[int]
-    verified_grammar_states: list[int] = []
-    if grammar_constraint is None:
-        target_token_ids = target_logits.argmax(dim=-1)[0].tolist()
-        accepted = 0
-        for proposed, target in zip(proposal.token_ids, target_token_ids):
-            if proposed != target:
-                break
-            accepted += 1
-        verified_token_ids = proposal.token_ids[:accepted] + [target_token_ids[accepted]]
-    else:
-        if grammar_state is None or live_grammar_states is None:
-            raise ValueError("grammar state tracking is required")
-        accepted = 0
-        verify_grammar_state = grammar_state
-        verified_token_ids = []
-        for position, proposed in enumerate(proposal.token_ids):
-            target = _grammar_token(
-                grammar_constraint,
-                verify_grammar_state,
-                target_logits[:, position, :],
-                mask_times,
-                greedy_backend,
-            ).item()
-            token = proposed if proposed == target else target
-            verified_token_ids.append(token)
-            verify_grammar_state = _advance_grammar_state(
-                grammar_constraint,
-                verify_grammar_state,
-                token,
-                live_grammar_states,
-            )
-            verified_grammar_states.append(verify_grammar_state)
-            if proposed != target:
-                break
-            accepted += 1
-            if grammar_constraint.is_match_state(verify_grammar_state):
-                break
+    replayed = False
+    for attempt in range(2):
+        verified_token_ids: list[int]
+        verified_grammar_states: list[int] = []
+        if grammar_constraint is None:
+            target_token_ids = target_logits.argmax(dim=-1)[0].tolist()
+            accepted = 0
+            for proposed, target in zip(proposal.token_ids, target_token_ids):
+                if proposed != target:
+                    break
+                accepted += 1
+            verified_token_ids = proposal.token_ids[:accepted] + [target_token_ids[accepted]]
         else:
-            target = _grammar_token(
-                grammar_constraint,
-                verify_grammar_state,
-                target_logits[:, len(proposal.token_ids), :],
-                mask_times,
-                greedy_backend,
-            ).item()
-            verified_token_ids.append(target)
-            verify_grammar_state = _advance_grammar_state(
-                grammar_constraint,
-                verify_grammar_state,
-                target,
-                live_grammar_states,
-            )
-            verified_grammar_states.append(verify_grammar_state)
+            if grammar_state is None or live_grammar_states is None:
+                raise ValueError("grammar state tracking is required")
+            accepted = 0
+            verify_grammar_state = grammar_state
+            verified_token_ids = []
+            for position, proposed in enumerate(proposal.token_ids):
+                target = _grammar_token(
+                    grammar_constraint,
+                    verify_grammar_state,
+                    target_logits[:, position, :],
+                    mask_times,
+                    greedy_backend,
+                ).item()
+                token = proposed if proposed == target else target
+                verified_token_ids.append(token)
+                verify_grammar_state = _advance_grammar_state(
+                    grammar_constraint,
+                    verify_grammar_state,
+                    token,
+                    live_grammar_states,
+                )
+                verified_grammar_states.append(verify_grammar_state)
+                if proposed != target:
+                    break
+                accepted += 1
+                if grammar_constraint.is_match_state(verify_grammar_state):
+                    break
+            else:
+                target = _grammar_token(
+                    grammar_constraint,
+                    verify_grammar_state,
+                    target_logits[:, len(proposal.token_ids), :],
+                    mask_times,
+                    greedy_backend,
+                ).item()
+                verified_token_ids.append(target)
+                verify_grammar_state = _advance_grammar_state(
+                    grammar_constraint,
+                    verify_grammar_state,
+                    target,
+                    live_grammar_states,
+                )
+                verified_grammar_states.append(verify_grammar_state)
+        if attempt == 0 and checkpoint is not None and not checkpoint.target_is_canonical and ambiguous_logits(
+            target_logits, len(verified_token_ids), grammar_constraint,
+            [grammar_state, *verified_grammar_states[:-1]],
+        ):
+            if grammar_constraint is not None:
+                _release_grammar_states(grammar_constraint, verified_grammar_states, live_grammar_states)
+            target_logits = checkpoint.replay(target_cache, input_ids, generated_token_ids)
+            replayed = True
+            continue
+        break
 
-    if accepted == len(proposal.token_ids):
+    if maintain_draft and accepted == len(proposal.token_ids):
         draft_token_id = proposal.token_ids[-1] if proposal.token_ids else current_token_id
         with torch.inference_mode():
             draft_cache.extend(
@@ -265,7 +284,13 @@ def _verify_proposal(
             )
 
     target_cache.crop(target_length_before + accepted + 1)
-    draft_cache.crop(proposal.draft_cache_length_before + accepted + 1)
+    if draft_cache is not None:
+        retained_length = proposal.draft_cache_length_before + accepted + 1
+        draft_cache.crop(retained_length if maintain_draft else min(draft_cache.length, retained_length))
+    if replayed:
+        checkpoint.commit(target_cache, input_ids, accepted, target_logits)
+    elif checkpoint is not None and input_ids.shape[1] == 1:
+        checkpoint.after_scalar(target_logits)
     return (
         VerificationResult(verified_token_ids, accepted),
         verified_grammar_states,
@@ -291,6 +316,24 @@ def verify_proposal(
     )[0]
 
 
+def _catch_up_draft(draft_model, draft_cache, prompt_token_ids, generated) -> None:
+    """Consume accepted history, leaving the current token for the next proposal.
+
+    Chunking bounds vocabulary logits and attention workspace during recovery.
+    The cache may lag after target-only steps or a fully accepted proposal.
+    """
+    offset = draft_cache.length - len(prompt_token_ids)
+    end = len(generated) - 1
+    if not 0 <= offset <= end:
+        raise RuntimeError("Draft cache is not a prefix of accepted history")
+    with torch.inference_mode():
+        for start in range(offset, end, 32):
+            draft_cache.extend(draft_model, torch.tensor(
+                [generated[start:min(start + 32, end)]],
+                device=draft_cache.attention_mask.device,
+            ))
+
+
 def generate_speculative_events(
     draft_model: PreTrainedModel | None,
     target_model: PreTrainedModel,
@@ -308,9 +351,12 @@ def generate_speculative_events(
     token_byte_vocabulary: TokenByteVocabulary | None = None,
     json_schema: str | None = None,
     greedy_backend: str | None = None,
+    adaptive: bool = False,
 ) -> Iterator[AcceptedTokenEvent | GenerationFinishedEvent]:
     """Yield accepted tokens and one terminal result from one generation loop."""
     greedy_backend = resolve_greedy_backend(greedy_backend)
+    if not isinstance(adaptive, bool):
+        raise ValueError("adaptive must be a boolean")
     if isinstance(gamma, bool) or not isinstance(gamma, int) or gamma < 0:
         raise ValueError("gamma must be a nonnegative integer (0 disables speculation)")
     _validate_generation_options(max_tokens, temperature, top_p, seed)
@@ -363,17 +409,26 @@ def generate_speculative_events(
     draft_seconds = 0.0
     verify_seconds = 0.0
     measurement_device = None
+    controller = AdaptiveController() if adaptive else None
+    runtime_device = next(target_model.parameters()).device if adaptive else None
+    draft_setup_seconds = 0.0
     if measure:
         measurement_device = next(target_model.parameters()).device
         _synchronize_device(measurement_device)
         started_at = time.perf_counter()
+    elif adaptive:
+        _synchronize_device(runtime_device)
+        started_at = time.perf_counter()
 
     try:
-        draft_prefill = prefill(draft_model, prompt_token_ids)
+        draft_cache = None
+        if not adaptive:
+            draft_prefill = prefill(draft_model, prompt_token_ids)
+            draft_cache = CacheState.from_prefill(
+                draft_prefill.past_key_values, draft_prefill.logits.device
+            )
+            del draft_prefill
         target_prefill = prefill(target_model, prompt_token_ids)
-        draft_cache = CacheState.from_prefill(
-            draft_prefill.past_key_values, draft_prefill.logits.device
-        )
         target_cache = CacheState.from_prefill(
             target_prefill.past_key_values, target_prefill.logits.device
         )
@@ -437,18 +492,46 @@ def generate_speculative_events(
                 for token_id in _take_ready_tokens(pending_events, event_retain):
                     yield AcceptedTokenEvent(token_id)
 
+        # A numerical repair can replace target_cache's underlying KV object;
+        # do not retain the obsolete object through the prefill result.
+        del target_prefill
+        checkpoint = GreedyCheckpoint(target_model, prompt_token_ids, constraint,
+                                      live_grammar_states, greedy_backend)
         while not finished and len(generated) < max_tokens:
-            speculative_iteration_count += 1
+            active_gamma = controller.choose(max_tokens - len(generated)) if controller else gamma
+            ready_events = []
+            generated_before = len(generated)
+            catchup_seconds = 0.0
+            if controller:
+                # A completed host-visible token fences every target step. The
+                # boundary here also excludes time suspended at a stream yield.
+                iteration_started = time.perf_counter()
+                if active_gamma and draft_cache is None:
+                    draft_prefill = prefill(draft_model, prompt_token_ids)
+                    draft_cache = CacheState.from_prefill(
+                        draft_prefill.past_key_values, draft_prefill.logits.device
+                    )
+                    del draft_prefill
+                    _synchronize_device(runtime_device)
+                    draft_setup_seconds += time.perf_counter() - iteration_started
+                    iteration_started = time.perf_counter()
+                if active_gamma:
+                    catchup_started = time.perf_counter()
+                    _catch_up_draft(draft_model, draft_cache, prompt_token_ids, generated)
+                    _synchronize_device(runtime_device)
+                    catchup_seconds = time.perf_counter() - catchup_started
+            speculative_iteration_count += int(active_gamma > 0)
             if measurement_device is not None:
                 _synchronize_device(measurement_device)
                 draft_started_at = time.perf_counter()
                 mask_seconds_before = sum(mask_times)
             states_before_draft = set(live_grammar_states)
+            proposal_started = time.perf_counter() if controller else None
             proposal = propose_tokens(
                 draft_model,
                 draft_cache,
                 generated,
-                gamma,
+                active_gamma,
                 max_tokens - len(generated) - 1,
                 eos_token_ids,
                 stop_sequences,
@@ -457,7 +540,8 @@ def generate_speculative_events(
                 live_grammar_states=(live_grammar_states if constraint is not None else None),
                 mask_times=mask_times,
                 greedy_backend=greedy_backend,
-            )
+            ) if active_gamma else ProposalResult([], 0, 0)
+            proposal_seconds = time.perf_counter() - proposal_started if controller else None
             proposed_token_count += len(proposal.token_ids)
             if measurement_device is not None:
                 _synchronize_device(measurement_device)
@@ -474,7 +558,7 @@ def generate_speculative_events(
                 mask_seconds_before = sum(mask_times)
             verified, verified_grammar_states = _verify_proposal(
                 draft_model,
-                draft_cache,
+                draft_cache if active_gamma or not adaptive else None,
                 target_model,
                 target_cache,
                 generated[-1],
@@ -484,6 +568,9 @@ def generate_speculative_events(
                 live_grammar_states=(live_grammar_states if constraint is not None else None),
                 mask_times=mask_times,
                 greedy_backend=greedy_backend,
+                maintain_draft=not adaptive,
+                checkpoint=checkpoint,
+                generated_token_ids=generated,
             )
             accepted_proposal_count += verified.accepted_proposal_count
             if measurement_device is not None:
@@ -523,8 +610,7 @@ def generate_speculative_events(
                     finished = True
                     break
 
-                for ready_token_id in _take_ready_tokens(pending_events, event_retain):
-                    yield AcceptedTokenEvent(ready_token_id)
+                ready_events.extend(_take_ready_tokens(pending_events, event_retain))
 
             if constraint is not None:
                 if retained_grammar_state is None:
@@ -543,6 +629,17 @@ def generate_speculative_events(
                     live_grammar_states,
                 )
                 grammar_state = retained_grammar_state
+
+            if controller:
+                _synchronize_device(runtime_device)
+                controller.observe(active_gamma, len(proposal.token_ids),
+                                   verified.accepted_proposal_count,
+                                   max(len(generated) - generated_before, 0),
+                                   time.perf_counter() - iteration_started,
+                                   catchup_seconds=catchup_seconds,
+                                   proposal_seconds=proposal_seconds)
+            for ready_token_id in ready_events:
+                yield AcceptedTokenEvent(ready_token_id)
 
         for token_id in _take_ready_tokens(pending_events):
             yield AcceptedTokenEvent(token_id)
@@ -577,7 +674,11 @@ def generate_speculative_events(
             speculative_iteration_count=speculative_iteration_count,
             draft_seconds=draft_seconds,
             verify_seconds=verify_seconds,
-            mask_seconds=sum(mask_times),
+            mask_seconds=sum(mask_times or ()),
+            verification_replays=checkpoint.replays,
+            canonical_replay_tokens=checkpoint.replayed_tokens,
+            adaptive_stats=({**controller.report(), **checkpoint.report(), "draft_setup_seconds": draft_setup_seconds}
+                            if controller else None),
         )
     yield GenerationFinishedEvent(
         GenerationResult(generated, past_key_values, finish_reason, timings)
@@ -601,6 +702,7 @@ def generate_speculative(
     token_byte_vocabulary: TokenByteVocabulary | None = None,
     json_schema: str | None = None,
     greedy_backend: str | None = None,
+    adaptive: bool = False,
 ) -> GenerationResult:
     """Collect the shared event stream into the established result shape."""
     accepted_token_ids = []
@@ -620,6 +722,7 @@ def generate_speculative(
         token_byte_vocabulary=token_byte_vocabulary,
         json_schema=json_schema,
         greedy_backend=greedy_backend,
+        adaptive=adaptive,
     )
     try:
         for event in events:

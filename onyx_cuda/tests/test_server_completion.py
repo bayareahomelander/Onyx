@@ -75,7 +75,8 @@ def _fake_generation(monkeypatch, results):
     return calls
 
 
-def test_non_streaming_chat_completion_returns_usage_reason_and_metrics(monkeypatch):
+@pytest.mark.parametrize("mode", ["fixed", "adaptive"])
+def test_non_streaming_chat_completion_returns_usage_reason_and_metrics(monkeypatch, mode):
     tokenizer = FakeTokenizer({(10, 99): "Hello"})
     engine = _engine(tokenizer)
     calls = _fake_generation(
@@ -89,7 +90,7 @@ def test_non_streaming_chat_completion_returns_usage_reason_and_metrics(monkeypa
         ],
     )
 
-    with TestClient(create_app(engine=engine)) as client:
+    with TestClient(create_app(engine=engine, speculative_mode=mode)) as client:
         response = client.post(
             "/v1/chat/completions",
             json={"messages": [{"role": "user", "content": "Hi"}]},
@@ -121,6 +122,7 @@ def test_non_streaming_chat_completion_returns_usage_reason_and_metrics(monkeypa
     }
     assert len(calls) == 1
     assert calls[0]["measure"] is True
+    assert calls[0]["adaptive"] is (mode == "adaptive")
     assert calls[0]["greedy_backend"] == client.app.state.greedy_backend
     assert calls[0]["draft_model"] is engine.draft.model
     assert calls[0]["target_model"] is engine.target.model
@@ -445,7 +447,8 @@ def _fake_stream(monkeypatch, events, error=None):
     return calls
 
 
-def test_streaming_chunks_preserve_id_and_real_finish_reason(monkeypatch):
+@pytest.mark.parametrize("mode", ["fixed", "adaptive"])
+def test_streaming_chunks_preserve_id_and_real_finish_reason(monkeypatch, mode):
     engine = _engine(FakeTokenizer({}))
     collected = []
 
@@ -463,7 +466,7 @@ def test_streaming_chunks_preserve_id_and_real_finish_reason(monkeypatch):
         ],
     )
 
-    with TestClient(create_app(engine=engine)) as client:
+    with TestClient(create_app(engine=engine, speculative_mode=mode)) as client:
         response = client.post(
             "/v1/chat/completions",
             json={
@@ -493,6 +496,7 @@ def test_streaming_chunks_preserve_id_and_real_finish_reason(monkeypatch):
     assert {chunk["model"] for chunk in chunks} == {MODEL_ID}
     assert collected == []
     assert calls[0]["arguments"]["measure"] is True
+    assert calls[0]["arguments"]["adaptive"] is (mode == "adaptive")
     assert calls[0]["stop"] == ["END"]
 
 
