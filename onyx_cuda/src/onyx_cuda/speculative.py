@@ -494,9 +494,11 @@ def generate_speculative_events(
 
         # A numerical repair can replace target_cache's underlying KV object;
         # do not retain the obsolete object through the prefill result.
-        del target_prefill
         checkpoint = GreedyCheckpoint(target_model, prompt_token_ids, constraint,
-                                      live_grammar_states, greedy_backend)
+                                      live_grammar_states, greedy_backend, measure=measure)
+        if not finished and len(generated) < max_tokens:
+            checkpoint.seed(target_cache, target_prefill.logits)
+        del target_prefill
         while not finished and len(generated) < max_tokens:
             active_gamma = controller.choose(max_tokens - len(generated)) if controller else gamma
             ready_events = []
@@ -677,6 +679,7 @@ def generate_speculative_events(
             mask_seconds=sum(mask_times or ()),
             verification_replays=checkpoint.replays,
             canonical_replay_tokens=checkpoint.replayed_tokens,
+            replay_stats=checkpoint.report(),
             adaptive_stats=({**controller.report(), **checkpoint.report(), "draft_setup_seconds": draft_setup_seconds}
                             if controller else None),
         )

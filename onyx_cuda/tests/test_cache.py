@@ -2,6 +2,7 @@ import pytest
 import torch
 
 from onyx_cuda.cache import CacheState
+from onyx_cuda.cache import snapshot_cache
 from onyx_cuda.model import load_model_pair
 from onyx_cuda.prefill import prefill
 from onyx_cuda.prompt import format_prompt
@@ -16,6 +17,36 @@ class FakeCache:
 
     def crop(self, length):
         self.length = length
+
+
+def test_dynamic_snapshot_shares_storage_but_append_and_crop_are_independent():
+    from transformers.cache_utils import DynamicCache
+
+    kv = DynamicCache()
+    keys = torch.arange(12, dtype=torch.float32).reshape(1, 1, 3, 4)
+    kv.update(keys, keys + 100, 0)
+    state = CacheState.from_prefill(kv, torch.device("cpu"))
+    fork = snapshot_cache(state)
+    assert fork.past_key_values is not kv
+    assert fork.past_key_values.layers[0] is not kv.layers[0]
+    assert fork.past_key_values.layers[0].keys.data_ptr() == kv.layers[0].keys.data_ptr()
+
+    kv.update(torch.ones(1, 1, 1, 4), torch.ones(1, 1, 1, 4), 0)
+    assert state.length == 4 and fork.length == 3
+    fork.crop(2)
+    fork.past_key_values.update(torch.zeros(1, 1, 1, 4), torch.zeros(1, 1, 1, 4), 0)
+    assert state.length == 4 and fork.length == 3
+    torch.testing.assert_close(kv.layers[0].keys[..., :3, :], keys)
+    assert fork.past_key_values.layers[0].keys[..., -1, :].eq(0).all()
+
+
+def test_unknown_mutable_cache_snapshot_owns_its_tensors():
+    state = CacheState(FakeCache(3), torch.ones(1, 3), torch.arange(3))
+    fork = snapshot_cache(state)
+    state.attention_mask.zero_()
+    state.past_key_values.crop(1)
+    assert fork.length == 3
+    assert fork.attention_mask.eq(1).all()
 
 
 def test_cache_state_length_and_invalid_rollback():

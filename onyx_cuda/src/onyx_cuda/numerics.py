@@ -1,10 +1,10 @@
 """Canonical cache replay for ambiguous low-precision greedy verification."""
 
-import copy
+import time
 
 import torch
 
-from onyx_cuda.cache import CacheState
+from onyx_cuda.cache import CacheState, snapshot_cache
 from onyx_cuda.masking import grammar_argmax
 from onyx_cuda.prefill import prefill
 
@@ -35,14 +35,14 @@ def ambiguous_logits(logits, token_count, constraint=None, grammar_states=()):
 
 
 class GreedyCheckpoint:
-    """Lazily retain a scalar-decoded cache independently of speculative KV.
+    """Retain clean scalar-decoded checkpoints independently of speculative KV.
 
     Catch-up checks previously emitted tokens rather than silently accepting a
     changed prefix. The checkpoint advances monotonically across recovery runs.
     Its grammar handles share the generation loop's final cleanup registry.
     """
 
-    def __init__(self, model, prompt_ids, constraint, live_states, backend):
+    def __init__(self, model, prompt_ids, constraint, live_states, backend, *, measure=False):
         self.model = model
         self.prompt_ids = prompt_ids
         self.constraint = constraint
@@ -55,6 +55,38 @@ class GreedyCheckpoint:
         self.replayed_tokens = 0
         self.target_is_canonical = True
         self.scalar_logits = None
+        self.measure = measure
+        self.profile = {name: 0.0 for name in (
+            "snapshot_seconds", "prefill_seconds", "history_seconds", "proposal_seconds")}
+        self.history_tokens = 0
+        self.proposal_tokens = 0
+        self.skipped_proposal_tokens = 0
+
+    def _start(self):
+        if not self.measure:
+            return None
+        device = next(self.model.parameters()).device
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        return time.perf_counter()
+
+    def _finish(self, name, started):
+        if started is not None:
+            device = next(self.model.parameters()).device
+            if device.type == "cuda":
+                torch.cuda.synchronize(device)
+            self.profile[name] += time.perf_counter() - started
+
+    def seed(self, cache, logits):
+        """Preserve the already computed clean prompt before any speculation."""
+        started = self._start()
+        self.cache = snapshot_cache(cache)
+        self.logits = logits.clone()
+        self.scalar_logits = self.logits
+        if self.constraint is not None:
+            self.state = self.constraint.init_state()
+            self.live_states.add(self.state)
+        self._finish("snapshot_seconds", started)
 
     def before_forward(self, target_cache, batch, generated):
         if batch.shape[1] > 1:
@@ -65,8 +97,10 @@ class GreedyCheckpoint:
                 end = target_cache.length - len(self.prompt_ids)
                 for token in generated[consumed:end]:
                     self._advance_state(token)
-                self.cache = copy.deepcopy(target_cache)
+                started = self._start()
+                self.cache = snapshot_cache(target_cache)
                 self.logits = self.scalar_logits.clone()
+                self._finish("snapshot_seconds", started)
             self.target_is_canonical = False
 
     def after_scalar(self, logits):
@@ -89,16 +123,19 @@ class GreedyCheckpoint:
 
     def replay(self, target_cache, batch, generated):
         if self.cache is None:
+            started = self._start()
             initial = prefill(self.model, self.prompt_ids)
             self.cache = CacheState.from_prefill(initial.past_key_values, initial.logits.device)
             self.logits = initial.logits
             if self.constraint is not None:
                 self.state = self.constraint.init_state()
                 self.live_states.add(self.state)
+            self._finish("prefill_seconds", started)
         consumed = self.cache.length - len(self.prompt_ids)
         if not 0 <= consumed <= len(generated) - 1:
             raise RuntimeError("Canonical cache is not a prefix of generated tokens")
         with torch.inference_mode():
+            started = self._start()
             for token in generated[consumed:-1]:
                 if self._select() != token:
                     raise RuntimeError("Greedy numerical replay found a noncanonical emitted prefix")
@@ -106,11 +143,44 @@ class GreedyCheckpoint:
                     [[token]], device=batch.device))[:, -1, :]
                 self._advance_state(token)
                 self.replayed_tokens += 1
+                self.history_tokens += 1
             if self._select() != generated[-1]:
                 raise RuntimeError("Greedy numerical replay found a noncanonical current token")
-            logits = torch.cat([self.cache.extend(self.model, batch[:, i:i + 1])
-                                for i in range(batch.shape[1])], dim=1)
-        self.replayed_tokens += batch.shape[1]
+            self._finish("history_seconds", started)
+            started = self._start()
+            rows = []
+            state = self.state
+            owned_state = None
+            try:
+                for i in range(batch.shape[1]):
+                    row = self.cache.extend(self.model, batch[:, i:i + 1])
+                    rows.append(row)
+                    if self.constraint is not None:
+                        next_state = self.constraint.advance_state(state, batch[0, i].item())
+                        self.live_states.add(next_state)
+                        if owned_state is not None:
+                            self.constraint.release_states([owned_state])
+                            self.live_states.remove(owned_state)
+                        state = owned_state = next_state
+                        # The existing verifier stops when a proposed token
+                        # completes the grammar; no following logits are used.
+                        if self.constraint.is_match_state(state):
+                            break
+                        token = grammar_argmax(row[:, -1, :],
+                            self.constraint.get_valid_token_ids(state), backend=self.backend).item()
+                    else:
+                        token = row[:, -1, :].argmax(-1).item()
+                    if i + 1 < batch.shape[1] and token != batch[0, i + 1].item():
+                        break
+            finally:
+                if owned_state is not None:
+                    self.constraint.release_states([owned_state])
+                    self.live_states.remove(owned_state)
+            logits = torch.cat(rows, dim=1)
+            self._finish("proposal_seconds", started)
+        self.replayed_tokens += len(rows)
+        self.proposal_tokens += len(rows)
+        self.skipped_proposal_tokens += batch.shape[1] - len(rows)
         self.replays += 1
         target_cache.past_key_values = self.cache.past_key_values
         target_cache.attention_mask = self.cache.attention_mask
@@ -120,13 +190,19 @@ class GreedyCheckpoint:
     def commit(self, target_cache, batch, accepted, logits):
         # Clone after rollback; the next speculative extension must not mutate
         # this canonical checkpoint. Keep only the next-position logits.
-        self.cache = copy.deepcopy(target_cache)
+        started = self._start()
+        self.cache = snapshot_cache(target_cache)
         self.logits = logits[:, accepted, :].clone()
         self.scalar_logits = self.logits
         self.target_is_canonical = True
         for token in batch[0, :accepted + 1].tolist():
             self._advance_state(token)
+        self._finish("snapshot_seconds", started)
 
     def report(self):
         return {"verification_replays": self.replays,
-                "canonical_replay_tokens": self.replayed_tokens}
+                "canonical_replay_tokens": self.replayed_tokens,
+                "history_replay_tokens": self.history_tokens,
+                "proposal_replay_tokens": self.proposal_tokens,
+                "skipped_proposal_tokens": self.skipped_proposal_tokens,
+                "stage_seconds": dict(self.profile) if self.measure else None}

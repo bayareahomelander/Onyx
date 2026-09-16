@@ -8,6 +8,82 @@ import torch
 from onyx_cuda.numerics import ambiguous_logits
 
 
+@pytest.mark.parametrize("constrained", [False, True])
+@pytest.mark.parametrize("clean_steps", [0, 2])
+def test_replay_stops_before_rejected_suffix_and_keeps_checkpoint_prefix(
+    constrained, clean_steps, monkeypatch
+):
+    from onyx_cuda.numerics import GreedyCheckpoint
+    from test_speculative import TrackingGrammar
+
+    def select(logits, valid, **kwargs):
+        masked = torch.full_like(logits, -torch.inf)
+        masked[:, valid] = logits[:, valid]
+        return masked.argmax(-1)
+
+    monkeypatch.setattr("onyx_cuda.numerics.grammar_argmax", select)
+
+    class Cache:
+        def __init__(self):
+            self.past_key_values = SimpleNamespace(history=[8, 8])
+            self.attention_mask = torch.ones(1, 2)
+            self.cache_position = torch.arange(2)
+
+        @property
+        def length(self):
+            return len(self.past_key_values.history)
+
+        def extend(self, model, ids):
+            self.past_key_values.history.extend(ids[0].tolist())
+            self.attention_mask = torch.ones(1, self.length)
+            self.cache_position = torch.arange(self.length)
+            logits = torch.full((1, 1, 9), -10.0)
+            logits[0, 0, 5] = 1
+            return logits
+
+    class Grammar(TrackingGrammar):
+        def get_valid_token_ids(self, state):
+            assert state in self.states
+            return [4, 5]
+
+    grammar = Grammar({}, set()) if constrained else None
+    live = set()
+    checkpoint = GreedyCheckpoint(None, [8, 8], grammar, live, "torch")
+    target = Cache()
+    initial = torch.full((1, 9), -10.0)
+    initial[0, 5] = 1
+    checkpoint.seed(target, initial)
+    for _ in range(clean_steps):
+        checkpoint.after_scalar(target.extend(None, torch.tensor([[5]])))
+    batch = torch.tensor([[5, 4, 4, 4]])
+    generated = [5] * (clean_steps + 1)
+    checkpoint.before_forward(target, batch, generated)
+    logits = checkpoint.replay(target, batch, generated)
+    assert logits.shape[1] == 1
+    assert target.past_key_values.history == [8, 8, *generated]
+    checkpoint.commit(target, batch, 0, logits)
+    assert checkpoint.report()["skipped_proposal_tokens"] == 3
+    assert checkpoint.report()["proposal_replay_tokens"] == 1
+    assert checkpoint.report()["history_replay_tokens"] == 0
+    # Mutating the working cache cannot mutate the retained checkpoint.
+    target.extend(None, torch.tensor([[4]]))
+    assert checkpoint.cache.past_key_values.history == [8, 8, *generated]
+    if grammar:
+        assert grammar.states[checkpoint.state] == tuple(generated)
+        grammar.release_states(list(live))
+        assert not grammar.active_states
+
+
+def test_replay_rejects_noncanonical_emitted_prefix():
+    from onyx_cuda.numerics import GreedyCheckpoint
+
+    checkpoint = GreedyCheckpoint(None, [8], None, set(), "torch")
+    checkpoint.cache = SimpleNamespace(length=1)
+    checkpoint.logits = torch.tensor([[0., 2.]])
+    with pytest.raises(RuntimeError, match="noncanonical emitted prefix"):
+        checkpoint.replay(None, torch.tensor([[1]]), [0, 1])
+
+
 def test_rounding_guard_checks_only_relevant_eligible_tokens():
     logits = torch.tensor([[[1, 0, -5], [1, 1, -5]]], dtype=torch.float16)
     assert not ambiguous_logits(logits, 1)
@@ -109,7 +185,7 @@ def test_replay_uses_clean_prefix_and_releases_grammar(monkeypatch, adaptive, co
     prefills.clear()
     result = speculative.generate_speculative(draft, target, gamma=2, adaptive=adaptive, **args)
     assert (result.token_ids, result.finish_reason) == (oracle.token_ids, oracle.finish_reason)
-    assert prefills.count("target") == 2  # One lazy canonical prefill, then incremental replay.
+    assert prefills.count("target") == 1  # Reuse the original clean prompt cache.
     assert all(not grammar.active_states for grammar in grammars)
     if adaptive:
         assert result.timings.verification_replays > 0

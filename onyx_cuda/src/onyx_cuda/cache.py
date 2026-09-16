@@ -1,10 +1,28 @@
 """Transformers cache state used by CUDA generation."""
 
 from dataclasses import dataclass
+import copy
 
 import torch
 from transformers import PreTrainedModel
-from transformers.cache_utils import Cache
+from transformers.cache_utils import Cache, DynamicCache, DynamicLayer
+
+
+def snapshot_cache(state):
+    """Fork append/crop-only dynamic KV without copying its tensor storage.
+
+    Only the pinned Transformers full-attention implementation is eligible:
+    extend replaces tensors with concatenations and crop replaces them with
+    views. Containers must be independent; reset or in-place tensor mutation
+    must never be used on either branch. Other cache implementations are copied.
+    """
+    kv = state.past_key_values
+    if (type(state) is CacheState and type(kv) is DynamicCache
+            and not kv.offloading and all(type(layer) is DynamicLayer for layer in kv.layers)):
+        fork = copy.copy(kv)
+        fork.layers = [copy.copy(layer) for layer in kv.layers]
+        return CacheState(fork, state.attention_mask, state.cache_position)
+    return copy.deepcopy(state)
 
 
 @dataclass

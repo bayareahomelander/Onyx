@@ -112,12 +112,22 @@ detailed stage profiling still requires `measure=True`.
 Both fixed and adaptive verification now guard ambiguous FP16 token scores.
 When scores are close at the dtype's rounding scale, a separate target cache
 replays the accepted prefix with single-token forwards and rechecks the batch.
-The checkpoint is created lazily, advances monotonically, and reuses subsequent
-target-only work. Its execution cost is included in adaptive decisions. It can
-require an additional target KV cache. A replay that discovers an already
+The checkpoint preserves the original prompt cache, advances monotonically, and
+reuses subsequent clean target-only work. For supported full-attention dynamic
+caches, independent cache containers share unchanged tensor storage; other
+cache types use independent copies. Repair stops at the first rejected proposal
+instead of evaluating its discarded suffix. Its execution cost is included in
+adaptive decisions. It can require an additional target KV cache, including on
+requests that never need repair. A replay that discovers an already
 emitted noncanonical token fails explicitly. The rounding-scale trigger is not
 a proof of a universal numerical error bound; exact corpus comparison remains
 a release requirement.
+
+With `measure=True`, `result.timings.replay_stats` separates historical token
+catch-up, proposal replay, skipped proposal positions, and time spent in replay
+stages and checkpoint snapshots. The adaptive benchmark preserves this field
+for both fixed and adaptive runs when invoked with `--measure`; use ordinary
+unprofiled runs for performance comparisons.
 
 The first ten-repetition candidate passed exact output checks on all 48 cases
 and retained 97% of the original gains, but failed the regression-reduction

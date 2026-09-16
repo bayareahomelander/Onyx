@@ -55,6 +55,7 @@ class GenerationTimings(NamedTuple):
     adaptive_stats: dict | None = None
     verification_replays: int | None = None
     canonical_replay_tokens: int | None = None
+    replay_stats: dict | None = None
 
 
 def _matched_stop_length(token_ids: list[int], stop_sequences: list[list[int]]) -> int:

@@ -133,6 +133,7 @@ def run(output, *, repetitions=10, split="all", measure=False):
                 return {"seconds": seconds, "ttft_seconds": first, "token_ids": ids,
                         "finish_reason": result.finish_reason,
                         "adaptive_stats": getattr(result.timings, "adaptive_stats", None),
+                        "replay_stats": getattr(result.timings, "replay_stats", None),
                         "peak_allocated_bytes": torch.cuda.max_memory_allocated(device)}
 
             for mode in MODES:  # Warm all modes and establish the target oracle first.
