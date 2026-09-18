@@ -567,6 +567,7 @@ def create_app(
     gamma: int | None = None,
     speculative_mode: str | None = None,
     greedy_backend: str | None = None,
+    replay_backend: str | None = None,
     target_model: str | None = None,
     target_revision: str | None = None,
     draft_model: str | None = None,
@@ -575,6 +576,8 @@ def create_app(
     limits = resolve_service_limits()
     speculative_mode = resolve_speculative_mode(speculative_mode)
     greedy_backend = resolve_greedy_backend(greedy_backend)
+    from onyx_cuda.replay_backend import resolve_replay_backend
+    replay_backend = resolve_replay_backend(replay_backend)
     if gamma is None:
         try:
             gamma = int(os.environ.get("ONYX_SPECULATIVE_GAMMA", str(GAMMA)))
@@ -611,8 +614,22 @@ def create_app(
         initialize_greedy_backend(greedy_backend)
         app.state.engines = {MODEL_ID: loader()}
         from onyx_cuda.model import describe_model_pair
+        from onyx_cuda.replay_backend import prepare_replay_backend, close_replay_backend
+
+        try:
+            app.state.replay_configuration = prepare_replay_backend(
+                getattr(getattr(app.state.engines[MODEL_ID], "target", None), "model", None),
+                replay_backend if gamma > 0 else "scalar")
+            if gamma == 0 and replay_backend == "graph":
+                app.state.replay_configuration.update(requested="graph", reason="speculation is disabled")
+        except BaseException:
+            app.state.engines.clear()
+            _release_cuda_memory()
+            raise
 
         app.state.model_configuration = describe_model_pair(app.state.engines[MODEL_ID])
+        logging.getLogger("uvicorn.error").info("Onyx CUDA replay backend: %s",
+                                               json.dumps(app.state.replay_configuration))
         logging.getLogger("uvicorn.error").info(
             "Onyx CUDA loaded models: %s; gamma=%s; mode=%s; selector=%s",
             json.dumps(app.state.model_configuration), gamma, speculative_mode, greedy_backend,
@@ -626,6 +643,9 @@ def create_app(
             app.state.inference_executor.shutdown(wait=True)
             del app.state.inference_executor
             app.state.engine_locks.clear()
+            for loaded_engine in app.state.engines.values():
+                close_replay_backend(getattr(getattr(loaded_engine, "target", None), "model", None))
+            del loaded_engine
             app.state.engines.clear()
             _release_cuda_memory()
 
@@ -647,6 +667,10 @@ def create_app(
 
     @app.get("/")
     async def root():
+        from onyx_cuda.replay_backend import replay_backend_status
+        active_replay = replay_backend_status(
+            getattr(getattr(app.state.engines[MODEL_ID], "target", None), "model", None),
+            app.state.replay_configuration)
         return {
             "status": "ok",
             "service": "Onyx CUDA API",
@@ -654,6 +678,7 @@ def create_app(
             "speculative_gamma": app.state.speculative_gamma,
             "speculative_mode": app.state.speculative_mode,
             "greedy_backend": app.state.greedy_backend,
+            "replay_backend": active_replay,
             "models": app.state.model_configuration,
             "limits": {
                 "max_output_tokens": limits.output_tokens,

@@ -1,6 +1,7 @@
 import sys
 import gc
 import weakref
+from types import SimpleNamespace
 
 import pytest
 from fastapi import HTTPException
@@ -8,6 +9,61 @@ from fastapi.testclient import TestClient
 
 from onyx_cuda.server import MODEL_ID, create_app, get_engine
 import onyx_cuda.server as server
+
+
+def test_replay_backend_startup_status_and_shutdown(monkeypatch):
+    import onyx_cuda.replay_backend as replay
+    model = SimpleNamespace()
+    engine = SimpleNamespace(target=SimpleNamespace(model=model), draft=None)
+    calls = []
+    def prepare(target, mode):
+        assert target is model
+        calls.append(("prepare", mode))
+        model._onyx_replay_backend = SimpleNamespace(closed=False)
+        return {"requested": mode, "active": "graph", "setup_seconds": 1.0}
+    def close(target):
+        assert target is model
+        calls.append(("close",))
+    monkeypatch.setattr(replay, "prepare_replay_backend", prepare)
+    monkeypatch.setattr(replay, "close_replay_backend", close)
+    monkeypatch.setenv("ONYX_REPLAY_BACKEND", "graph")
+    app = create_app(engine=engine)
+    monkeypatch.setenv("ONYX_REPLAY_BACKEND", "scalar")
+    with TestClient(app) as client:
+        assert client.get("/").json()["replay_backend"]["active"] == "graph"
+        model._onyx_replay_backend.closed = True
+        model._onyx_replay_backend.fallback_reason = "memory pressure"
+        assert client.get("/").json()["replay_backend"]["reason"] == "memory pressure"
+    assert calls == [("prepare", "graph"), ("close",)]
+
+
+def test_replay_setup_failure_releases_loaded_engine(monkeypatch):
+    import onyx_cuda.replay_backend as replay
+    references = []
+    class Engine:
+        target = SimpleNamespace(model=None)
+    def load():
+        engine = Engine()
+        references.append(weakref.ref(engine))
+        return engine
+    def fail(*args):
+        raise RuntimeError("setup failed")
+    monkeypatch.setattr(replay, "prepare_replay_backend", fail)
+    app = create_app(load_engine=load, replay_backend="graph")
+    with pytest.raises(RuntimeError, match="setup failed"):
+        with TestClient(app):
+            pass
+    gc.collect()
+    assert references[0]() is None
+    assert not app.state.engines
+
+
+def test_target_only_does_not_prepare_graphs():
+    with TestClient(create_app(engine=object(), gamma=0, replay_backend="graph")) as client:
+        configuration = client.get("/").json()["replay_backend"]
+        assert configuration["requested"] == "graph"
+        assert configuration["active"] == "scalar"
+        assert configuration["reason"] == "speculation is disabled"
 
 
 def test_shutdown_releases_injected_engine_even_if_app_is_retained():

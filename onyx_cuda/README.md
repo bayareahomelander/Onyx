@@ -68,6 +68,7 @@ Set overrides in the server's terminal **before startup**:
 | `ONYX_DRAFT_MODEL` | `Qwen/Qwen2.5-0.5B-Instruct` |
 | `ONYX_TARGET_REVISION`, `ONYX_DRAFT_REVISION` | Bundled models use pinned revisions; use commit hashes for custom selections |
 | `ONYX_SPECULATIVE_GAMMA` | `2` draft tokens per iteration; `0` explicitly selects target-only generation |
+| `ONYX_REPLAY_BACKEND` | `scalar` by default; `graph` opts into model-owned CUDA graphs for historical recovery on the supported target |
 
 The target tokenizer defines chat prompts, grammar bytes, decoding, and EOS for
 both models. Compatible drafts may omit target-added tokens in unused embedding
@@ -128,6 +129,63 @@ catch-up, proposal replay, skipped proposal positions, and time spent in replay
 stages and checkpoint snapshots. The adaptive benchmark preserves this field
 for both fixed and adaptive runs when invoked with `--measure`; use ordinary
 unprofiled runs for performance comparisons.
+
+### Optional graph recovery
+
+Set `ONYX_REPLAY_BACKEND=graph` before starting the server, or pass
+`create_app(replay_backend="graph")`. Startup prepares reusable graphs once for
+the target model. The root endpoint reports the requested and active backend,
+setup time, and the reason for scalar fallback on an unsupported target.
+
+This backend supports the pinned Qwen3-8B FP16 target with full SDPA attention,
+default rotary embeddings, PyTorch 2.6.0, Transformers 4.57.6, and CUDA capability
+7.5. It was validated on an RTX 2080 Ti with 22 GiB. Other configurations retain
+scalar recovery. Explicit graph setup errors fail startup after releasing partial
+graph state. The default remains `scalar`; no graphs are built during a request.
+
+Graph recovery consumes already-known **unconstrained historical tokens** in
+blocks of two or three. Ordinary speculative verification, its ambiguity guard,
+proposal recovery, and constrained requests keep their existing paths. Each
+block checks all next-token IDs. A mismatch discards the tentative cache and
+returns to scalar recovery for that generation; an invalid emitted prefix still
+raises. If graph recovery exhausts CUDA memory, its tentative cache is discarded
+and its model-owned graphs are released; subsequent recovery stays scalar until
+explicitly prepared again. The root endpoint reports that change. `replay_stats`
+adds `chunked_history_tokens` and `graph_replay_fallbacks`.
+
+For programmatic use, prepare the loaded target explicitly and release its graphs
+when finished. Keep weights and model configuration unchanged while prepared:
+
+```python
+from onyx_cuda.model import load_model_pair
+from onyx_cuda.replay_backend import prepare_replay_backend, close_replay_backend
+
+pair = load_model_pair()
+configuration = prepare_replay_backend(pair.target.model, "graph")
+try:
+    # Existing generate_speculative / generate_speculative_events calls using
+    # this target automatically use the prepared recovery backend when eligible.
+    ...
+finally:
+    close_replay_backend(pair.target.model)
+```
+
+Graph buffers belong to the target, are serialized across CUDA streams, and are
+released by server shutdown. Normal model forwards and the global attention
+registry are not patched. Closing a generation stream releases its request
+caches; model-owned graphs remain available for the next request.
+
+The latest full-corpus comparison reduced aggregate fixed-speculation latency
+by 4.76%, with 13–15% reductions on two replay-heavy requests and 28.2 seconds of
+additional one-time graph setup. See [measured performance](#measured-performance)
+for the comparison and methodology. These gains apply to warm requests.
+Graphs retain extra
+VRAM; allow for both models, graph buffers, and recovery KV caches when sizing a
+deployment. All 48 corpus cases matched target-only output in both fixed and
+adaptive modes. A 4096-token prompt plus 4096-token constrained API completion
+passed with graphs retained (20.69 GiB peak reserved). An additional live-cache
+stress case at the context limit exhausted graph workspace; scalar fallback
+completed with exact logits and KV contents after graphs were released.
 
 The first ten-repetition candidate passed exact output checks on all 48 cases
 and retained 97% of the original gains, but failed the regression-reduction
@@ -225,7 +283,47 @@ Windows delivery check.
 
 ## Measured performance
 
-The revised default passed **511 Python tests and 44 Rust tests** on the Linux
+### Latest full-suite comparison (September 17, 2026)
+
+The graph-recovery implementation passed **578 Python tests**, with three
+Windows-specific tests skipped and no failures, on a Linux RTX 2080 Ti reporting
+22,528 MiB VRAM. All 49 GPU tests restored their starting CUDA allocation after
+cleanup. This validates the Linux source implementation; Windows wheel delivery
+still requires the separate gate described above.
+
+A fresh run of all **48 corpus cases** compared the pinned Qwen3-8B FP16 target
+and Qwen2.5-0.5B-Instruct draft using non-thinking greedy generation and the Torch
+selector. Each mode received one warmup and three measured runs per case, with
+rotating measured order and synchronized full-generation wall time. All **768
+generation runs** matched their case's target-only reference tokens and finish
+reason, including all 576 speculative runs.
+
+| Mode | Sum of per-case median latency | Speedup versus target-only |
+| --- | ---: | ---: |
+| Target-only | 93.03 s | 1.000x |
+| Fixed gamma 2, scalar recovery (default) | 83.63 s | 1.112x |
+| Fixed gamma 2, graph recovery (opt-in) | **79.66 s** | **1.168x** |
+| Adaptive speculation, graph recovery (opt-in) | 82.62 s | 1.126x |
+
+Graph recovery reduced total fixed-speculation latency by **4.76%**; fixed graph
+mode used **14.38% less time than target-only** and won on 34 of 48 cases.
+Code averaged 1.65x target-only speed, extraction 1.39x, regex 1.48x, and JSON
+1.13x. Prose was nearly tied at 1.02x, while short replies were slightly slower
+at 0.96x. Recovery-heavy requests improved by 12–15% but some still trailed
+target-only. Adaptive was slower overall than fixed graph mode and remains
+experimental.
+
+Startup is excluded from these timings: model loading took 9.6 seconds and
+graph preparation added **28.2 seconds**. Graph storage remained resident across
+all comparison modes; scalar and target-only runs detached the recovery backend.
+Peak benchmark memory was **17.25 GiB allocated / 18.81 GiB reserved**, and final
+allocated memory returned to zero. These corpus peaks do not represent worst-case
+8192-token capacity; see the separate context-limit checks above. Graph recovery
+remains opt-in with `ONYX_REPLAY_BACKEND=graph` on its supported configuration.
+
+### Earlier measurements
+
+An earlier default revision passed **511 Python tests and 44 Rust tests** on the Linux
 RTX 2080 Ti reporting 22 GiB VRAM, with three Windows-only tests skipped. The
 Windows CPU suite passed 468 tests. An additional regression for an omitted
 output budget under a smaller configured limit passed on both platforms.

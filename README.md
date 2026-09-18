@@ -36,6 +36,12 @@ python -m uvicorn onyx.server:app --host 127.0.0.1 --port 8000
 For NVIDIA CUDA setup, model selection, and benchmarks, see the
 [Onyx CUDA README](onyx_cuda/README.md).
 
+The CUDA implementation defaults to fixed gamma 2 with a Qwen3-8B FP16 target
+and Qwen2.5-0.5B draft on a 22 GiB GPU. On the validated RTX 2080 Ti, optional
+graph recovery achieved **1.168x aggregate target-only speed** across 48 cases,
+with exact outputs and 28.2 seconds of additional startup. It remains opt-in;
+see [CUDA performance and limitations](onyx_cuda/README.md#measured-performance).
+
 ## Example
 
 With the Mac server running, request a constrained product code:

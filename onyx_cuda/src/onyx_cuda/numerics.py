@@ -61,6 +61,9 @@ class GreedyCheckpoint:
         self.history_tokens = 0
         self.proposal_tokens = 0
         self.skipped_proposal_tokens = 0
+        self.chunked_history_tokens = 0
+        self.graph_replay_fallbacks = 0
+        self.replay_backend = getattr(model, "_onyx_replay_backend", None)
 
     def _start(self):
         if not self.measure:
@@ -136,14 +139,35 @@ class GreedyCheckpoint:
             raise RuntimeError("Canonical cache is not a prefix of generated tokens")
         with torch.inference_mode():
             started = self._start()
-            for token in generated[consumed:-1]:
+            while consumed < len(generated) - 1:
+                token = generated[consumed]
                 if self._select() != token:
                     raise RuntimeError("Greedy numerical replay found a noncanonical emitted prefix")
+                width = min(3, len(generated) - 1 - consumed)
+                if self.constraint is None and self.replay_backend is not None and width > 1:
+                    # Commit only a checked chunk. A numerical mismatch leaves
+                    # the clean checkpoint intact for the original scalar path.
+                    trial = snapshot_cache(self.cache)
+                    ids = torch.tensor([generated[consumed:consumed + width]], device=batch.device)
+                    chunk = self.replay_backend.extend(trial, ids)
+                    if chunk is not None and chunk.argmax(-1).flatten().tolist() == generated[consumed + 1:consumed + width + 1]:
+                        self.cache = trial
+                        self.logits = chunk[:, -1, :].clone()
+                        self.replayed_tokens += width
+                        self.history_tokens += width
+                        self.chunked_history_tokens += width
+                        consumed += width
+                        del trial, chunk
+                        continue
+                    self.graph_replay_fallbacks += 1
+                    self.replay_backend = None
+                    del trial, chunk
                 self.logits = self.cache.extend(self.model, torch.tensor(
                     [[token]], device=batch.device))[:, -1, :]
                 self._advance_state(token)
                 self.replayed_tokens += 1
                 self.history_tokens += 1
+                consumed += 1
             if self._select() != generated[-1]:
                 raise RuntimeError("Greedy numerical replay found a noncanonical current token")
             self._finish("history_seconds", started)
@@ -205,4 +229,6 @@ class GreedyCheckpoint:
                 "history_replay_tokens": self.history_tokens,
                 "proposal_replay_tokens": self.proposal_tokens,
                 "skipped_proposal_tokens": self.skipped_proposal_tokens,
+                "chunked_history_tokens": self.chunked_history_tokens,
+                "graph_replay_fallbacks": self.graph_replay_fallbacks,
                 "stage_seconds": dict(self.profile) if self.measure else None}
