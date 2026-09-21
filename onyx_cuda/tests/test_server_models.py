@@ -53,7 +53,7 @@ def test_valid_request_and_response_round_trip():
         "compact_json": False,
         "top_p": 0.9,
         "n": 1,
-        "stop": ["END"],
+        "stop": None,
     }
     request = ChatCompletionRequest.model_validate(request_payload)
     assert request.model_dump() == {**request_payload, "enable_thinking": False}
@@ -149,6 +149,15 @@ def test_invalid_request_bounds_and_shapes_fail_before_cuda(overrides):
 def test_missing_messages_fail_validation():
     with pytest.raises(ValidationError):
         ChatCompletionRequest.model_validate({})
+
+
+@pytest.mark.parametrize("regex", ["CUDA Ready", ""])
+@pytest.mark.parametrize("stop", [" Ready", [" Ready"]])
+def test_regex_rejects_custom_stops(regex, stop):
+    with pytest.raises(ValidationError, match="stop is unsupported with regex output"):
+        ChatCompletionRequest.model_validate(
+            {"messages": [{"role": "user", "content": "Hi"}], "regex": regex, "stop": stop}
+        )
 
 
 @pytest.mark.parametrize(

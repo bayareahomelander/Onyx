@@ -330,6 +330,9 @@ def test_response_format_and_json_exhaustion_contract(monkeypatch, stream, finis
     "options,status",
     [
         ({"tools": []}, 422),
+        ({"regex": "CUDA Ready", "stop": " Ready"}, 422),
+        ({"regex": "CUDA Ready", "stop": [" Ready"]}, 422),
+        ({"regex": "", "stop": "END"}, 422),
         ({"regex": "["}, 400),
         ({"response_format": {"type": "json_object"}}, 422),
         (

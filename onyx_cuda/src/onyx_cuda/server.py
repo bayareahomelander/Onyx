@@ -142,6 +142,10 @@ class ChatCompletionRequest(BaseModel):
             > 1
         ):
             raise ValueError("regex, json_schema, and response_format are mutually exclusive")
+        if self.regex is not None and self.stop is not None:
+            raise ValueError(
+                "stop is unsupported with regex output; the regex determines completion"
+            )
         if self.effective_json_schema is not None and self.stop is not None:
             raise ValueError(
                 "stop is unsupported with JSON output; the schema determines completion"
