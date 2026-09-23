@@ -8,6 +8,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::constraint::ConstraintError;
+use crate::regex_engine::StringPattern;
 
 fn invalid(path: &str, message: impl std::fmt::Display) -> ConstraintError {
     ConstraintError::CompilationError(format!("JSON schema {path}: {message}"))
@@ -424,8 +425,8 @@ pub struct PropertyBlueprint {
     pub required: bool,
     /// for enums: allowed values (serialized json bytes)
     pub enum_values: Option<Vec<Vec<u8>>>,
-    /// for strings: regex pattern
-    pub pattern: Option<String>,
+    /// for strings: shared compiled pattern and completion distances
+    pub pattern: Option<Arc<StringPattern>>,
     /// for strings: min char count
     pub min_length: Option<usize>,
     /// for strings: max char count
@@ -486,12 +487,6 @@ impl PropertyBlueprint {
                 .collect()
         });
 
-        // parse pattern for string regex constraints
-        let pattern = value
-            .get("pattern")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
-
         // parse string length constraints
         let min_length = value
             .get("minLength")
@@ -501,6 +496,13 @@ impl PropertyBlueprint {
             .get("maxLength")
             .and_then(|v| v.as_u64())
             .map(|n| n as usize);
+
+        // Share compilation and completion distances across candidate tokens,
+        // parser clones and repeated array items.
+        let pattern = value.get("pattern").and_then(Value::as_str).map(|pattern| {
+            let normalized = schema_pattern(pattern).expect("validated pattern");
+            Arc::new(StringPattern::new(&normalized, max_length.is_some()))
+        });
 
         // parse array length constraints
         let min_items = value

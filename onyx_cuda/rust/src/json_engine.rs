@@ -4,14 +4,14 @@
 //! constraints during LLM generation. each level of JSON nesting has its own
 //! scope on the stack, enabling proper tracking of nested objects and arrays.
 
-use regex_automata::dfa::{dense, Automaton};
+use regex_automata::dfa::Automaton;
 use regex_automata::util::primitives::StateID;
 use serde_json::Value;
 use std::sync::Arc;
 
 use crate::constraint::{ConstraintEngine, ConstraintError};
-use crate::regex_engine::compile_pattern_dfa;
 use crate::schema::{PropertyBlueprint, SchemaBlueprint, SchemaType};
+use crate::regex_engine::StringPattern;
 
 /// syntax state within an object scope
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -40,7 +40,7 @@ enum StringStep {
 #[derive(Debug, Clone)]
 pub struct StringState {
     pending: Vec<u8>,
-    pattern_dfa: Option<Arc<dense::DFA<Vec<u32>>>>,
+    pattern: Option<Arc<StringPattern>>,
     dfa_state: Option<StateID>,
     char_count: usize,
     min_length: Option<usize>,
@@ -51,7 +51,7 @@ impl StringState {
     pub fn new_started() -> Self {
         Self {
             pending: Vec::new(),
-            pattern_dfa: None,
+            pattern: None,
             dfa_state: None,
             char_count: 0,
             min_length: None,
@@ -60,18 +60,14 @@ impl StringState {
     }
 
     pub fn with_pattern_and_constraints(
-        pattern: Option<&str>,
+        pattern: Option<Arc<StringPattern>>,
         min_length: Option<usize>,
         max_length: Option<usize>,
     ) -> Self {
         let mut state = Self::new_started();
         if let Some(pattern) = pattern {
-            // Schema compilation validates every pattern before constructing states.
-            let normalized = crate::schema::schema_pattern(pattern).expect("validated pattern");
-            let compiled =
-                compile_pattern_dfa(&format!("(?s:.*(?:{normalized}).*)")).expect("validated DFA");
-            state.pattern_dfa = Some(Arc::new(compiled.dfa));
-            state.dfa_state = Some(compiled.initial_state);
+            state.dfa_state = Some(pattern.initial_state);
+            state.pattern = Some(pattern);
         }
         state.min_length = min_length;
         state.max_length = max_length;
@@ -183,6 +179,76 @@ impl StringState {
             .is_some_and(|prefix| prefix.eq_ignore_ascii_case(&self.pending))
     }
 
+    fn can_complete_pattern(&self) -> bool {
+        let (Some(pattern), Some(state), Some(maximum)) =
+            (&self.pattern, self.dfa_state, self.max_length)
+        else {
+            return true;
+        };
+        let Some(budget) = maximum.checked_sub(self.char_count) else {
+            return false;
+        };
+        if self.pending.is_empty() {
+            return pattern.can_finish(state, budget);
+        }
+        self.pending_character_ranges()
+            .into_iter()
+            .any(|(low, high)| pattern.can_finish_after_character(state, low, high, budget))
+    }
+
+    /// Scalar ranges still encodable by this unfinished JSON character. The
+    /// pattern consumes decoded Unicode, so escape bytes do not spend length.
+    fn pending_character_ranges(&self) -> Vec<(u32, u32)> {
+        fn hex_range(digits: &[u8]) -> (u32, u32) {
+            let prefix = digits.iter().fold(0, |value, &byte| {
+                (value << 4) | (byte as char).to_digit(16).expect("validated hex digit")
+            });
+            let bits = 4 * (4 - digits.len());
+            (prefix << bits, (prefix << bits) | ((1 << bits) - 1))
+        }
+
+        if self.pending[0] != b'\\' {
+            let (width, mask, minimum) = match self.pending[0] {
+                0xc2..=0xdf => (2, 0x1f, 0x80),
+                0xe0..=0xef => (3, 0x0f, 0x800),
+                _ => (4, 0x07, 0x10000),
+            };
+            let prefix = self.pending[1..]
+                .iter()
+                .fold((self.pending[0] & mask) as u32, |value, &byte| {
+                    (value << 6) | (byte & 0x3f) as u32
+                });
+            let bits = 6 * (width - self.pending.len());
+            let low = prefix << bits;
+            return vec![(low.max(minimum), (low | ((1 << bits) - 1)).min(0x10ffff))];
+        }
+        // A lone backslash can still begin a Unicode escape for any scalar.
+        if self.pending.len() <= 2 {
+            return vec![(0, 0x10ffff)];
+        }
+        if self.pending.len() < 6 {
+            let (low, high) = hex_range(&self.pending[2..]);
+            let mut ranges = vec![(low, high.min(0xd7ff)), (low.max(0xe000), high)];
+            let (first, last) = (low.max(0xd800), high.min(0xdbff));
+            if first <= last {
+                ranges.push((
+                    0x10000 + ((first - 0xd800) << 10),
+                    0x10000 + ((last - 0xd800) << 10) + 0x3ff,
+                ));
+            }
+            return ranges;
+        }
+        // A completed high surrogate is pending until its low surrogate ends.
+        let (high, _) = hex_range(&self.pending[2..6]);
+        let (low_first, low_last) = hex_range(self.pending.get(8..).unwrap_or_default());
+        let (first, last) = (low_first.max(0xdc00), low_last.min(0xdfff));
+        if first > last {
+            return Vec::new();
+        }
+        let base = 0x10000 + ((high - 0xd800) << 10);
+        vec![(base + first - 0xdc00, base + last - 0xdc00)]
+    }
+
     fn advance(&mut self, byte: u8) -> Option<StringStep> {
         if self.pending.is_empty()
             && byte != b'"'
@@ -194,11 +260,17 @@ impl StringState {
         match step {
             StringStep::Character(character) => {
                 self.char_count += 1;
-                if let (Some(dfa), Some(state)) = (&self.pattern_dfa, &mut self.dfa_state) {
+                if let (Some(pattern), Some(state)) = (&self.pattern, &mut self.dfa_state) {
+                    let dfa = &pattern.dfa;
                     let mut buffer = [0; 4];
                     for &byte in character.encode_utf8(&mut buffer).as_bytes() {
                         *state = dfa.next_state(*state, byte);
                         if dfa.is_dead_state(*state) {
+                            return None;
+                        }
+                    }
+                    if let Some(maximum) = self.max_length {
+                        if !pattern.can_finish(*state, maximum - self.char_count) {
                             return None;
                         }
                     }
@@ -208,13 +280,18 @@ impl StringState {
                 if self.min_length.is_some_and(|min| self.char_count < min) {
                     return None;
                 }
-                if let (Some(dfa), Some(state)) = (&self.pattern_dfa, self.dfa_state) {
+                if let (Some(pattern), Some(state)) = (&self.pattern, self.dfa_state) {
+                    let dfa = &pattern.dfa;
                     if !dfa.is_match_state(dfa.next_eoi_state(state)) {
                         return None;
                     }
                 }
             }
-            StringStep::Pending => {}
+            StringStep::Pending => {
+                if !self.can_complete_pattern() {
+                    return None;
+                }
+            }
         }
         Some(step)
     }
@@ -508,13 +585,16 @@ impl JsonEngine {
                         // pass constraints from item blueprint
                         let string_state = if let Some(bp) = item_bp {
                             StringState::with_pattern_and_constraints(
-                                bp.pattern.as_deref(),
+                                bp.pattern.clone(),
                                 bp.min_length,
                                 bp.max_length,
                             )
                         } else {
                             StringState::new_started()
                         };
+                        if !string_state.can_complete_pattern() {
+                            return false;
+                        }
                         stack.push(Scope::String(string_state));
                         return true;
                     }

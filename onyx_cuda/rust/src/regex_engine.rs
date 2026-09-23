@@ -1,11 +1,13 @@
 //! DFA-based regex constraint engine.
 
-use std::sync::Arc;
+use std::collections::{HashMap, VecDeque};
+use std::sync::{Arc, Mutex};
 
 use regex_automata::dfa::{dense, Automaton};
 use regex_automata::util::primitives::StateID;
 use regex_automata::util::start::Config as StartConfig;
 use regex_automata::Anchored;
+use regex_syntax::utf8::Utf8Sequences;
 
 use crate::constraint::{ConstraintEngine, ConstraintError};
 
@@ -30,6 +32,156 @@ pub fn compile_pattern_dfa(pattern: &str) -> Result<CompiledDfa, String> {
         .map_err(|error| format!("Failed to get start state: {error}"))?;
 
     Ok(CompiledDfa { dfa, initial_state })
+}
+
+/// Shared JSON string pattern and minimum completion lengths in characters.
+#[derive(Debug)]
+pub struct StringPattern {
+    pub dfa: dense::DFA<Vec<u32>>,
+    pub initial_state: StateID,
+    remaining: HashMap<StateID, usize>,
+    // Partial UTF-8 and JSON escapes repeatedly ask about the same character
+    // intervals during vocabulary scans. Bound this schema-owned cache.
+    range_remaining: Mutex<HashMap<(StateID, u32, u32), Option<usize>>>,
+}
+
+impl StringPattern {
+    pub fn new(normalized: &str, bounded: bool) -> Self {
+        let compiled = compile_pattern_dfa(&format!("(?s:.*(?:{normalized}).*)"))
+            .expect("validated pattern DFA");
+        let remaining = if bounded {
+            completion_lengths(&compiled.dfa, compiled.initial_state)
+        } else {
+            HashMap::new()
+        };
+        Self {
+            dfa: compiled.dfa,
+            initial_state: compiled.initial_state,
+            remaining,
+            range_remaining: Mutex::new(HashMap::new()),
+        }
+    }
+
+    pub fn can_finish(&self, state: StateID, budget: usize) -> bool {
+        self.remaining
+            .get(&state)
+            .is_some_and(|&length| length <= budget)
+    }
+
+    pub fn can_finish_after_character(
+        &self,
+        state: StateID,
+        low: u32,
+        high: u32,
+        budget: usize,
+    ) -> bool {
+        if budget == 0 || low > high {
+            return false;
+        }
+        let key = (state, low, high);
+        let cached = self
+            .range_remaining
+            .lock()
+            .expect("pattern cache lock")
+            .get(&key)
+            .copied();
+        let length = cached.unwrap_or_else(|| {
+            let length = character_successors(&self.dfa, state, low, high)
+                .iter()
+                .filter_map(|state| self.remaining.get(state).copied())
+                .min();
+            let mut cache = self.range_remaining.lock().expect("pattern cache lock");
+            if cache.len() < 4096 {
+                cache.insert(key, length);
+            }
+            length
+        });
+        length.is_some_and(|length| length < budget)
+    }
+}
+
+/// Advance by one Unicode scalar, without enumerating 1.1 million characters.
+/// UTF-8 byte ranges exclude overlong encodings, surrogates and invalid scalars.
+fn character_successors(
+    dfa: &dense::DFA<Vec<u32>>,
+    state: StateID,
+    mut low: u32,
+    mut high: u32,
+) -> Vec<StateID> {
+    if (0xd800..=0xdfff).contains(&low) {
+        low = 0xe000;
+    }
+    if (0xd800..=0xdfff).contains(&high) {
+        high = 0xd7ff;
+    }
+    high = high.min(0x10ffff);
+    if low > high {
+        return Vec::new();
+    }
+    let mut successors = Vec::new();
+    for sequence in Utf8Sequences::new(char::from_u32(low).unwrap(), char::from_u32(high).unwrap())
+    {
+        let mut states = vec![state];
+        for range in sequence.as_slice() {
+            let mut next = Vec::new();
+            for state in states {
+                for byte in range.start..=range.end {
+                    let state = dfa.next_state(state, byte);
+                    if !dfa.is_dead_state(state) {
+                        next.push(state);
+                    }
+                }
+            }
+            next.sort_unstable();
+            next.dedup();
+            states = next;
+        }
+        successors.extend(states);
+    }
+    successors.sort_unstable();
+    successors.dedup();
+    successors
+}
+
+/// Reverse breadth-first search over character transitions, computed once per
+/// blueprint. The runtime check is independent of the requested length limit.
+fn completion_lengths(dfa: &dense::DFA<Vec<u32>>, initial: StateID) -> HashMap<StateID, usize> {
+    let mut states = vec![initial];
+    let mut indices = HashMap::from([(initial, 0)]);
+    let mut reverse = vec![Vec::new()];
+    let mut index = 0;
+    while index < states.len() {
+        for next in character_successors(dfa, states[index], 0, 0x10ffff) {
+            let next_index = *indices.entry(next).or_insert_with(|| {
+                states.push(next);
+                reverse.push(Vec::new());
+                states.len() - 1
+            });
+            reverse[next_index].push(index);
+        }
+        index += 1;
+    }
+    let mut lengths = vec![usize::MAX; states.len()];
+    let mut queue = VecDeque::new();
+    for (index, &state) in states.iter().enumerate() {
+        if dfa.is_match_state(dfa.next_eoi_state(state)) {
+            lengths[index] = 0;
+            queue.push_back(index);
+        }
+    }
+    while let Some(index) = queue.pop_front() {
+        for &previous in &reverse[index] {
+            if lengths[previous] == usize::MAX {
+                lengths[previous] = lengths[index] + 1;
+                queue.push_back(previous);
+            }
+        }
+    }
+    states
+        .into_iter()
+        .zip(lengths)
+        .filter(|(_, length)| *length != usize::MAX)
+        .collect()
 }
 
 pub struct RegexEngine {

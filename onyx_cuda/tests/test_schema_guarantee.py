@@ -1,5 +1,6 @@
 """Permanent regressions for the supported JSON Schema output contract."""
 
+import itertools
 import json
 import random
 from decimal import Decimal
@@ -58,6 +59,117 @@ def accepts(schema, document, chunk_size=None):
         return constraint.is_match_state(state)
     finally:
         constraint.release_state(state)
+
+
+@pytest.mark.parametrize("pattern,maximum,prefix,token,expected", [
+    ("AB", 2, b'"', b'X', False),
+    ("AB", 2, b'"', b'B', False),
+    ("AB", 2, b'"', b'A', True),
+    ("AB", 3, b'"', b'X', True),
+    ("AB", 3, b'"X', b'X', False),
+    ("AB", 2, b'"', b'\\u005', False),
+    ("AB", 2, b'"', b'\\u004', True),
+    ("AB", 2, b'"', b'\xc2', False),
+    ("éB", 2, b'"', b'\xc3', True),
+    ("éB", 2, b'"', b'\xc2', False),
+    ("éB", 2, b'"', b'\\u00E', True),
+    ("éB", 2, b'"', b'\\u00F', False),
+    ("🚀B", 2, b'"', b'\xf0\x9f', True),
+    ("🚀B", 2, b'"', b'\xf0\x90', False),
+    ("🚀B", 2, b'"', b'\\uD83', True),
+    ("🚀B", 2, b'"', b'\\uD84', False),
+    ("🚀B", 2, b'"', b'\\uD83D\\uDE8', True),
+    ("🚀B", 2, b'"', b'\\uD83D\\uDC', False),
+    ("A|BC", 1, b'"', b'B', False),
+    ("A|BC", 2, b'"', b'B', True),
+])
+def test_pattern_prefix_can_finish_within_max_length(pattern, maximum, prefix, token, expected):
+    constraint = _rust.GrammarConstraint([prefix, token])
+    constraint.compile_json_schema(json.dumps({
+        "type": "string", "pattern": pattern, "maxLength": maximum,
+    }))
+    initial = constraint.init_state()
+    state = constraint.advance_state(initial, 0)
+    try:
+        assert (1 in constraint.get_valid_token_ids(state)) is expected
+    finally:
+        constraint.release_states([initial, state])
+
+
+@pytest.mark.parametrize("chunk_size", [None, 1, 2])
+@pytest.mark.parametrize("pattern,maximum,document", [
+    ("AB", 2, '"AB"'),
+    ("AB", 3, '"XAB"'),
+    ("AB", 3, '"ABX"'),
+    ("éB", 2, '"éB"'),
+    ("éB", 2, r'"\u00e9B"'),
+    ("🚀B", 2, '"🚀B"'),
+    ("🚀B", 2, r'"\uD83d\uDe80B"'),
+    ("", 0, '""'),
+    ("^A$", 1, '"A"'),
+    ("A|BC", 2, '"BC"'),
+    (r"\nB", 2, r'"\nB"'),
+])
+def test_bounded_pattern_preserves_valid_encodings(pattern, maximum, document, chunk_size):
+    schema = {"type": "string", "pattern": pattern, "maxLength": maximum}
+    assert accepts(schema, document, chunk_size)
+    Draft202012Validator(schema).validate(json.loads(document))
+
+
+@pytest.mark.parametrize("codepoint", [0, 0x7f, 0x80, 0x7ff, 0x800, 0xd7ff,
+                                       0xe000, 0xffff, 0x10000, 0x10ffff])
+@pytest.mark.parametrize("ensure_ascii", [False, True])
+def test_bounded_pattern_unicode_boundaries(codepoint, ensure_ascii):
+    character = chr(codepoint)
+    schema = {"type": "string", "pattern": character + "B", "maxLength": 2}
+    document = json.dumps(character + "B", ensure_ascii=ensure_ascii)
+    assert accepts(schema, document, 1)
+
+
+@pytest.mark.parametrize("pattern", ["AB", "A{2}", "^A?B$", "A$", "A*", "éB|🚀A", "[^A]B"])
+def test_bounded_pattern_prefixes_match_independent_completion_oracle(pattern):
+    alphabet = "ABXé🚀"
+    maximum = 3
+    schema = {"type": "string", "pattern": pattern, "maxLength": maximum}
+    validator = Draft202012Validator(schema)
+    words = ["".join(chars) for length in range(maximum + 1)
+             for chars in itertools.product(alphabet, repeat=length)]
+    valid = [word for word in words if validator.is_valid(word)]
+    vocabulary = [b'"', *(character.encode() for character in alphabet)]
+    constraint = _rust.GrammarConstraint(vocabulary)
+    constraint.compile_json_schema(json.dumps(schema))
+    for prefix in words:
+        if not any(word.startswith(prefix) for word in valid):
+            continue
+        state = constraint.init_state()
+        try:
+            for token in [0, *(1 + alphabet.index(character) for character in prefix)]:
+                assert token in constraint.get_valid_token_ids(state)
+                previous = state
+                state = constraint.advance_state(state, token)
+                constraint.release_state(previous)
+            allowed = constraint.get_valid_token_ids(state)
+            assert (0 in allowed) == validator.is_valid(prefix)
+            for token, character in enumerate(alphabet, 1):
+                assert (token in allowed) == any(word.startswith(prefix + character) for word in valid)
+        finally:
+            constraint.release_state(state)
+
+
+@pytest.mark.parametrize("schema,prefix", [
+    ({"type": "object", "properties": {"value": {"type": "string", "pattern": "AB", "maxLength": 2}},
+      "required": ["value"]}, b'{"value":"'),
+    ({"type": "array", "items": {"type": "string", "pattern": "AB", "maxLength": 2}}, b'["AB","'),
+])
+def test_nested_bounded_patterns_reject_dead_end_tokens(schema, prefix):
+    constraint = _rust.GrammarConstraint([prefix, b'X', b'A', b'\\u005'])
+    constraint.compile_json_schema(json.dumps(schema))
+    initial = constraint.init_state()
+    state = constraint.advance_state(initial, 0)
+    try:
+        assert constraint.get_valid_token_ids(state) == [2]
+    finally:
+        constraint.release_states([initial, state])
 
 
 @pytest.mark.parametrize("chunk_size", [None, 1, 2])

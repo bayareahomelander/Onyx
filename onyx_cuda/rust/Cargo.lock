@@ -78,6 +78,7 @@ dependencies = [
  "pyo3",
  "regex",
  "regex-automata",
+ "regex-syntax",
  "serde_json",
 ]
 
