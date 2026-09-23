@@ -109,6 +109,30 @@ matched reference tokens and finish reasons.
 See [benchmark methodology, detailed results, and history](docs/benchmarks.md).
 Graph recovery remains opt-in on its [supported configuration](docs/configuration.md#optional-graph-recovery).
 
+### Speedup by workload
+
+The September 17, 2026 comparison reported the following category speedups with
+**fixed gamma 2 and opt-in graph recovery**, using the Qwen3-8B FP16 target and
+Qwen2.5-0.5B-Instruct draft on the same Linux RTX 2080 Ti configuration:
+
+| Workload | Speedup over target-only |
+| --- | ---: |
+| Code generation | **1.65x** |
+| Regex-constrained output | **1.48x** |
+| Information extraction | **1.39x** |
+| JSON Schema output | **1.13x** |
+| Prose | 1.02x |
+| Short replies | 0.96x (slower) |
+
+Each baseline uses the same target model, prompt, precision, and output budget.
+Regex and JSON baselines enforce the same constraints; these figures measure
+the benefit of speculation over already-constrained target-only generation.
+Model loading and graph setup are excluded.
+
+This breakdown belongs to the September 17 **1.168x aggregate** result and has
+not been remeasured for later graph-recovery revisions. Category results
+describe the tested cases and do not guarantee a speedup for every request.
+
 ## Development
 
 See the [validation guide](docs/validation.md) for GPU tests, runtime checks,
