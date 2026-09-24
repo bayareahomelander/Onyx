@@ -85,9 +85,7 @@ a successful `stop` finish event; `[DONE]` alone is insufficient.
 | Context / maximum output | 8192 tokens including prompt / 4096 output tokens |
 | Token selection / recovery | Torch / scalar |
 
-No model overrides are needed. See the [configuration guide](docs/configuration.md)
-for model selection, capacity limits, thinking, experimental adaptive decoding,
-and optional graph recovery.
+No model overrides are needed for the default setup.
 
 ## Measured performance
 
@@ -106,8 +104,7 @@ recovery-heavy requests remain slower than target-only. The full CUDA suite
 passed 578 tests, with three Windows-specific skips; all 768 benchmark generations
 matched reference tokens and finish reasons.
 
-See [benchmark methodology, detailed results, and history](docs/benchmarks.md).
-Graph recovery remains opt-in on its [supported configuration](docs/configuration.md#optional-graph-recovery).
+Graph recovery remains opt-in.
 
 ### Speedup by workload
 
@@ -133,11 +130,6 @@ This breakdown belongs to the September 17 **1.168x aggregate** result and has
 not been remeasured for later graph-recovery revisions. Category results
 describe the tested cases and do not guarantee a speedup for every request.
 
-## Development
-
-See the [validation guide](docs/validation.md) for GPU tests, runtime checks,
-and Windows build/release validation.
-
 ## Structure
 
 ```text
@@ -145,7 +137,6 @@ src/onyx_cuda/  CUDA inference, token selection, and API
 rust/          Native regex and JSON Schema engine
 tests/         Unit, API, and real-GPU tests
 scripts/       Windows package validation
-docs/          Configuration, benchmarks, and validation guides
 ```
 
 ## License
