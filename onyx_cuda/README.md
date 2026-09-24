@@ -96,29 +96,30 @@ checks and scalar fallback remain in place; speculative gamma stays at 2.
 
 ## Measured performance
 
-On a Linux RTX 2080 Ti reporting 22 GiB, the September 22, 2026 comparison covered
+On a Linux RTX 2080 Ti reporting 22 GiB, the September 24, 2026 comparison covered
 48 cases with one warmup and three measured runs per mode. Aggregates sum
 per-case median generation times, excluding model loading and graph setup:
 
 | Mode | Aggregate speedup over target-only |
 | --- | ---: |
-| Fixed gamma 2, scalar recovery (default) | 1.112x |
-| Fixed gamma 2, graph recovery (opt-in) | **1.190x** |
-| Adaptive speculation, graph recovery (opt-in) | 1.160x |
+| Fixed gamma 2, scalar recovery (default) | 1.115x |
+| Fixed gamma 2, graph recovery (opt-in) | **1.193x** |
+| Adaptive speculation, graph recovery (opt-in) | 1.167x |
 
-An independent ten-repetition comparison confirmed 1.92% lower fixed-mode
-latency and 2.56% lower adaptive-mode latency versus the previous two/three-token
-graph backend. No case crossed the predeclared regression threshold of both
-5% and 5 ms. Gains vary by workload; some short and recovery-heavy requests
-remain slower than target-only.
+Aggregates were within 0.5% of the September 22 eight-token recovery
+validation, and all 960 generations matched target-only tokens and finish
+reasons. In that earlier validation, an independent ten-repetition comparison
+confirmed 1.92% lower fixed-mode latency and 2.56% lower adaptive-mode latency
+versus the previous two/three-token graph backend, and no case crossed the
+predeclared regression threshold of both 5% and 5 ms. Gains vary by workload;
+some short and recovery-heavy requests remain slower than target-only.
 
 Graph preparation took 45.3 seconds versus 32.1 seconds for the previous backend
 in separate startup measurements. Preallocating graph outputs reduced prepared
 reserved memory from 18.15 to 17.22 GiB; allocated memory increased slightly,
 from 16.47 to 16.52 GiB. These startup observations are not context-capacity bounds.
 
-The full CUDA suite passed 657 tests, with three Windows-specific skips. All
-3,264 benchmark generations matched reference tokens and finish reasons.
+The full CUDA suite passed 862 tests, with three Windows-specific skips.
 Separate checks matched full logits and KV caches bitwise through 8192 tokens,
 and the API completed a 4096-prompt/4096-output capacity test. Graph recovery
 remains restricted to its validated runtime and opt-in; memory exhaustion still
