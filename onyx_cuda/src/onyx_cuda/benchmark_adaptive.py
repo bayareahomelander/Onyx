@@ -1,4 +1,9 @@
-"""Predetermined, paired comparison of fixed gamma 0/2 and adaptive generation."""
+"""Predetermined, paired comparison of fixed gamma 0/2 and adaptive generation.
+
+Every mode runs in one interleaved comparison. On a target that supports graph
+recovery, graphs are prepared once and stay resident for all modes, but only
+graph modes use them; model loading and graph setup are excluded from timings.
+"""
 
 import argparse
 import gc
@@ -18,35 +23,61 @@ from onyx_cuda.config import resolve_model_selection
 from onyx_cuda.generation import AcceptedTokenEvent
 from onyx_cuda.model import load_model_pair
 from onyx_cuda.prompt import format_prompt
+from onyx_cuda.replay_backend import close_replay_backend, prepare_replay_backend
 from onyx_cuda.speculative import generate_speculative_events
 from onyx_cuda.vocabulary import get_token_byte_vocabulary
 from onyx_cuda._validation_report import evidence
 
-MODES = ("gamma0", "gamma2", "adaptive")
+# Mode: (gamma, adaptive, graph recovery). Promotion gates use the scalar modes.
+MODES = {
+    "gamma0": (0, False, False),
+    "gamma2": (2, False, False),
+    "adaptive": (2, True, False),
+    "gamma2_graph": (2, False, True),
+    "adaptive_graph": (2, True, True),
+}
 GATES = {"retained_savings_fraction": 0.9, "remaining_regression_fraction": 0.8,
          "aggregate_latency_tolerance": 0.02}
 
 
+def select_modes(replay_configuration):
+    """Graph modes run only when graphs are active; otherwise they would repeat scalar timings."""
+    graph = replay_configuration["active"] == "graph"
+    return [mode for mode, (_, _, uses_graph) in MODES.items() if graph or not uses_graph]
+
+
+def use_replay_backend(model, backend):
+    """Attach prepared graphs for one generation, or detach them without releasing them."""
+    if backend is not None:
+        model._onyx_replay_backend = backend
+    elif hasattr(model, "_onyx_replay_backend"):
+        del model._onyx_replay_backend
+
+
 def summarize(cases):
-    totals = {mode: sum(c["median_seconds"][mode] for c in cases) for mode in MODES}
+    modes = [mode for mode in MODES if cases and mode in cases[0]["median_seconds"]]
+    totals = {mode: sum(c["median_seconds"][mode] for c in cases) for mode in modes}
     winners = [c for c in cases if c["original"] and c["median_seconds"]["gamma2"] < c["median_seconds"]["gamma0"]]
     losers = [c for c in cases if c["median_seconds"]["gamma2"] > c["median_seconds"]["gamma0"]]
     savings = sum(c["median_seconds"]["gamma0"] - c["median_seconds"]["gamma2"] for c in winners)
     retained = sum(c["median_seconds"]["gamma0"] - c["median_seconds"]["adaptive"] for c in winners)
     excess = {mode: sum(max(c["median_seconds"][mode] - c["median_seconds"]["gamma0"], 0) for c in losers)
               for mode in ("gamma2", "adaptive")}
-    return {"total_median_seconds": totals,
-            "speedup_vs_target": {m: totals["gamma0"] / totals[m] for m in MODES} if cases else {},
-            "original_winner_savings_retained": retained / savings if savings else None,
-            "regression_seconds": excess,
-            "gates": {
-                "retained_gains": retained >= GATES["retained_savings_fraction"] * savings if winners else None,
-                "reduced_regressions": excess["adaptive"] <= GATES["remaining_regression_fraction"] * excess["gamma2"] if losers else None,
-                "aggregate": totals["adaptive"] <= totals["gamma2"] * (1 + GATES["aggregate_latency_tolerance"]),
-                "recovery_observed": any(
-                    (r.get("adaptive_stats") or {}).get("recovery_count", 0) > 0
-                    for c in cases for r in c["runs"]["adaptive"]),
-            }}
+    summary = {"total_median_seconds": totals,
+               "speedup_vs_target": {m: totals["gamma0"] / totals[m] for m in modes},
+               "original_winner_savings_retained": retained / savings if savings else None,
+               "regression_seconds": excess,
+               "gates": {
+                   "retained_gains": retained >= GATES["retained_savings_fraction"] * savings if winners else None,
+                   "reduced_regressions": excess["adaptive"] <= GATES["remaining_regression_fraction"] * excess["gamma2"] if losers else None,
+                   "aggregate": totals["adaptive"] <= totals["gamma2"] * (1 + GATES["aggregate_latency_tolerance"]),
+                   "recovery_observed": any(
+                       (r.get("adaptive_stats") or {}).get("recovery_count", 0) > 0
+                       for c in cases for r in c["runs"]["adaptive"]),
+               }}
+    if "gamma2_graph" in totals:
+        summary["graph_latency_reduction_vs_scalar"] = 1 - totals["gamma2_graph"] / totals["gamma2"]
+    return summary
 
 
 def paired_latency_interval(runs, reference="gamma2", draws=1000):
@@ -71,11 +102,18 @@ def run(output, *, repetitions=10, split="all", measure=False):
     selected = [c for c in CORPUS if split == "all" or c["split"] == split]
     device = torch.device("cuda:0")
     pair = load_model_pair(selection=resolve_model_selection())
+    target_model = pair.target.model
+    replay_configuration = prepare_replay_backend(target_model, "graph")
+    graphs = getattr(target_model, "_onyx_replay_backend", None)
+    modes = select_modes(replay_configuration)
     vocabulary = get_token_byte_vocabulary(pair.target.tokenizer, pair.target.model.config.vocab_size)
     report = {"corpus_sha256": hashlib.sha256(corpus_bytes).hexdigest(), "corpus_version": 1,
               "settings": {"repetitions": repetitions, "warmups": 1, "split": split,
                            "measure": measure, "temperature": 0, "enable_thinking": False,
-                           "greedy_backend": "torch", "dtype": "float16", "gates": GATES},
+                           "greedy_backend": "torch", "dtype": "float16", "gates": GATES,
+                           "modes": {mode: dict(zip(("gamma", "adaptive", "graph_recovery"), MODES[mode]))
+                                     for mode in modes},
+                           "replay_backend": replay_configuration},
               "models": {role: {"id": getattr(pair, role).model_id, "revision": getattr(pair, role).revision}
                          for role in ("draft", "target")},
               "environment": {"python": platform.python_version(), "torch": str(torch.__version__),
@@ -102,14 +140,15 @@ def run(output, *, repetitions=10, split="all", measure=False):
 
             def generate(mode):
                 nonlocal expected
+                gamma, adaptive, graph = MODES[mode]
+                use_replay_backend(target_model, graphs if graph else None)
                 torch.cuda.synchronize(device)
                 torch.cuda.reset_peak_memory_stats(device)
                 started = time.perf_counter()
                 first = None
                 ids = []
                 result = None
-                events = generate_speculative_events(**args, gamma=0 if mode == "gamma0" else 2,
-                                                     adaptive=mode == "adaptive", measure=measure)
+                events = generate_speculative_events(**args, gamma=gamma, adaptive=adaptive, measure=measure)
                 try:
                     for event in events:
                         if isinstance(event, AcceptedTokenEvent):
@@ -122,6 +161,9 @@ def run(output, *, repetitions=10, split="all", measure=False):
                     events.close()
                 torch.cuda.synchronize(device)
                 seconds = time.perf_counter() - started
+                if graph and graphs.closed:
+                    # Memory exhaustion releases the graphs; later runs would be scalar.
+                    raise RuntimeError(f"Graph recovery closed during {case['name']}: {graphs.fallback_reason}")
                 assert result is not None and ids == result.token_ids
                 signature = (ids, result.finish_reason)
                 if expected is None:
@@ -136,25 +178,25 @@ def run(output, *, repetitions=10, split="all", measure=False):
                         "replay_stats": getattr(result.timings, "replay_stats", None),
                         "peak_allocated_bytes": torch.cuda.max_memory_allocated(device)}
 
-            for mode in MODES:  # Warm all modes and establish the target oracle first.
+            for mode in modes:  # Warm all modes and establish the target oracle first.
                 generate(mode)
             gc.collect()
             torch.cuda.synchronize(device)
             allocation = torch.cuda.memory_allocated(device)
-            runs = {mode: [] for mode in MODES}
+            runs = {mode: [] for mode in modes}
             for repetition in range(repetitions):
-                offset = (index + repetition) % len(MODES)
-                for mode in MODES[offset:] + MODES[:offset]:
+                offset = (index + repetition) % len(modes)
+                for mode in modes[offset:] + modes[:offset]:
                     runs[mode].append(generate(mode))
             gc.collect()
             torch.cuda.synchronize(device)
             if torch.cuda.memory_allocated(device) != allocation:
                 raise RuntimeError(f"Retained GPU allocation: {case['name']}")
             row = {**case, "prompt_token_count": len(prompt.token_ids), "runs": runs,
-                   "median_seconds": {mode: statistics.median(r["seconds"] for r in runs[mode]) for mode in MODES},
+                   "median_seconds": {mode: statistics.median(r["seconds"] for r in runs[mode]) for mode in modes},
                    "adaptive_latency_ratio_95pct_interval": paired_latency_interval(runs),
                    "min_max_seconds": {mode: [min(r["seconds"] for r in runs[mode]),
-                                                max(r["seconds"] for r in runs[mode])] for mode in MODES}}
+                                                max(r["seconds"] for r in runs[mode])] for mode in modes}}
             report["cases"].append(row)
             report["summary"] = summarize(report["cases"])
             save()
@@ -167,6 +209,8 @@ def run(output, *, repetitions=10, split="all", measure=False):
         report["error"] = str(error)
         raise
     finally:
+        use_replay_backend(target_model, graphs)
+        close_replay_backend(target_model)
         save()
     return report
 

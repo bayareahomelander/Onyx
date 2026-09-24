@@ -109,6 +109,17 @@ matched reference tokens and finish reasons.
 
 Graph recovery remains opt-in.
 
+To reproduce the comparison on your GPU, use a new output filename for each run:
+
+```sh
+python -m onyx_cuda.benchmark_adaptive --split all --repetitions 3 --output validation/speedups.json
+```
+
+One interleaved run times target-only, fixed gamma 2, and adaptive speculation,
+and adds graph-recovery modes when the GPU supports them (compute capability 7.5).
+Every speculative output must match target-only generation token for token.
+The report records which modes ran and why graph recovery was unavailable.
+
 ### Speedup by workload
 
 The September 17, 2026 comparison reported the following category speedups with
