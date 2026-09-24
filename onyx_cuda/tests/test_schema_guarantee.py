@@ -250,6 +250,8 @@ CASES = [
     ({"type": "string", "enum": [1, "é", "long"], "maxLength": 1}, "1", False),
     ({"enum": [1, 10]}, "1", True),
     ({"enum": [1, 10]}, "10", True),
+    ({"type": "array", "items": {"enum": [12, 123]}}, "[123]", True),
+    ({"type": "array", "items": {"enum": [12, 123]}}, "[12,123]", True),
     (
         {"type": "object", "enum": [{"a": 1}], "properties": {"a": {"type": "integer"}}},
         '{"a":2}',

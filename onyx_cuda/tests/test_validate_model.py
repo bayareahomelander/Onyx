@@ -37,6 +37,12 @@ def test_budget_limited_constraints_do_not_pass(payload, text):
         validation.validate_output(payload, text, "length")
 
 
+@pytest.mark.parametrize("finish_reason", ["stop", "eos"])
+@pytest.mark.parametrize("payload,text", [({"regex": "[0-9]+"}, "427"), ({"json_schema": {"type": "integer"}}, "427")])
+def test_complete_constraints_pass_whether_grammar_or_model_ended_them(payload, text, finish_reason):
+    validation.validate_output(payload, text, finish_reason)
+
+
 def test_validation_failure_records_stage_and_does_not_claim_tested(monkeypatch, tmp_path):
     seen = []
     def precheck(selection, **kwargs):

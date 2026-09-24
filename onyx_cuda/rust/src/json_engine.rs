@@ -1163,10 +1163,10 @@ impl JsonEngine {
                     state.cursor += 1;
                     state.candidates = new_candidates;
 
-                    // check if we just completed a match
+                    // Close once no longer candidate remains. A complete prefix
+                    // such as 12 in [12, 123] closes at the following delimiter.
                     let new_cursor = state.cursor;
-                    if state.candidates.iter().any(|c| c.len() == new_cursor) {
-                        // have a complete match, pop and update parent
+                    if state.candidates.iter().all(|c| c.len() == new_cursor) {
                         stack.pop();
                         if stack.is_empty() {
                             *finished = true;
@@ -1718,6 +1718,30 @@ mod tests {
         // try to use "green" - not in enum, should fail
         let result = engine.advance(6);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_enum_prefix_value_does_not_hide_longer_value() {
+        let vocab: Vec<Vec<u8>> = (0..=255).map(|byte| vec![byte]).collect();
+        let schema = r#"{"type":"array","items":{"enum":[12,123]}}"#;
+        for document in ["[123]", "[12,123]", "[12]"] {
+            let mut engine = JsonEngine::new(vocab.clone(), schema).unwrap();
+            for byte in document.bytes() {
+                engine.advance(byte as usize).unwrap();
+            }
+            assert!(engine.is_finished(), "{document}");
+        }
+
+        let mut engine = JsonEngine::new(vocab.clone(), r#"{"enum":[12,123]}"#).unwrap();
+        engine.advance(b'1' as usize).unwrap();
+        engine.advance(b'2' as usize).unwrap();
+        assert!(engine.is_finished());
+        let valid = engine.get_valid_tokens();
+        assert!(valid.contains(&(b'3' as usize)));
+        assert!(!valid.contains(&(b'4' as usize)));
+        engine.advance(b'3' as usize).unwrap();
+        assert!(engine.is_finished());
+        assert!(engine.get_valid_tokens().is_empty());
     }
 
     #[test]

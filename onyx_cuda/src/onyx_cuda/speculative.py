@@ -1,7 +1,7 @@
 """Fixed and adaptive speculative token generation through one event loop."""
 
 import time
-from collections.abc import Iterable, Iterator
+from collections.abc import Iterable, Iterator, Sequence
 from typing import NamedTuple
 
 import torch
@@ -17,6 +17,7 @@ from onyx_cuda.generation import (
     _take_ready_tokens,
     GenerationResult,
     GenerationTimings,
+    _grammar_choices,
     _initialize_grammar_constraint,
     _matched_stop_length,
     _validate_grammar_request,
@@ -66,9 +67,21 @@ def _synchronize_device(device) -> None:
         torch.cuda.synchronize(device)
 
 
-def _grammar_token(
+def _timed_grammar_choices(
     constraint,
     grammar_state: int,
+    eos_token_ids: list[int],
+    mask_times: list[float] | None = None,
+) -> list[int]:
+    started_at = time.perf_counter() if mask_times is not None else None
+    choices = _grammar_choices(constraint, grammar_state, eos_token_ids)
+    if started_at is not None:
+        mask_times.append(time.perf_counter() - started_at)
+    return choices
+
+
+def _grammar_token(
+    choices: list[int],
     logits: torch.Tensor,
     mask_times: list[float] | None = None,
     greedy_backend: str | None = None,
@@ -77,10 +90,7 @@ def _grammar_token(
         if logits.device.type == "cuda":
             torch.cuda.synchronize(logits.device)
         started_at = time.perf_counter()
-    valid_token_ids = constraint.get_valid_token_ids(grammar_state)
-    if not valid_token_ids:
-        raise ValueError("Grammar constraint has no valid token continuation")
-    token_id = grammar_argmax(logits, valid_token_ids, backend=greedy_backend)
+    token_id = grammar_argmax(logits, choices, backend=greedy_backend)
     if mask_times is not None:
         if logits.device.type == "cuda":
             torch.cuda.synchronize(logits.device)
@@ -120,8 +130,12 @@ def propose_tokens(
     live_grammar_states: set[int] | None = None,
     mask_times: list[float] | None = None,
     greedy_backend: str | None = None,
+    grammar_choices: list[int] | None = None,
 ) -> ProposalResult:
-    """Greedily propose tokens after the target-selected current token."""
+    """Greedily propose tokens after the target-selected current token.
+
+    grammar_choices, when given, are the selectable tokens after grammar_state.
+    """
     if not generated_token_ids:
         raise ValueError("draft proposal requires a target-selected token")
     if isinstance(eos_token_ids, int):
@@ -131,7 +145,11 @@ def propose_tokens(
     if grammar_constraint is not None:
         if grammar_state is None or live_grammar_states is None:
             raise ValueError("grammar state tracking is required")
-        if grammar_constraint.is_match_state(grammar_state):
+        if grammar_choices is None:
+            grammar_choices = _timed_grammar_choices(
+                grammar_constraint, grammar_state, eos_token_ids, mask_times
+            )
+        if not grammar_choices:
             return ProposalResult([], start_length, start_length)
     if generated_token_ids[-1] in eos_token_ids or _matched_stop_length(
         generated_token_ids, stop_sequences
@@ -144,21 +162,23 @@ def propose_tokens(
         device=draft_cache.attention_mask.device,
     )
     draft_grammar_state = grammar_state
+    choices = grammar_choices
     with torch.inference_mode():
         for _ in range(min(gamma, remaining_tokens)):
             logits = draft_cache.extend(draft_model, input_ids)[:, -1, :]
             if grammar_constraint is not None:
-                token_id = _grammar_token(
-                    grammar_constraint,
-                    draft_grammar_state,
-                    logits,
-                    mask_times,
-                    greedy_backend,
-                )
+                if choices is None:
+                    choices = _timed_grammar_choices(
+                        grammar_constraint, draft_grammar_state, eos_token_ids, mask_times
+                    )
+                token_id = _grammar_token(choices, logits, mask_times, greedy_backend)
+                choices = None
             else:
                 token_id = logits.argmax(dim=-1)
             token = token_id.item()
             proposed.append(token)
+            if token in eos_token_ids:
+                break
             if grammar_constraint is not None:
                 draft_grammar_state = _advance_grammar_state(
                     grammar_constraint,
@@ -167,10 +187,12 @@ def propose_tokens(
                     live_grammar_states,
                 )
                 if grammar_constraint.is_match_state(draft_grammar_state):
-                    break
-            if token in eos_token_ids or _matched_stop_length(
-                generated_token_ids + proposed, stop_sequences
-            ):
+                    choices = _timed_grammar_choices(
+                        grammar_constraint, draft_grammar_state, eos_token_ids, mask_times
+                    )
+                    if not choices:
+                        break
+            if _matched_stop_length(generated_token_ids + proposed, stop_sequences):
                 break
             input_ids = token_id[:, None]
 
@@ -193,8 +215,13 @@ def _verify_proposal(
     maintain_draft: bool = True,
     checkpoint: GreedyCheckpoint | None = None,
     generated_token_ids: list[int] | None = None,
+    eos_token_ids: Sequence[int] = (),
+    grammar_choices: list[int] | None = None,
 ) -> tuple[VerificationResult, list[int]]:
-    """Verify every proposal position in one target forward."""
+    """Verify every proposal position in one target forward.
+
+    Grammar states are returned for each verified token except a final EOS.
+    """
     input_ids = torch.tensor(
         [[current_token_id, *proposal.token_ids]],
         device=target_cache.attention_mask.device,
@@ -209,6 +236,7 @@ def _verify_proposal(
     for attempt in range(2):
         verified_token_ids: list[int]
         verified_grammar_states: list[int] = []
+        position_choices = None
         if grammar_constraint is None:
             target_token_ids = target_logits.argmax(dim=-1)[0].tolist()
             accepted = 0
@@ -223,37 +251,32 @@ def _verify_proposal(
             accepted = 0
             verify_grammar_state = grammar_state
             verified_token_ids = []
-            for position, proposed in enumerate(proposal.token_ids):
-                target = _grammar_token(
-                    grammar_constraint,
-                    verify_grammar_state,
-                    target_logits[:, position, :],
-                    mask_times,
-                    greedy_backend,
-                ).item()
-                token = proposed if proposed == target else target
-                verified_token_ids.append(token)
-                verify_grammar_state = _advance_grammar_state(
-                    grammar_constraint,
-                    verify_grammar_state,
-                    token,
-                    live_grammar_states,
-                )
-                verified_grammar_states.append(verify_grammar_state)
-                if proposed != target:
+            position_choices = []
+            choices = grammar_choices
+            # The final position selects the correction or bonus token.
+            for position in range(len(proposal.token_ids) + 1):
+                if choices is None:
+                    choices = _timed_grammar_choices(
+                        grammar_constraint, verify_grammar_state, eos_token_ids, mask_times
+                    )
+                    if position == 0:
+                        grammar_choices = choices
+                if not choices:
                     break
-                accepted += 1
-                if grammar_constraint.is_match_state(verify_grammar_state):
-                    break
-            else:
                 target = _grammar_token(
-                    grammar_constraint,
-                    verify_grammar_state,
-                    target_logits[:, len(proposal.token_ids), :],
-                    mask_times,
-                    greedy_backend,
+                    choices, target_logits[:, position, :], mask_times, greedy_backend
                 ).item()
+                position_choices.append(choices)
+                choices = None
                 verified_token_ids.append(target)
+                proposed = (
+                    proposal.token_ids[position] if position < len(proposal.token_ids) else None
+                )
+                if target in eos_token_ids:
+                    # EOS ends the output and never advances the grammar.
+                    if target == proposed:
+                        accepted += 1
+                    break
                 verify_grammar_state = _advance_grammar_state(
                     grammar_constraint,
                     verify_grammar_state,
@@ -261,9 +284,15 @@ def _verify_proposal(
                     live_grammar_states,
                 )
                 verified_grammar_states.append(verify_grammar_state)
+                if target != proposed:
+                    break
+                accepted += 1
+                if grammar_constraint.is_match_state(verify_grammar_state):
+                    choices = _timed_grammar_choices(
+                        grammar_constraint, verify_grammar_state, eos_token_ids, mask_times
+                    )
         if attempt == 0 and checkpoint is not None and not checkpoint.target_is_canonical and ambiguous_logits(
-            target_logits, len(verified_token_ids), grammar_constraint,
-            [grammar_state, *verified_grammar_states[:-1]],
+            target_logits, len(verified_token_ids), position_choices,
         ):
             if grammar_constraint is not None:
                 _release_grammar_states(grammar_constraint, verified_grammar_states, live_grammar_states)
@@ -387,6 +416,7 @@ def generate_speculative_events(
     stop_sequences = stop_sequences or []
     constraint = None
     grammar_state = None
+    grammar_choices = None
     live_grammar_states: set[int] = set()
     generated: list[int] = []
     pending_events: list[int] = []
@@ -443,7 +473,10 @@ def generate_speculative_events(
             if compile_started_at is not None:
                 grammar_compile_seconds = time.perf_counter() - compile_started_at
             live_grammar_states.add(grammar_state)
-            if constraint.is_match_state(grammar_state):
+            grammar_choices = _timed_grammar_choices(
+                constraint, grammar_state, eos_token_ids, mask_times
+            )
+            if not grammar_choices:
                 finish_reason = "stop"
                 finished = True
 
@@ -452,19 +485,16 @@ def generate_speculative_events(
                 first_token = target_prefill.token_id
             else:
                 first_token = _grammar_token(
-                    constraint,
-                    grammar_state,
-                    target_prefill.logits,
-                    mask_times,
-                    greedy_backend,
+                    grammar_choices, target_prefill.logits, mask_times, greedy_backend
                 )
+                grammar_choices = None
             generated.append(first_token.item())
             pending_events.append(generated[-1])
             if started_at is not None:
                 _synchronize_device(measurement_device)
                 time_to_first_token = time.perf_counter() - started_at
 
-            if constraint is not None:
+            if constraint is not None and generated[-1] not in eos_token_ids:
                 previous_state = grammar_state
                 grammar_state = _advance_grammar_state(
                     constraint,
@@ -474,8 +504,12 @@ def generate_speculative_events(
                 )
                 _release_grammar_states(constraint, [previous_state], live_grammar_states)
                 if constraint.is_match_state(grammar_state):
-                    finish_reason = "stop"
-                    finished = True
+                    grammar_choices = _timed_grammar_choices(
+                        constraint, grammar_state, eos_token_ids, mask_times
+                    )
+                    if not grammar_choices:
+                        finish_reason = "stop"
+                        finished = True
 
             if not finished:
                 matched_stop_length = _matched_stop_length(generated, stop_sequences)
@@ -495,7 +529,8 @@ def generate_speculative_events(
         # A numerical repair can replace target_cache's underlying KV object;
         # do not retain the obsolete object through the prefill result.
         checkpoint = GreedyCheckpoint(target_model, prompt_token_ids, constraint,
-                                      live_grammar_states, greedy_backend, measure=measure)
+                                      live_grammar_states, greedy_backend,
+                                      eos_token_ids=eos_token_ids, measure=measure)
         if not finished and len(generated) < max_tokens:
             checkpoint.seed(target_cache, target_prefill.logits)
         del target_prefill
@@ -522,6 +557,11 @@ def generate_speculative_events(
                     _catch_up_draft(draft_model, draft_cache, prompt_token_ids, generated)
                     _synchronize_device(runtime_device)
                     catchup_seconds = time.perf_counter() - catchup_started
+            if constraint is not None and grammar_choices is None:
+                # Shared by the draft's first proposal and the target's first check.
+                grammar_choices = _timed_grammar_choices(
+                    constraint, grammar_state, eos_token_ids, mask_times
+                )
             speculative_iteration_count += int(active_gamma > 0)
             if measurement_device is not None:
                 _synchronize_device(measurement_device)
@@ -542,6 +582,7 @@ def generate_speculative_events(
                 live_grammar_states=(live_grammar_states if constraint is not None else None),
                 mask_times=mask_times,
                 greedy_backend=greedy_backend,
+                grammar_choices=grammar_choices,
             ) if active_gamma else ProposalResult([], 0, 0)
             proposal_seconds = time.perf_counter() - proposal_started if controller else None
             proposed_token_count += len(proposal.token_ids)
@@ -573,7 +614,10 @@ def generate_speculative_events(
                 maintain_draft=not adaptive,
                 checkpoint=checkpoint,
                 generated_token_ids=generated,
+                eos_token_ids=eos_token_ids,
+                grammar_choices=grammar_choices,
             )
+            grammar_choices = None
             accepted_proposal_count += verified.accepted_proposal_count
             if measurement_device is not None:
                 _synchronize_device(measurement_device)
@@ -584,14 +628,21 @@ def generate_speculative_events(
                     0.0,
                 )
 
-            retained_grammar_state = None
+            # Verification stops at a complete match that cannot grow, so only
+            # the final token can end the grammar. Check it before stop
+            # sequences, in the same order as target-only generation.
+            grammar_complete = False
+            if (constraint is not None
+                    and len(verified_grammar_states) == len(verified.token_ids)
+                    and constraint.is_match_state(verified_grammar_states[-1])):
+                grammar_choices = _timed_grammar_choices(
+                    constraint, verified_grammar_states[-1], eos_token_ids, mask_times
+                )
+                grammar_complete = not grammar_choices
             for position, token_id in enumerate(verified.token_ids):
                 generated.append(token_id)
                 pending_events.append(token_id)
-                if constraint is not None and constraint.is_match_state(
-                    verified_grammar_states[position]
-                ):
-                    retained_grammar_state = verified_grammar_states[position]
+                if grammar_complete and position == len(verified.token_ids) - 1:
                     finish_reason = "stop"
                     finished = True
                     break
@@ -600,14 +651,10 @@ def generate_speculative_events(
                 if matched_stop_length:
                     del generated[-matched_stop_length:]
                     del pending_events[-matched_stop_length:]
-                    if constraint is not None:
-                        retained_grammar_state = verified_grammar_states[position]
                     finish_reason = "stop"
                     finished = True
                     break
                 if token_id in eos_token_ids:
-                    if constraint is not None:
-                        retained_grammar_state = verified_grammar_states[position]
                     finish_reason = "eos"
                     finished = True
                     break
@@ -615,18 +662,16 @@ def generate_speculative_events(
                 ready_events.extend(_take_ready_tokens(pending_events, event_retain))
 
             if constraint is not None:
-                if retained_grammar_state is None:
-                    retained_grammar_state = verified_grammar_states[-1]
+                # Once finished, any retained state is released by the final cleanup.
+                retained_grammar_state = (
+                    verified_grammar_states[-1] if verified_grammar_states else grammar_state
+                )
                 _release_grammar_states(
                     constraint,
                     [
-                        grammar_state,
-                        *draft_grammar_states,
-                        *(
-                            state
-                            for state in verified_grammar_states
-                            if state != retained_grammar_state
-                        ),
+                        state
+                        for state in (grammar_state, *draft_grammar_states, *verified_grammar_states)
+                        if state != retained_grammar_state
                     ],
                     live_grammar_states,
                 )

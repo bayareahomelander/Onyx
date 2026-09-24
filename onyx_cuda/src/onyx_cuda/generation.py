@@ -136,6 +136,24 @@ def _validate_json_result(
     _rust.validate_json_output(json_schema, text)
 
 
+def _grammar_choices(constraint, grammar_state: int, eos_token_ids: list[int]) -> list[int]:
+    """Return the token IDs selectable after grammar_state.
+
+    A complete match that can still grow (``[0-9]+`` after one digit) also
+    permits EOS, so the model rather than the first match decides where output
+    ends. An empty list means the match is complete and cannot be extended.
+    EOS tokens decode to no bytes, so the grammar never lists them itself.
+    """
+    valid_token_ids = constraint.get_valid_token_ids(grammar_state)
+    if not constraint.is_match_state(grammar_state):
+        if not valid_token_ids:
+            raise ValueError("Grammar constraint has no valid token continuation")
+        return valid_token_ids
+    if not valid_token_ids:
+        return []
+    return [*valid_token_ids, *eos_token_ids]
+
+
 def _initialize_grammar_constraint(
     logits_vocab_size: int,
     regex: str | None,
@@ -196,6 +214,16 @@ def generate_token_events(
 
     constraint = None
     grammar_state = None
+    grammar_choices = None
+
+    def choices_after(state):
+        nonlocal valid_token_enumeration_seconds
+        enumeration_started_at = time.perf_counter() if measure else None
+        choices = _grammar_choices(constraint, state, eos_token_ids)
+        if enumeration_started_at is not None:
+            valid_token_enumeration_seconds += time.perf_counter() - enumeration_started_at
+        return choices
+
     try:
         result = prefill(model, prompt_token_ids)
         logits = result.logits
@@ -221,22 +249,19 @@ def generate_token_events(
         for step in range(max_tokens):
             token_id = None
             if constraint is not None:
-                if constraint.is_match_state(grammar_state):
+                if grammar_choices is None:
+                    grammar_choices = choices_after(grammar_state)
+                if not grammar_choices:
                     finish_reason = "stop"
                     break
-                enumeration_started_at = time.perf_counter() if measure else None
-                valid_token_ids = constraint.get_valid_token_ids(grammar_state)
-                if enumeration_started_at is not None:
-                    valid_token_enumeration_seconds += time.perf_counter() - enumeration_started_at
-                if not valid_token_ids:
-                    raise ValueError("Grammar constraint has no valid token continuation")
                 if measure:
                     torch.cuda.synchronize(logits.device)
                     mask_started_at = time.perf_counter()
                 if temperature == 0:
-                    token_id = grammar_argmax(logits, valid_token_ids, backend=greedy_backend)
+                    token_id = grammar_argmax(logits, grammar_choices, backend=greedy_backend)
                 else:
-                    logits = apply_grammar_mask(logits, valid_token_ids)
+                    logits = apply_grammar_mask(logits, grammar_choices)
+                grammar_choices = None
                 if measure:
                     torch.cuda.synchronize(logits.device)
                     mask_transfer_seconds += time.perf_counter() - mask_started_at
@@ -249,13 +274,17 @@ def generate_token_events(
             generated.append(token)
             pending.append(token)
 
-            if constraint is not None:
+            if constraint is not None and token not in eos_token_ids:
                 previous_state = grammar_state
                 grammar_state = constraint.advance_state(grammar_state, token)
                 constraint.release_state(previous_state)
                 if constraint.is_match_state(grammar_state):
-                    finish_reason = "stop"
-                    break
+                    # Decide now whether this complete match can grow, so a
+                    # finished output does not pay for another forward pass.
+                    grammar_choices = choices_after(grammar_state)
+                    if not grammar_choices:
+                        finish_reason = "stop"
+                        break
 
             matched_stop_length = _matched_stop_length(generated, stop_sequences)
             if matched_stop_length:

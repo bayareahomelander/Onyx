@@ -5,24 +5,25 @@ import time
 import torch
 
 from onyx_cuda.cache import CacheState, snapshot_cache
+from onyx_cuda.generation import _grammar_choices
 from onyx_cuda.masking import grammar_argmax
 from onyx_cuda.prefill import prefill
 
 
-def ambiguous_logits(logits, token_count, constraint=None, grammar_states=()):
+def ambiguous_logits(logits, token_count, choices=None):
     """Check the rounding scale of the two strongest eligible token scores.
 
+    choices lists the token IDs selectable at each position; None allows all.
     This is a numerical guard, not a proof of an error bound through every
     transformer layer. Exact output comparison remains a required release gate.
     """
     if logits.dtype not in (torch.float16, torch.bfloat16):
         return False
-    if constraint is None:
+    if choices is None:
         values = logits[0, :token_count].topk(2).values.float()
         tolerance = torch.finfo(logits.dtype).eps * values.abs().amax(-1).clamp_min(1)
         return bool(torch.any(values[:, 0] - values[:, 1] <= tolerance).item())
-    for position, state in enumerate(grammar_states[:token_count]):
-        valid = constraint.get_valid_token_ids(state)
+    for position, valid in enumerate(choices[:token_count]):
         if len(valid) < 2:
             continue
         eligible = logits[0, position].index_select(
@@ -42,12 +43,14 @@ class GreedyCheckpoint:
     Its grammar handles share the generation loop's final cleanup registry.
     """
 
-    def __init__(self, model, prompt_ids, constraint, live_states, backend, *, measure=False):
+    def __init__(self, model, prompt_ids, constraint, live_states, backend, *,
+                 eos_token_ids=(), measure=False):
         self.model = model
         self.prompt_ids = prompt_ids
         self.constraint = constraint
         self.live_states = live_states
         self.backend = backend
+        self.eos_token_ids = eos_token_ids
         self.cache = None
         self.logits = None
         self.state = None
@@ -113,11 +116,12 @@ class GreedyCheckpoint:
     def _select(self):
         if self.constraint is None:
             return self.logits.argmax(-1).item()
-        return grammar_argmax(self.logits, self.constraint.get_valid_token_ids(self.state),
-                              backend=self.backend).item()
+        choices = _grammar_choices(self.constraint, self.state, self.eos_token_ids)
+        return grammar_argmax(self.logits, choices, backend=self.backend).item()
 
     def _advance_state(self, token):
-        if self.constraint is not None:
+        # EOS ends generation and has no grammar bytes to consume.
+        if self.constraint is not None and token not in self.eos_token_ids:
             previous = self.state
             self.state = self.constraint.advance_state(previous, token)
             self.live_states.add(self.state)
@@ -179,6 +183,9 @@ class GreedyCheckpoint:
                 for i in range(batch.shape[1]):
                     row = self.cache.extend(self.model, batch[:, i:i + 1])
                     rows.append(row)
+                    # The verifier accepts at most through EOS; later logits are unused.
+                    if batch[0, i].item() in self.eos_token_ids:
+                        break
                     if self.constraint is not None:
                         next_state = self.constraint.advance_state(state, batch[0, i].item())
                         self.live_states.add(next_state)
@@ -186,12 +193,12 @@ class GreedyCheckpoint:
                             self.constraint.release_states([owned_state])
                             self.live_states.remove(owned_state)
                         state = owned_state = next_state
-                        # The existing verifier stops when a proposed token
-                        # completes the grammar; no following logits are used.
-                        if self.constraint.is_match_state(state):
+                        # The verifier stops when a proposed token completes a
+                        # match that cannot grow; no following logits are used.
+                        choices = _grammar_choices(self.constraint, state, self.eos_token_ids)
+                        if not choices:
                             break
-                        token = grammar_argmax(row[:, -1, :],
-                            self.constraint.get_valid_token_ids(state), backend=self.backend).item()
+                        token = grammar_argmax(row[:, -1, :], choices, backend=self.backend).item()
                     else:
                         token = row[:, -1, :].argmax(-1).item()
                     if i + 1 < batch.shape[1] and token != batch[0, i + 1].item():

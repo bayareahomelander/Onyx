@@ -88,10 +88,10 @@ def test_rounding_guard_checks_only_relevant_eligible_tokens():
     logits = torch.tensor([[[1, 0, -5], [1, 1, -5]]], dtype=torch.float16)
     assert not ambiguous_logits(logits, 1)
     assert ambiguous_logits(logits, 2)
-    constraint = SimpleNamespace(get_valid_token_ids=lambda state: [0, 2])
-    assert not ambiguous_logits(logits, 2, constraint, [0, 1])
-    constraint.get_valid_token_ids = lambda state: [1]
-    assert not ambiguous_logits(logits, 2, constraint, [0, 1])
+    assert not ambiguous_logits(logits, 2, [[0, 2], [0, 2]])
+    assert not ambiguous_logits(logits, 2, [[1], [1]])
+    # A permitted EOS near-tied with the grammar's best token is ambiguous.
+    assert ambiguous_logits(logits, 2, [[0, 2], [0, 1]])
 
 
 @pytest.mark.parametrize("adaptive", [False, True])

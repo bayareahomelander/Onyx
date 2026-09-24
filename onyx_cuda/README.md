@@ -62,9 +62,12 @@ Invoke-RestMethod -Uri http://127.0.0.1:8000/v1/chat/completions -Method Post -C
 
 Use `json_schema` for JSON constraints and `stream: true` for SSE. The API allows
 up to 4096 output tokens within an 8192-token prompt-plus-output budget by default.
-Partial output has `finish_reason: "length"` and may not satisfy the constraint.
-Custom `stop` strings cannot be combined with regex or JSON Schema constraints;
-the constraint determines completion. These combinations return HTTP 422.
+Constrained output ends with `finish_reason: "stop"` once it fully matches and
+either cannot be extended or the model chooses to end it, so open-ended patterns
+such as `[0-9]+` are not cut off at their first match. Partial output has
+`finish_reason: "length"` and may not satisfy the constraint. Custom `stop`
+strings cannot be combined with regex or JSON Schema constraints; these
+combinations return HTTP 422.
 
 For live SSE output, set `stream = $true` before converting the body to JSON:
 

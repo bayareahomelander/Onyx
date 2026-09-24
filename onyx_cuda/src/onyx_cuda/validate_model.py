@@ -45,13 +45,15 @@ def require(condition, message):
 
 
 def validate_output(payload, text, finish_reason):
+    # The model may end a complete match with EOS; only the budget leaves it partial.
+    complete = finish_reason in ("stop", "eos")
     if "regex" in payload:
-        require(finish_reason == "stop" and re.fullmatch(payload["regex"], text) is not None,
+        require(complete and re.fullmatch(payload["regex"], text) is not None,
                 "Regex output was incomplete or did not match")
     if "json_schema" in payload:
         from onyx_cuda import _rust
 
-        require(finish_reason == "stop", "JSON output was incomplete")
+        require(complete, "JSON output was incomplete")
         _rust.validate_json_output(json.dumps(payload["json_schema"]), text)
     require(finish_reason in ("stop", "eos", "length"), "Unknown finish reason")
 
