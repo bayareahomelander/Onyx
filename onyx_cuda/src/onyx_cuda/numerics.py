@@ -147,7 +147,8 @@ class GreedyCheckpoint:
                 token = generated[consumed]
                 if self._select() != token:
                     raise RuntimeError("Greedy numerical replay found a noncanonical emitted prefix")
-                width = min(3, len(generated) - 1 - consumed)
+                remaining = len(generated) - 1 - consumed
+                width = 8 if remaining >= 8 else min(3, remaining)
                 if self.constraint is None and self.replay_backend is not None and width > 1:
                     # Commit only a checked chunk. A numerical mismatch leaves
                     # the clean checkpoint intact for the original scalar path.

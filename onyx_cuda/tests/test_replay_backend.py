@@ -73,6 +73,137 @@ def test_bad_prefix_still_raises_after_chunk_fallback():
     assert checkpoint.cache.past_key_values.tokens == [8, 5]
 
 
+@pytest.mark.parametrize("history, widths", [
+    (0, []), (1, []), (2, [2]), (3, [3]), (4, [3]), (5, [3, 2]),
+    (6, [3, 3]), (7, [3, 3]), (8, [8]), (9, [8]), (10, [8, 2]),
+    (11, [8, 3]), (12, [8, 3]), (13, [8, 3, 2]), (14, [8, 3, 3]),
+    (15, [8, 3, 3]), (16, [8, 8]), (24, [8, 8, 8]),
+])
+def test_history_blocks_preserve_cache_and_proposal_boundary(history, widths):
+    calls = []
+    def extend(cache, ids):
+        calls.append(ids.shape[1])
+        return cache.extend(None, ids)
+    model = SimpleNamespace(_onyx_replay_backend=SimpleNamespace(extend=extend))
+    checkpoint = GreedyCheckpoint(model, [8], None, set(), "torch")
+    cache = HistoryCache()
+    checkpoint.seed(cache, torch.nn.functional.one_hot(torch.tensor([5]), 9).float())
+    # The rejected suffix must never enter either the history or proposal cache.
+    output = checkpoint.replay(cache, torch.tensor([[5, 4, 4]]), [5] * (history + 1))
+    assert calls == widths
+    assert cache.past_key_values.tokens == [8] + [5] * (history + 1)
+    assert output.shape == (1, 1, 9)
+    assert checkpoint.history_tokens == history
+    assert checkpoint.chunked_history_tokens == sum(widths)
+    assert checkpoint.proposal_tokens == 1
+    assert checkpoint.skipped_proposal_tokens == 2
+    assert checkpoint.replayed_tokens == history + 1
+    assert checkpoint.graph_replay_fallbacks == 0
+
+
+@pytest.mark.parametrize("committed", [0, 8])
+@pytest.mark.parametrize("bad_row", [None, *range(8)])
+def test_wide_block_failure_discards_trial_and_preserves_committed_prefix(committed, bad_row):
+    calls = []
+    def extend(cache, ids):
+        calls.append((cache.length, ids.shape[1]))
+        logits = cache.extend(None, ids)
+        if cache.length == 1 + committed + 8:
+            # Even a backend returning None after tentative mutation cannot
+            # publish the trial. A mismatch in any row also rejects the block.
+            if bad_row is None:
+                return None
+            logits[:, bad_row, 4] = 2
+        return logits
+    model = SimpleNamespace(_onyx_replay_backend=SimpleNamespace(extend=extend))
+    checkpoint = GreedyCheckpoint(model, [8], None, set(), "torch")
+    cache = HistoryCache()
+    checkpoint.seed(cache, torch.nn.functional.one_hot(torch.tensor([5]), 9).float())
+    history = committed + 16
+    checkpoint.replay(cache, torch.tensor([[5]]), [5] * (history + 1))
+    assert calls == ([(1, 8), (9, 8)] if committed else [(1, 8)])
+    assert cache.past_key_values.tokens == [8] + [5] * (history + 1)
+    assert checkpoint.history_tokens == history
+    assert checkpoint.chunked_history_tokens == committed
+    assert checkpoint.graph_replay_fallbacks == 1
+    assert checkpoint.replay_backend is None
+
+
+@pytest.mark.parametrize("bad_index", range(18))
+def test_wide_history_rejects_corrupt_emitted_and_current_tokens(bad_index):
+    model = SimpleNamespace(_onyx_replay_backend=SimpleNamespace(
+        extend=lambda cache, ids: cache.extend(None, ids)))
+    checkpoint = GreedyCheckpoint(model, [8], None, set(), "torch")
+    cache = HistoryCache()
+    checkpoint.seed(cache, torch.nn.functional.one_hot(torch.tensor([5]), 9).float())
+    generated = [5] * 18
+    generated[bad_index] = 4
+    kind = "current token" if bad_index == 17 else "emitted prefix"
+    with pytest.raises(RuntimeError, match=f"noncanonical {kind}"):
+        checkpoint.replay(cache, torch.tensor([[generated[-1]]]), generated)
+    assert checkpoint.cache.past_key_values.tokens == [8] + [5] * bad_index
+    assert cache.past_key_values.tokens == [8]
+
+
+@pytest.mark.parametrize("constrained", [False, True])
+def test_scalar_and_constrained_history_never_use_graphs(constrained, monkeypatch):
+    from test_speculative import TrackingGrammar
+    class Grammar(TrackingGrammar):
+        def get_valid_token_ids(self, state):
+            return [4, 5]
+    grammar = Grammar({}, set()) if constrained else None
+    live = set()
+    def unexpected(*args):
+        pytest.fail("Constrained history used graph recovery")
+    model = SimpleNamespace(_onyx_replay_backend=SimpleNamespace(extend=unexpected)) if constrained else None
+    monkeypatch.setattr("onyx_cuda.numerics.grammar_argmax", lambda logits, valid, **kw: logits.argmax(-1))
+    checkpoint = GreedyCheckpoint(model, [8], grammar, live, "torch")
+    cache = HistoryCache()
+    checkpoint.seed(cache, torch.nn.functional.one_hot(torch.tensor([5]), 9).float())
+    output = checkpoint.replay(cache, torch.tensor([[5, 4]]), [5] * 18)
+    assert cache.past_key_values.tokens == [8] + [5] * 18
+    assert checkpoint.history_tokens == 17 and checkpoint.chunked_history_tokens == 0
+    assert checkpoint.proposal_tokens == 1 and checkpoint.skipped_proposal_tokens == 1
+    checkpoint.commit(cache, torch.tensor([[5, 4]]), 0, output)
+    if grammar:
+        assert grammar.states[checkpoint.state] == tuple([5] * 18)
+        grammar.release_states(list(live))
+        assert not grammar.active_states
+
+
+@pytest.mark.parametrize("width, length, supported", [
+    (1, 1, False), (2, 1, True), (3, 1, True), (4, 1, False),
+    (7, 1, False), (8, 1, True), (9, 1, False),
+    (8, 8184, True), (8, 8185, False), (3, 8189, True), (2, 8190, True),
+])
+def test_graph_support_checks_actual_width_and_context(width, length, supported):
+    from onyx_cuda.cache import CacheState
+    from onyx_cuda.replay_backend import GraphReplayBackend
+    from transformers.cache_utils import DynamicCache
+    kv = DynamicCache()
+    keys = torch.zeros(1, 1, length, 1)
+    kv.update(keys, keys.clone(), 0)
+    cache = CacheState.from_prefill(kv, torch.device("cpu"))
+    backend = GraphReplayBackend.__new__(GraphReplayBackend)
+    backend._model = lambda: SimpleNamespace(training=False)
+    backend.closed = False
+    backend.device = torch.device("cpu")
+    ids = torch.ones((1, width), dtype=torch.long)
+    assert backend.supports(cache, ids) is supported
+    assert not backend.supports(cache, ids.float())
+    assert not backend.supports(cache, ids.flatten())
+    assert not backend.supports(cache, ids.expand(2, -1))
+    backend.device = torch.device("cuda")
+    assert not backend.supports(cache, ids)
+    backend.device = torch.device("cpu")
+    cache.attention_mask[0, 0] = 0
+    assert not backend.supports(cache, ids)
+    cache.attention_mask[0, 0] = 1
+    backend.closed = True
+    assert not backend.supports(cache, ids)
+    assert cache.length == length and torch.equal(kv.layers[0].keys, keys)
+
+
 def test_setup_reuse_and_release(monkeypatch):
     import onyx_cuda.replay_backend as replay
     instances = []
@@ -91,6 +222,9 @@ def test_setup_reuse_and_release(monkeypatch):
     assert prepare_replay_backend(model, "scalar")["active"] == "scalar"
     assert instances[0].closed
     assert not hasattr(model, "_onyx_replay_backend")
+    assert prepare_replay_backend(model)["active"] == "graph"
+    assert len(instances) == 2 and not instances[-1].closed
+    close_replay_backend(model)
 
 
 def test_concurrent_setup_and_close_are_idempotent(monkeypatch):
@@ -122,7 +256,8 @@ def test_concurrent_setup_and_close_are_idempotent(monkeypatch):
     assert calls == ["build", "close"]
 
 
-def test_memory_failure_discards_partial_cache_and_releases_graphs(monkeypatch):
+@pytest.mark.parametrize("width", [2, 3, 8])
+def test_memory_failure_discards_partial_cache_and_releases_graphs(monkeypatch, width):
     from contextlib import nullcontext
     from threading import RLock
     from onyx_cuda.replay_backend import GraphReplayBackend
@@ -145,7 +280,7 @@ def test_memory_failure_discards_partial_cache_and_releases_graphs(monkeypatch):
     backend._graphs = {"allocated": object()}
     backend.supports = lambda cache, ids: not backend.closed
     cache = Cache()
-    assert backend.extend(cache, torch.tensor([[5, 5]])) is None
+    assert backend.extend(cache, torch.full((1, width), 5)) is None
     assert cache.past_key_values.tokens == [8]
     assert backend.closed and not backend._graphs and released == [True]
     assert "memory exhausted" in backend.fallback_reason
@@ -178,28 +313,38 @@ def test_graph_recovery_exact_concurrent_streams_and_cleanup(monkeypatch):
             seed = CacheState.from_prefill(initial.past_key_values, initial.logits.device)
             scalar = snapshot_cache(seed)
             token = initial.token_id.item()
-            inputs, rows = [], []
-            for _ in range(3):
+            inputs, rows, references = [], [], {}
+            for i in range(8):
                 inputs.append(token)
                 row = scalar.extend(pair.target.model, torch.tensor([[token]], device="cuda"))
                 rows.append(row)
                 token = row[:, -1].argmax(-1).item()
-            expected = torch.cat(rows, 1)
+                if i + 1 in (2, 3, 8):
+                    references[i + 1] = (snapshot_cache(scalar), torch.cat(rows, 1))
 
-        def run():
+        def run(width):
             stream = torch.cuda.Stream()
             with torch.cuda.stream(stream), torch.inference_mode():
                 cache = snapshot_cache(seed)
-                actual = backend.extend(cache, torch.tensor([inputs], device="cuda"))
+                actual = backend.extend(cache, torch.tensor([inputs[:width]], device="cuda"))
                 stream.synchronize()
+                reference, expected = references[width]
                 return (torch.equal(actual, expected) and
+                        torch.equal(cache.attention_mask, reference.attention_mask) and
+                        torch.equal(cache.cache_position, reference.cache_position) and
                         all(torch.equal(a.keys, b.keys) and torch.equal(a.values, b.values)
-                            for a, b in zip(cache.past_key_values.layers, scalar.past_key_values.layers)))
+                            for a, b in zip(cache.past_key_values.layers, reference.past_key_values.layers)))
 
         torch.cuda.synchronize()
         with ThreadPoolExecutor(max_workers=2) as executor:
-            assert all(executor.map(lambda _: run(), range(4)))
-        del initial, seed, scalar, expected, row, rows
+            assert all(executor.map(run, (8, 2, 3, 8)))
+        # A later graph replay must not overwrite a previous caller's logits.
+        with torch.inference_mode():
+            actual = backend.extend(snapshot_cache(seed), torch.tensor([inputs], device="cuda"))
+            saved = actual.clone()
+            backend.extend(snapshot_cache(seed), torch.tensor([[inputs[0]] * 8], device="cuda"))
+            assert torch.equal(actual, saved)
+        del initial, seed, scalar, references, row, rows, actual, saved
         for name in ("cache_long", "apology"):
             case = next(c for c in CORPUS if c["name"] == name)
             ids = format_prompt(pair.target.tokenizer, case["messages"], enable_thinking=False).token_ids
@@ -228,7 +373,7 @@ def test_graph_recovery_exact_concurrent_streams_and_cleanup(monkeypatch):
         length = cache.length
         with monkeypatch.context() as patch:
             patch.setattr(GraphReplayBackend, "__call__", exhaust_after_forward)
-            assert backend.extend(cache, initial.token_id.reshape(1, 1).expand(1, 2)) is None
+            assert backend.extend(cache, initial.token_id.reshape(1, 1).expand(1, 8)) is None
         assert cache.length == length
         assert all(layer.keys.shape[-2] == length for layer in cache.past_key_values.layers)
         assert backend.closed and not backend._graphs
@@ -241,7 +386,7 @@ def test_graph_recovery_exact_concurrent_streams_and_cleanup(monkeypatch):
     original_build = GraphReplayBackend._build
     attempts = []
     def fail_during_setup(self, module, width):
-        if attempts:
+        if width == 8:
             raise RuntimeError("injected graph setup failure")
         attempts.append(True)
         original_build(self, module, width)

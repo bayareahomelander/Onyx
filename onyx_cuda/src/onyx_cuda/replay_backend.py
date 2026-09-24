@@ -20,6 +20,7 @@ from onyx_cuda.cache import CacheState, snapshot_cache
 from onyx_cuda.revisions import MODEL_REVISIONS
 
 _lifecycle_lock = threading.RLock()
+_REPLAY_WIDTHS = (2, 3, 8)
 
 
 def resolve_replay_backend(value=None):
@@ -50,10 +51,9 @@ def _unsupported_reason(model):
     return None
 
 
-def _tiled_linear(inputs, weight):
+def _tiled_linear(inputs, weight, output):
     width, _ = inputs.shape
     size = weight.shape[0]
-    output = torch.empty((width, size), device=inputs.device, dtype=inputs.dtype)
     for start in range(0, size, 256):
         end = min(start + 256, size)
         torch.bmm(inputs[:, None, :], weight[start:end].T[None].expand(width, -1, -1),
@@ -75,7 +75,7 @@ class GraphReplayBackend:
             with torch.cuda.device(self.device), torch.inference_mode():
                 for module in model.modules():
                     if type(module) is torch.nn.Linear:
-                        for width in (2, 3):
+                        for width in _REPLAY_WIDTHS:
                             self._build(module, width)
                 torch.cuda.synchronize(self.device)
         except BaseException:
@@ -85,16 +85,20 @@ class GraphReplayBackend:
 
     def _build(self, module, width):
         inputs = torch.zeros((width, module.weight.shape[1]), device=self.device, dtype=torch.float16)
+        # Allocate persistent outputs before capture to avoid a private memory
+        # pool allocation for every linear/width graph. The model owns both
+        # buffers; extend serializes their use and _linear clones each result.
+        output = torch.empty((width, module.weight.shape[0]), device=self.device, dtype=torch.float16)
         stream = torch.cuda.Stream(device=self.device)
         stream.wait_stream(torch.cuda.current_stream(self.device))
         with torch.cuda.stream(stream):
             for _ in range(3):
-                output = _tiled_linear(inputs, module.weight)
+                _tiled_linear(inputs, module.weight, output)
         torch.cuda.current_stream(self.device).wait_stream(stream)
         torch.cuda.synchronize(self.device)
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
-            output = _tiled_linear(inputs, module.weight)
+            _tiled_linear(inputs, module.weight, output)
         self._graphs[id(module), width] = inputs, output, graph
 
     def _linear(self, module, inputs):
@@ -115,7 +119,7 @@ class GraphReplayBackend:
                 and type(cache) is CacheState and type(cache.past_key_values) is DynamicCache
                 and not cache.past_key_values.offloading
                 and all(type(layer) is DynamicLayer for layer in cache.past_key_values.layers)
-                and ids.ndim == 2 and ids.shape[0] == 1 and ids.shape[1] in (2, 3)
+                and ids.ndim == 2 and ids.shape[0] == 1 and ids.shape[1] in _REPLAY_WIDTHS
                 and ids.device == self.device and ids.dtype == torch.long
                 and cache.length + ids.shape[1] <= 8192
                 and cache.attention_mask.shape == (1, cache.length)

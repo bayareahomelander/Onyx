@@ -1,4 +1,6 @@
 *.pdb
+*.pyd
+.benchmarks/
 benchmarks/results/
 validation/
 V1_PLAN.md
