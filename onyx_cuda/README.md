@@ -95,8 +95,8 @@ Draft graphs replay each draft token as one CUDA graph over the draft's own
 weights. The target still verifies every proposed token, so they change speed,
 not output. Set `ONYX_DRAFT_BACKEND=eager` to use the ordinary draft forward.
 Opt-in graph recovery processes unconstrained emitted history in eight-token
-blocks, with two/three-token blocks and scalar steps for remainders. The
-[configuration guide](docs/configuration.md) describes both backends.
+blocks, with two/three-token blocks and scalar steps for remainders; set
+`ONYX_REPLAY_BACKEND=graph` to enable it.
 
 ## Measured performance
 
@@ -139,7 +139,7 @@ Every mode uses the configured draft backend, draft graphs by default. Every
 speculative output must match target-only generation token for token. The report
 records which modes ran and why a graph backend was unavailable. The September 25
 figures come from an equivalent validation run that also timed the ordinary draft
-forward side by side; see [benchmarks](docs/benchmarks.md).
+forward side by side.
 
 ### Speedup by workload
 
