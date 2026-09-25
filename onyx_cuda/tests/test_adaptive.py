@@ -126,6 +126,7 @@ def test_small_timing_noise_does_not_toggle_modes():
 
 def test_catchup_consumes_only_missing_accepted_prefix_in_bounded_chunks():
     class Cache:
+        device = torch.device("cpu")
         length = 5
         attention_mask = torch.ones((1, 5))
         inputs = []
@@ -164,6 +165,7 @@ def test_mode_transitions_preserve_target_tokens_and_cache(monkeypatch, stop, bu
     grammars = []
 
     class Cache:
+        device = torch.device("cpu")
         def __init__(self, history):
             self.history = list(history)
             self.attention_mask = torch.ones((1, len(history)), dtype=torch.long)

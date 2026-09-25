@@ -107,6 +107,7 @@ def test_replay_uses_clean_prefix_and_releases_grammar(monkeypatch, adaptive, co
     grammars = []
 
     class Cache:
+        device = torch.device("cpu")
         def __init__(self, kv):
             self.past_key_values = kv
             self.attention_mask = torch.ones((1, len(kv.history)), dtype=torch.long)

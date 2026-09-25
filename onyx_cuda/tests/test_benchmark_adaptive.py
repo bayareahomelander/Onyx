@@ -110,6 +110,7 @@ def test_one_run_interleaves_every_mode_and_attaches_graphs_only_to_graph_modes(
     assert len(benchmark.calls) == 2 * len(modes) * 3  # Two cases; one warmup and two measured runs.
     assert list(report["settings"]["modes"]) == list(report["cases"][0]["median_seconds"])
     assert report["settings"]["replay_backend"]["active"] == ("graph" if graph else "scalar")
+    assert report["settings"]["draft_backend"]["requested"] == "graph"
     assert report["complete"] and report["correctness_passed"]
     assert benchmark.closes == 1 and not hasattr(benchmark.model, "_onyx_replay_backend")
 

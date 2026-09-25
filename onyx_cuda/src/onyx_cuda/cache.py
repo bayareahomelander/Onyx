@@ -44,6 +44,10 @@ class CacheState:
     def length(self) -> int:
         return self.past_key_values.get_seq_length()
 
+    @property
+    def device(self) -> torch.device:
+        return self.attention_mask.device
+
     def extend(
         self, model: PreTrainedModel, input_ids: torch.Tensor
     ) -> torch.Tensor:

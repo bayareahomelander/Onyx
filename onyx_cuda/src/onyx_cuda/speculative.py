@@ -159,7 +159,7 @@ def propose_tokens(
     proposed: list[int] = []
     input_ids = torch.tensor(
         [[generated_token_ids[-1]]],
-        device=draft_cache.attention_mask.device,
+        device=draft_cache.device,
     )
     draft_grammar_state = grammar_state
     choices = grammar_choices
@@ -308,7 +308,7 @@ def _verify_proposal(
                 draft_model,
                 torch.tensor(
                     [[draft_token_id]],
-                    device=draft_cache.attention_mask.device,
+                    device=draft_cache.device,
                 ),
             )
 
@@ -345,6 +345,17 @@ def verify_proposal(
     )[0]
 
 
+def _start_draft_cache(draft_model, prompt_token_ids, max_tokens):
+    """Prefill the draft; use its graph backend's static cache when available."""
+    draft_prefill = prefill(draft_model, prompt_token_ids)
+    backend = getattr(draft_model, "_onyx_draft_backend", None)
+    cache = (backend.start(draft_prefill.past_key_values, len(prompt_token_ids) + max_tokens)
+             if backend is not None else None)
+    if cache is None:
+        cache = CacheState.from_prefill(draft_prefill.past_key_values, draft_prefill.logits.device)
+    return cache
+
+
 def _catch_up_draft(draft_model, draft_cache, prompt_token_ids, generated) -> None:
     """Consume accepted history, leaving the current token for the next proposal.
 
@@ -359,7 +370,7 @@ def _catch_up_draft(draft_model, draft_cache, prompt_token_ids, generated) -> No
         for start in range(offset, end, 32):
             draft_cache.extend(draft_model, torch.tensor(
                 [generated[start:min(start + 32, end)]],
-                device=draft_cache.attention_mask.device,
+                device=draft_cache.device,
             ))
 
 
@@ -453,11 +464,7 @@ def generate_speculative_events(
     try:
         draft_cache = None
         if not adaptive:
-            draft_prefill = prefill(draft_model, prompt_token_ids)
-            draft_cache = CacheState.from_prefill(
-                draft_prefill.past_key_values, draft_prefill.logits.device
-            )
-            del draft_prefill
+            draft_cache = _start_draft_cache(draft_model, prompt_token_ids, max_tokens)
         target_prefill = prefill(target_model, prompt_token_ids)
         target_cache = CacheState.from_prefill(
             target_prefill.past_key_values, target_prefill.logits.device
@@ -544,11 +551,7 @@ def generate_speculative_events(
                 # boundary here also excludes time suspended at a stream yield.
                 iteration_started = time.perf_counter()
                 if active_gamma and draft_cache is None:
-                    draft_prefill = prefill(draft_model, prompt_token_ids)
-                    draft_cache = CacheState.from_prefill(
-                        draft_prefill.past_key_values, draft_prefill.logits.device
-                    )
-                    del draft_prefill
+                    draft_cache = _start_draft_cache(draft_model, prompt_token_ids, max_tokens)
                     _synchronize_device(runtime_device)
                     draft_setup_seconds += time.perf_counter() - iteration_started
                     iteration_started = time.perf_counter()
@@ -695,6 +698,10 @@ def generate_speculative_events(
             _validate_json_result(json_schema, token_byte_vocabulary, generated)
         past_key_values = target_cache.past_key_values
     finally:
+        # A graph draft cache is shared model state; free it for the next generation.
+        release = getattr(draft_cache, "release", None)
+        if release is not None:
+            release()
         if constraint is not None and live_grammar_states:
             constraint.release_states(list(live_grammar_states))
 

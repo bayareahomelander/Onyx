@@ -30,6 +30,7 @@ from onyx_cuda.vocabulary import (
 
 
 class ScriptedCache:
+    device = torch.device("cpu")
     def __init__(self, token_ids):
         self.token_ids = iter(token_ids)
         self.inputs = []

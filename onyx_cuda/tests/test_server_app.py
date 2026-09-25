@@ -37,6 +37,37 @@ def test_replay_backend_startup_status_and_shutdown(monkeypatch):
     assert calls == [("prepare", "graph"), ("close",)]
 
 
+@pytest.mark.parametrize("gamma, setting, active", [
+    (2, None, "graph"), (2, "eager", "eager"), (0, None, "eager")])
+def test_draft_backend_startup_status_and_shutdown(monkeypatch, gamma, setting, active):
+    import onyx_cuda.draft_backend as draft
+    model = SimpleNamespace()
+    engine = SimpleNamespace(target=SimpleNamespace(model=None), draft=SimpleNamespace(model=model))
+    calls = []
+    def prepare(target, mode, *, capacity):
+        assert target is model
+        calls.append(("prepare", mode, capacity))
+        if mode == "graph":
+            model._onyx_draft_backend = SimpleNamespace(closed=False)
+        return {"requested": mode, "active": mode, "setup_seconds": 2.0}
+    def close(target):
+        calls.append(("close", target is model))
+    monkeypatch.setattr(draft, "prepare_draft_backend", prepare)
+    monkeypatch.setattr(draft, "close_draft_backend", close)
+    if setting is not None:
+        monkeypatch.setenv("ONYX_DRAFT_BACKEND", setting)
+    with TestClient(create_app(engine=engine, gamma=gamma)) as client:
+        status = client.get("/").json()["draft_backend"]
+        assert status["active"] == active
+        if gamma == 0:
+            assert status == {"requested": "graph", "active": "eager", "setup_seconds": 2.0,
+                              "reason": "speculation is disabled"}
+        if active == "graph":
+            model._onyx_draft_backend.closed = True
+            assert client.get("/").json()["draft_backend"]["active"] == "eager"
+    assert calls == [("prepare", active, 8192), ("close", True)]
+
+
 def test_replay_setup_failure_releases_loaded_engine(monkeypatch):
     import onyx_cuda.replay_backend as replay
     references = []

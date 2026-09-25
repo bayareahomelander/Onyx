@@ -3,6 +3,7 @@
 Every mode runs in one interleaved comparison. On a target that supports graph
 recovery, graphs are prepared once and stay resident for all modes, but only
 graph modes use them; model loading and graph setup are excluded from timings.
+Draft graphs follow the service default (ONYX_DRAFT_BACKEND) for every mode.
 """
 
 import argparse
@@ -20,6 +21,7 @@ import transformers
 
 from onyx_cuda.benchmark_corpus import CORPUS
 from onyx_cuda.config import resolve_model_selection
+from onyx_cuda.draft_backend import close_draft_backend, prepare_draft_backend, resolve_draft_backend
 from onyx_cuda.generation import AcceptedTokenEvent
 from onyx_cuda.model import load_model_pair
 from onyx_cuda.prompt import format_prompt
@@ -105,6 +107,7 @@ def run(output, *, repetitions=10, split="all", measure=False):
     target_model = pair.target.model
     replay_configuration = prepare_replay_backend(target_model, "graph")
     graphs = getattr(target_model, "_onyx_replay_backend", None)
+    draft_configuration = prepare_draft_backend(pair.draft.model, resolve_draft_backend())
     modes = select_modes(replay_configuration)
     vocabulary = get_token_byte_vocabulary(pair.target.tokenizer, pair.target.model.config.vocab_size)
     report = {"corpus_sha256": hashlib.sha256(corpus_bytes).hexdigest(), "corpus_version": 1,
@@ -113,7 +116,8 @@ def run(output, *, repetitions=10, split="all", measure=False):
                            "greedy_backend": "torch", "dtype": "float16", "gates": GATES,
                            "modes": {mode: dict(zip(("gamma", "adaptive", "graph_recovery"), MODES[mode]))
                                      for mode in modes},
-                           "replay_backend": replay_configuration},
+                           "replay_backend": replay_configuration,
+                           "draft_backend": draft_configuration},
               "models": {role: {"id": getattr(pair, role).model_id, "revision": getattr(pair, role).revision}
                          for role in ("draft", "target")},
               "environment": {"python": platform.python_version(), "torch": str(torch.__version__),
@@ -211,6 +215,7 @@ def run(output, *, repetitions=10, split="all", measure=False):
     finally:
         use_replay_backend(target_model, graphs)
         close_replay_backend(target_model)
+        close_draft_backend(pair.draft.model)
         save()
     return report
 
