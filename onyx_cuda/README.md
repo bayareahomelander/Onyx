@@ -98,6 +98,30 @@ Opt-in graph recovery processes unconstrained emitted history in eight-token
 blocks, with two/three-token blocks and scalar steps for remainders; set
 `ONYX_REPLAY_BACKEND=graph` to enable it.
 
+## Settings
+
+Set environment variables in the server's terminal before startup:
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `ONYX_TARGET_MODEL`, `ONYX_DRAFT_MODEL` | `Qwen/Qwen3-8B`, `Qwen/Qwen2.5-0.5B-Instruct` | Hugging Face model IDs |
+| `ONYX_TARGET_REVISION`, `ONYX_DRAFT_REVISION` | Pinned revisions | Commit hashes for custom models |
+| `ONYX_SPECULATIVE_GAMMA` | `2` | Draft tokens per step; `0` selects target-only generation |
+| `ONYX_SPECULATIVE_MODE` | `fixed` | `adaptive` opts into the experimental adaptive controller |
+| `ONYX_DRAFT_BACKEND` | `graph` | `eager` uses the ordinary draft forward |
+| `ONYX_REPLAY_BACKEND` | `scalar` | `graph` opts into graph recovery, validated on CUDA capability 7.5 |
+| `ONYX_GREEDY_BACKEND` | `torch` | `cuda` uses the optional custom selector (install `.[kernels]`; needs CUDA Toolkit 12.4) |
+| `ONYX_MAX_CONTEXT_TOKENS` | `8192` | Prompt plus requested output tokens |
+| `ONYX_MAX_OUTPUT_TOKENS` | `4096` | Maximum requested output; omitted budgets use the smaller of 1024 and this limit |
+| `ONYX_MAX_ACTIVE_REQUESTS` | `8` | Running or queued completions; excess requests receive HTTP 429 |
+| `ONYX_STREAM_BUFFER_CHUNKS` | `64` | Buffered SSE chunks before the producer waits for the reader |
+
+Limits must be positive integers, and the output limit must leave room for a
+prompt. The root endpoint (`GET /`) reports the active limits, models, and
+backends. Validate custom models or larger limits on the target GPU first with
+`python -m pytest --require-cuda` and
+`python -m onyx_cuda.validate_model --output validation/runtime.json`.
+
 ## Measured performance
 
 On a Linux RTX 2080 Ti reporting 22 GiB, the September 25, 2026 comparison covered
