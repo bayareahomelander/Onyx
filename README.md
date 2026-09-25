@@ -37,10 +37,12 @@ For NVIDIA CUDA setup, model selection, and benchmarks, see the
 [Onyx CUDA README](onyx_cuda/README.md).
 
 The CUDA implementation defaults to fixed gamma 2 with a Qwen3-8B FP16 target
-and Qwen2.5-0.5B draft on a 22 GiB GPU. On the validated RTX 2080 Ti, optional
-graph recovery achieved **1.168x aggregate target-only speed** across 48 cases,
-with exact outputs and 28.2 seconds of additional startup. It remains opt-in;
-see [CUDA performance and limitations](onyx_cuda/README.md#measured-performance).
+and Qwen2.5-0.5B draft on a 22 GiB GPU, decoding draft tokens with CUDA graphs.
+On the validated RTX 2080 Ti, the default achieved **1.292x aggregate
+target-only speed** across 48 cases and opt-in graph recovery **1.398x**, with
+outputs identical to target-only generation. Draft graphs add about 2 seconds of
+startup and graph recovery about 45 seconds; see
+[CUDA performance and limitations](onyx_cuda/README.md#measured-performance).
 
 ## Example
 
