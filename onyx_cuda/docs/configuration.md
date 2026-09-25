@@ -22,6 +22,7 @@ Set overrides in the server's terminal **before startup**:
 | `ONYX_TARGET_REVISION`, `ONYX_DRAFT_REVISION` | Bundled models use pinned revisions; use commit hashes for custom selections |
 | `ONYX_SPECULATIVE_GAMMA` | `2` draft tokens per iteration; `0` explicitly selects target-only generation |
 | `ONYX_REPLAY_BACKEND` | `scalar` by default; `graph` opts into model-owned CUDA graphs for historical recovery on the supported target |
+| `ONYX_DRAFT_BACKEND` | `graph` by default: CUDA-graph draft decoding on the supported draft; `eager` uses the ordinary draft forward |
 
 The target tokenizer defines chat prompts, grammar bytes, decoding, and EOS for
 both models. Compatible drafts may omit target-added tokens in unused embedding
@@ -57,6 +58,52 @@ model's thinking template. Thinking consumes the same output/context budget.
 The default `torch` selector needs neither CuPy nor a CUDA Toolkit installation.
 The optional custom selector requires CUDA Toolkit 12.4 with NVRTC/headers
 and CuPy. Install `.[kernels]` and set `ONYX_GREEDY_BACKEND=cuda` to opt in.
+
+## Draft graph decoding
+
+By default, startup prepares CUDA graphs for the draft model. Each single-token
+draft step replays one graph that reads the draft's own weights with fewer GPU
+kernels than the ordinary forward, a static KV cache in 256-token chunks, and
+attention over only the chunks in use. Prompts are prefilled with the ordinary
+forward and copied into the static cache. On the validated RTX 2080 Ti this cut
+draft cost from about 7.5-9.8 ms to 4.1-4.4 ms per token.
+
+The target verifies every proposed token, so draft graphs change speed, not
+output. Their arithmetic differs slightly from the ordinary draft forward; in
+teacher-forced checks they chose the same top token 192 of 192 times. Exact
+corpus comparisons against target-only generation remain the release check.
+
+Draft graphs support the pinned Qwen2.5-0.5B-Instruct draft with FP16 weights on
+one CUDA device, full attention, default rotary embeddings, PyTorch 2.6.0, and
+Transformers 4.57.6. Other drafts keep the ordinary forward. Capacity follows
+`ONYX_MAX_CONTEXT_TOKENS`, rounded up to 256 tokens; the default 8192 prepares 32
+graphs in about 2 seconds and a static cache of about 96 MiB. No weights are
+copied. Weights and model configuration must remain unchanged while prepared.
+
+One generation owns the static cache at a time and releases it when it finishes
+or its stream closes. A generation that cannot own it, or whose prompt plus
+requested output exceeds capacity, uses the ordinary draft cache. Set
+`ONYX_DRAFT_BACKEND=eager` or pass `create_app(draft_backend="eager")` to disable
+draft graphs. The root endpoint reports the requested and active draft backend,
+its capacity and setup time, and the reason for any fallback. Draft graphs were
+validated on Linux; they have not yet been validated on a Windows GPU.
+
+For programmatic use, prepare the loaded draft explicitly and release its graphs
+when finished:
+
+```python
+from onyx_cuda.model import load_model_pair
+from onyx_cuda.draft_backend import prepare_draft_backend, close_draft_backend
+
+pair = load_model_pair()
+configuration = prepare_draft_backend(pair.draft.model, "graph", capacity=8192)
+try:
+    # generate_speculative / generate_speculative_events calls using this draft
+    # automatically use the prepared graphs when eligible.
+    ...
+finally:
+    close_draft_backend(pair.draft.model)
+```
 
 ## Adaptive decoding (experimental)
 
@@ -115,7 +162,8 @@ scalar recovery. Explicit graph setup errors fail startup after releasing partia
 graph state. The default remains `scalar`; no graphs are built during a request.
 
 Graph recovery consumes already-known **unconstrained historical tokens** in
-blocks of two or three. Ordinary speculative verification, its ambiguity guard,
+eight-token blocks, with two/three-token blocks and scalar steps for remainders.
+Ordinary speculative verification, its ambiguity guard,
 proposal recovery, and constrained requests keep their existing paths. Each
 block checks all next-token IDs. A mismatch discards the tentative cache and
 returns to scalar recovery for that generation; an invalid emitted prefix still

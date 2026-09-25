@@ -2,7 +2,59 @@
 
 [Setup](../README.md) · [Configuration](configuration.md) · [Validation](validation.md)
 
-## Latest full-suite comparison (September 17, 2026)
+## Latest comparison: draft graphs (September 25, 2026)
+
+On the Linux RTX 2080 Ti reporting 22,528 MiB VRAM, one interleaved run compared
+the ordinary draft forward with draft graphs, each with scalar and graph
+recovery, across all **48 corpus cases**. It used the pinned Qwen3-8B FP16 target
+and Qwen2.5-0.5B-Instruct draft, fixed gamma 2, non-thinking greedy generation,
+the Torch selector, one warmup and three measured runs per case and mode,
+rotating measured order, and synchronized full-generation wall time. All 960
+measured and warmup runs matched their case's target-only tokens and finish
+reason, and the draft graph cache was released after every generation.
+
+| Mode | Sum of per-case median latency | Speedup versus target-only |
+| --- | ---: | ---: |
+| Target-only | 92.75 s | 1.000x |
+| Fixed gamma 2, ordinary draft, scalar recovery | 82.11 s | 1.130x |
+| Fixed gamma 2, ordinary draft, graph recovery | 76.62 s | 1.211x |
+| Fixed gamma 2, draft graphs, scalar recovery (default) | 71.79 s | 1.292x |
+| Fixed gamma 2, draft graphs, graph recovery (opt-in) | **66.35 s** | **1.398x** |
+
+Draft graphs reduced total latency by 12.6% with scalar recovery and 13.4% with
+graph recovery, and no case was slower than with the ordinary draft. With draft
+graphs and graph recovery, code averaged 2.02x target-only speed, regex 1.79x,
+extraction 1.61x, JSON 1.58x, prose 1.20x, and short replies 1.06x. Nine cases
+remain slower than target-only: six very short requests by at most 23 ms, and
+the recovery-heavy `cache_long`, `count_then_explain`, and `comparison`.
+
+A preceding stage profile explained the gain. The ordinary draft forward launched
+about 1,350 GPU kernels per token and took about 7.6 ms per proposed token, over
+a fifth of a 35 ms target decode step, although the draft reads about 1 GB of
+weights per token. A draft graph step replays 712 kernels, about half as many,
+and took 4.1-4.4 ms per token. Verifying three target positions cost 39 ms,
+close to a single target decode step, leaving little launch overhead to remove there.
+
+Startup is excluded from these timings: draft graphs took **2.0 seconds** and
+graph recovery **44.8 seconds** to prepare. Peak benchmark memory was
+**17.29 GiB allocated**, compared with 17.32 GiB for the ordinary draft. With draft
+graphs enabled by default, the full CUDA suite passed **872 tests** with three
+Windows-specific skips, and all 51 GPU tests restored their starting allocation;
+the highest test peak was 18.69 GiB.
+
+## Eight-token graph recovery (September 22, 2026)
+
+Graph recovery replays unconstrained history in eight-token blocks, with
+two/three-token blocks and scalar steps for remainders. An independent
+ten-repetition comparison confirmed 1.92% lower fixed-mode latency and 2.56%
+lower adaptive-mode latency than the previous two/three-token backend. No case
+crossed the predeclared regression threshold of both 5% and 5 ms. Graph
+preparation took 45.3 seconds versus 32.1 seconds for the previous backend.
+Preallocating graph outputs reduced prepared reserved memory from 18.15 to
+17.22 GiB; allocated memory increased slightly, from 16.47 to 16.52 GiB. Separate
+checks matched full logits and KV caches bitwise through 8192 tokens.
+
+## Graph-recovery comparison (September 17, 2026)
 
 The graph-recovery implementation passed **578 Python tests**, with three
 Windows-specific tests skipped and no failures, on a Linux RTX 2080 Ti reporting
@@ -158,6 +210,8 @@ failed both performance gates. Adaptive remains opt-in: the broader performance
 objective is not yet met. Model weights, FP16 precision, and attention settings
 remain unchanged.
 
-The adaptive benchmark commands evaluate the controller; they do not prepare
-the optional graph backend. Programmatic graph comparisons must explicitly
-prepare it as shown in the [configuration guide](configuration.md#optional-graph-recovery).
+`benchmark_adaptive` prepares graph recovery and adds graph-recovery modes when
+the target supports them. Every mode uses the configured draft backend, draft
+graphs by default; set `ONYX_DRAFT_BACKEND=eager` to time the ordinary draft
+forward. Other programmatic comparisons must prepare either backend explicitly
+as shown in the [configuration guide](configuration.md).
