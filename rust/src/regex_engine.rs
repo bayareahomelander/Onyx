@@ -5,9 +5,12 @@
 //! finite automata for efficient vocabulary filtering during generation.
 
 use regex_automata::dfa::{dense, Automaton};
+use regex_automata::nfa::thompson;
 use regex_automata::util::primitives::StateID;
 use regex_automata::util::start::Config as StartConfig;
+use regex_automata::util::syntax;
 use regex_automata::Anchored;
+use regex_syntax::hir::{Hir, Look};
 use std::sync::Arc;
 
 use crate::constraint::{ConstraintEngine, ConstraintError};
@@ -43,6 +46,10 @@ pub fn compile_pattern_dfa(pattern: &str) -> Result<CompiledDfa, String> {
 /// such as `\w{1,200}` (about 31 MiB), stay below this bound.
 const REGEX_DFA_SIZE_LIMIT: usize = 64 << 20;
 
+fn compile_error(e: impl std::fmt::Display) -> ConstraintError {
+    ConstraintError::CompilationError(format!("Failed to compile regex: {}", e))
+}
+
 /// a regex constraint engine using DFA traversal
 ///
 /// this struct holds a compiled DFA and tracks the current state
@@ -58,8 +65,20 @@ pub struct RegexEngine {
 impl RegexEngine {
     /// create a new RegexEngine with the given vocabulary and pattern
     ///
-    /// compiles the regex pattern into a DFA and initializes the state
+    /// compiles the regex pattern into a DFA and initializes the state.
+    /// the pattern must match the whole output: without the end anchor, a
+    /// token that completes the match and then continues is not dead.
     pub fn new(vocabulary: Vec<Vec<u8>>, pattern: &str) -> Result<Self, ConstraintError> {
+        // anchor the parsed pattern rather than the text: splicing it into
+        // `\A(?:...)\z` accepts unbalanced input such as `a)|(b`, and a
+        // trailing `(?x)` comment would swallow the closing anchor.
+        let hir = syntax::parse(pattern).map_err(compile_error)?;
+        let hir = Hir::concat(vec![Hir::look(Look::Start), hir, Hir::look(Look::End)]);
+        let nfa = thompson::Compiler::new()
+            .configure(thompson::Config::new().which_captures(thompson::WhichCaptures::None))
+            .build_from_hir(&hir)
+            .map_err(compile_error)?;
+
         let dfa = dense::Builder::new()
             .configure(
                 dense::Config::new()
@@ -68,10 +87,8 @@ impl RegexEngine {
                     .dfa_size_limit(Some(REGEX_DFA_SIZE_LIMIT))
                     .determinize_size_limit(Some(REGEX_DFA_SIZE_LIMIT)),
             )
-            .build(pattern)
-            .map_err(|e| {
-                ConstraintError::CompilationError(format!("Failed to compile regex: {}", e))
-            })?;
+            .build_from_nfa(&nfa)
+            .map_err(compile_error)?;
 
         let start_config = StartConfig::new().anchored(Anchored::Yes);
         let initial_state = dfa.start_state(&start_config).map_err(|e| {
@@ -263,5 +280,41 @@ mod tests {
 
         assert!(engine.is_finished());
         assert!(!engine.is_dead());
+    }
+
+    #[test]
+    fn test_complete_match_rejects_trailing_bytes_in_same_token() {
+        let vocab = vec![
+            b"ABC-123".to_vec(),
+            b"5.".to_vec(),
+            b"5".to_vec(),
+            b".".to_vec(),
+        ];
+        let mut engine = RegexEngine::new(vocab, "[A-Z]{3}-[0-9]{4}").unwrap();
+
+        engine.advance(0).unwrap(); // "ABC-123"
+        assert_eq!(engine.get_valid_tokens(), vec![2]);
+
+        engine.advance(2).unwrap(); // "5"
+        assert!(engine.is_finished());
+        assert!(engine.get_valid_tokens().is_empty());
+    }
+
+    #[test]
+    fn test_unbalanced_pattern_is_rejected() {
+        // wrapped as text, `\A(?:a)|(b)\z` would compile with an unanchored end.
+        assert!(RegexEngine::new(make_test_vocab(), "a)|(b").is_err());
+        assert!(RegexEngine::new(make_test_vocab(), "a)(?:b").is_err());
+    }
+
+    #[test]
+    fn test_verbose_pattern_with_trailing_comment_is_anchored() {
+        let vocab = vec![b"a".to_vec(), b"b".to_vec(), b"bc".to_vec()];
+        let mut engine = RegexEngine::new(vocab, "(?x) a b  # letters").unwrap();
+
+        engine.advance(0).unwrap(); // "a"
+        assert_eq!(engine.get_valid_tokens(), vec![1]);
+        engine.advance(1).unwrap(); // "b"
+        assert!(engine.is_finished());
     }
 }
