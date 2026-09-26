@@ -1,3 +1,4 @@
+import asyncio
 import json
 import time
 import uuid
@@ -5,7 +6,9 @@ import os
 from typing import List, Optional, Dict, Any, Generator, Literal, Annotated
 from contextlib import asynccontextmanager, closing
 
+import anyio
 from fastapi import FastAPI, HTTPException
+from fastapi.concurrency import iterate_in_threadpool, run_in_threadpool
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, ConfigDict, model_validator
 
@@ -114,6 +117,10 @@ class ChatCompletionChunk(BaseModel):
 
 
 _engines: Dict[str, Any] = {}
+# An engine keeps its KV caches on itself, so one request must own it at a time.
+# Requests wait on the event loop: a waiter blocking a worker thread could starve
+# the owning stream of the threads it needs to produce its next chunk.
+_engine_locks: Dict[str, asyncio.Lock] = {}
 
 
 def get_engine(model: str = "onyx-speculative"):
@@ -122,10 +129,22 @@ def get_engine(model: str = "onyx-speculative"):
             status_code=400,
             detail=f"Unknown model '{model}'. Available: {list(_engines.keys())}",
         )
-    engine = _engines[model]
+    return _engines[model]
+
+
+def engine_lock(model: str) -> asyncio.Lock:
+    return _engine_locks.setdefault(model, asyncio.Lock())
+
+
+def ensure_loaded(engine) -> None:
+    # Called while owning the engine, so a lazy engine loads exactly once.
     if engine.draft_model is None:
         engine.load_models()
-    return engine
+
+
+def generate_loaded(request: ChatCompletionRequest, engine):
+    ensure_loaded(engine)
+    return engine.generate(**prepare_generation(request, engine))
 
 
 @asynccontextmanager
@@ -312,6 +331,7 @@ def create_streaming_response(request: ChatCompletionRequest, engine) -> Generat
         pending = ""
         stopped = False
         terminal = None
+        ensure_loaded(engine)
         with closing(engine.stream_generate(**prepare_generation(request, engine))) as events:
             for text, metrics in events:
                 if metrics is not None:
@@ -331,6 +351,20 @@ def create_streaming_response(request: ChatCompletionRequest, engine) -> Generat
         payload = {"error": {"message": str(error), "type": "server_error"}}
         yield f"data: {json.dumps(payload)}\n\n"
     yield "data: [DONE]\n\n"
+
+
+async def exclusive_stream(request: ChatCompletionRequest, engine):
+    """Own the engine for a whole stream; each generation step runs off the event loop."""
+    async with engine_lock(request.model):
+        chunks = create_streaming_response(request, engine)
+        try:
+            async for chunk in iterate_in_threadpool(chunks):
+                yield chunk
+        finally:
+            # A disconnect cancels this task. Close generation before the next
+            # request can own the engine, even while that cancellation is pending.
+            with anyio.CancelScope(shield=True):
+                await run_in_threadpool(chunks.close)
 
 
 @app.get("/")
@@ -371,11 +405,13 @@ async def create_chat_completion(request: ChatCompletionRequest):
     engine = get_engine(request.model)
     if request.stream:
         return StreamingResponse(
-            create_streaming_response(request, engine), media_type="text/event-stream",
+            exclusive_stream(request, engine), media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
     try:
-        output, metrics = engine.generate(**prepare_generation(request, engine))
+        async with engine_lock(request.model):
+            # Off the event loop, so other requests and streams keep being served.
+            output, metrics = await run_in_threadpool(generate_loaded, request, engine)
         text = truncate_at_stop(output, request.stop)
         reason = completion_reason(metrics, text != output)
         prompt_tokens = metrics.get("prompt_tokens", 0)

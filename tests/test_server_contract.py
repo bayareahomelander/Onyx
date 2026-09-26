@@ -1,8 +1,13 @@
+import asyncio
 import importlib
 import json
 import sys
+import threading
+import time
+from contextlib import asynccontextmanager, contextmanager
 from types import SimpleNamespace
 
+import anyio
 import pytest
 from fastapi.testclient import TestClient
 
@@ -125,3 +130,157 @@ def test_documentation_routes_and_compatibility_fields(api, monkeypatch):
     assert with_docs_off.get("/docs").status_code == 404
     assert with_docs_off.get("/openapi.json").status_code == 200
     with_docs_off.close()
+
+
+
+@contextmanager
+def serving(server):
+    """One event loop for every request, as under uvicorn, without loading models."""
+    @asynccontextmanager
+    async def no_model_loading(app):
+        yield
+
+    server.app.router.lifespan_context = no_model_loading
+    with TestClient(server.app) as client:
+        yield client
+
+
+def _post_concurrently(client, bodies):
+    threads = [threading.Thread(target=client.post, args=("/v1/chat/completions",),
+                                kwargs={"json": body}, daemon=True) for body in bodies]
+    for thread in threads:
+        thread.start()
+        time.sleep(0.02)
+    for thread in threads:
+        thread.join(10)
+    assert not any(thread.is_alive() for thread in threads), "requests did not finish"
+
+
+def _serialized_engine(engine, metrics, steps=4):
+    """Record whether two generations ever run inside the engine at once."""
+    active, overlaps, guard = [0], [], threading.Lock()
+
+    def step():
+        with guard:
+            active[0] += 1
+            overlaps.append(active[0] > 1)
+        time.sleep(0.05)  # model work on the engine's shared KV caches
+        with guard:
+            active[0] -= 1
+
+    def stream_generate(**kwargs):
+        for _ in range(steps):
+            step()
+            yield "x", None
+        yield "", dict(metrics)
+
+    def generate(**kwargs):
+        step()
+        return "x", dict(metrics)
+
+    engine.stream_generate, engine.generate = stream_generate, generate
+    return overlaps
+
+
+@pytest.mark.parametrize("streams", [(True, True), (True, False), (False, False)])
+def test_requests_never_share_an_engine(api, streams):
+    server, _, engine, _, _, metrics = api
+    overlaps = _serialized_engine(engine, metrics)
+    with serving(server) as client:
+        _post_concurrently(client, [payload(stream=stream) for stream in streams])
+    assert overlaps and not any(overlaps)
+
+
+def test_waiting_requests_do_not_starve_the_owning_stream(api):
+    server, _, engine, _, _, metrics = api
+    overlaps = _serialized_engine(engine, metrics)
+    with serving(server) as client:
+        # With one worker thread, a request blocking a thread while it waits for
+        # the engine would leave the owning stream no thread for its next chunk.
+        client.portal.call(lambda: setattr(
+            anyio.to_thread.current_default_thread_limiter(), "total_tokens", 1))
+        _post_concurrently(client, [payload(stream=True), payload(), payload()])
+    assert overlaps and not any(overlaps)
+
+
+def test_lazy_engine_loads_once_under_concurrent_requests(api):
+    server, _, engine, _, _, _ = api
+    loads = []
+
+    def load_models():
+        loads.append(True)
+        time.sleep(0.1)
+        engine.draft_model = object()
+
+    engine.draft_model, engine.load_models = None, load_models
+    with serving(server) as client:
+        _post_concurrently(client, [payload(), payload(stream=True)])
+    assert loads == [True]
+
+
+def test_generation_does_not_block_the_event_loop(api):
+    server, _, engine, _, _, metrics = api
+    started, release, order = threading.Event(), threading.Event(), []
+
+    def generate(**kwargs):
+        started.set()
+        release.wait(5)
+        order.append("generation")
+        return "x", dict(metrics)
+
+    engine.generate = generate
+    with serving(server) as client:
+        request = threading.Thread(target=client.post, args=("/v1/chat/completions",),
+                                   kwargs={"json": payload()})
+        request.start()
+        assert started.wait(5)
+        assert client.get("/").status_code == 200
+        order.append("root")
+        release.set()
+        request.join()
+    assert order == ["root", "generation"]
+
+
+@pytest.mark.parametrize("abandon", ["close", "disconnect"])
+def test_abandoned_stream_closes_generation_before_releasing_engine(api, abandon):
+    server, _, engine, _, closed, _ = api
+
+    def stream_generate(**kwargs):
+        try:
+            while True:
+                yield "x", None
+        finally:
+            closed.append(True)
+
+    engine.stream_generate = stream_generate
+    request = server.ChatCompletionRequest(**payload(stream=True))
+
+    async def scenario():
+        lock = server.engine_lock(request.model)
+        stream = server.exclusive_stream(request, engine)
+        if abandon == "close":
+            await stream.__anext__()  # role
+            await stream.__anext__()  # content: generation owns the engine
+            assert lock.locked()
+            await stream.aclose()
+        else:
+            # Starlette cancels the response through a task group on disconnect;
+            # that cancellation is redelivered at every await until the scope ends.
+            produced = anyio.Event()
+
+            async def respond():
+                sent = 0
+                async for _ in stream:
+                    sent += 1
+                    if sent == 2:  # role, then content: generation owns the engine
+                        produced.set()
+
+            async with anyio.create_task_group() as responses:
+                responses.start_soon(respond)
+                await produced.wait()
+                assert lock.locked()
+                responses.cancel_scope.cancel()
+        assert closed == [True]
+        assert not lock.locked()
+
+    asyncio.run(scenario())
