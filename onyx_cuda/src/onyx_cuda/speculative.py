@@ -55,11 +55,15 @@ def _flush_stream_text(pending: str, stop: list[str] | None) -> tuple[str, str, 
     if positions:
         return pending[: min(positions)], "", True
 
-    retain = max(len(sequence) for sequence in active_stops) - 1
-    if retain <= 0 or len(pending) > retain:
-        split = max(len(pending) - retain, 0)
-        return pending[:split], pending[split:], False
-    return "", pending, False
+    # Only a suffix matching a stop's prefix can become a stop in a later chunk.
+    retain = 0
+    for sequence in active_stops:
+        for length in range(min(len(pending), len(sequence) - 1), retain, -1):
+            if pending.endswith(sequence[:length]):
+                retain = length
+                break
+    split = len(pending) - retain
+    return pending[:split], pending[split:], False
 
 
 def _synchronize_device(device) -> None:

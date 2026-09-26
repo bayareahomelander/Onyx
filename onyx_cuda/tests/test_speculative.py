@@ -490,6 +490,68 @@ def test_text_events_match_collected_greedy_output(monkeypatch):
     assert result.finish_reason == "length"
 
 
+@pytest.mark.parametrize("pending,stops,expected", [
+    ("Hello", ["[END_OF_RESPONSE]"], ("Hello", "", False)),
+    ("Hello [EN", ["[END]"], ("Hello ", "[EN", False)),
+    ("Hello [EX", ["[END]"], ("Hello [EX", "", False)),
+    ("Hello [END] ignored", ["[END]"], ("Hello ", "", True)),
+    ("xabab", ["ababx", "abc"], ("x", "abab", False)),
+    ("xabab", ["abc", "ababx"], ("x", "abab", False)),
+    ("xEND STOP", ["STOP", "END"], ("x", "", True)),
+    ("café 終", ["終わり"], ("café ", "終", False)),
+    ("Hello", ["!"], ("Hello", "", False)),
+    ("", ["END"], ("", "", False)),
+    ("Hello", None, ("Hello", "", False)),
+    ("Hello", [""], ("Hello", "", False)),
+])
+def test_stream_text_flushes_every_safe_character(pending, stops, expected):
+    assert speculative_module._flush_stream_text(pending, stops) == expected
+
+
+def test_text_events_emit_safe_text_before_consuming_next_token():
+    consumed = []
+
+    def source():
+        for token in (1, 2):
+            consumed.append(token)
+            yield AcceptedTokenEvent(token)
+        yield GenerationFinishedEvent(GenerationResult([1, 2], None, "length"))
+
+    stream = decode_speculative_events(
+        source(), _MappedTokenizer({1: "Hello", 2: " world"}),
+        stop=["[END_OF_RESPONSE]"],
+    )
+    try:
+        assert next(stream) == TextDeltaEvent("Hello")
+        assert consumed == [1]
+        assert next(stream) == TextDeltaEvent(" world")
+        assert consumed == [1, 2]
+        assert next(stream).result.finish_reason == "length"
+        assert list(stream) == []
+    finally:
+        stream.close()
+
+
+@pytest.mark.parametrize("pieces,stops,text,reason", [
+    (["Hello [", "EN", "D] ignored"], ["[END]"], "Hello ", "stop"),
+    (["Hello [EN", "X", " world"], ["[END]"], "Hello [ENX world", "length"),
+    (["Hello ", "[EN"], ["[END]"], "Hello [EN", "length"),
+    (["xaba", "b", "x"], ["abc", "ababx"], "x", "stop"),
+    (["café 終", "わ", "り"], ["終わり"], "café ", "stop"),
+])
+def test_text_events_preserve_fragmented_stops_and_final_prefix(pieces, stops, text, reason):
+    ids = list(range(len(pieces)))
+    events = [AcceptedTokenEvent(token) for token in ids]
+    events.append(GenerationFinishedEvent(GenerationResult(ids, None, "length")))
+    decoded = list(decode_speculative_events(
+        events, _MappedTokenizer(dict(enumerate(pieces))), stop=stops,
+    ))
+    assert "".join(event.text for event in decoded if isinstance(event, TextDeltaEvent)) == text
+    assert isinstance(decoded[-1], GenerationFinishedEvent)
+    assert decoded[-1].result.finish_reason == reason
+    assert sum(isinstance(event, GenerationFinishedEvent) for event in decoded) == 1
+
+
 def test_text_events_decode_split_utf8_and_hide_fragmented_stop(monkeypatch):
     events, _, _ = _run_scripted_speculation(
         monkeypatch,
