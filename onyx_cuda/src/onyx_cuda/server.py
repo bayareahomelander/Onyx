@@ -2,6 +2,7 @@
 
 import asyncio
 import gc
+import hashlib
 import json
 import logging
 import os
@@ -364,6 +365,18 @@ def _validate_schema_number_precision(value: Any) -> None:
     elif isinstance(value, list):
         for child in value:
             _validate_schema_number_precision(child)
+
+
+def _choice_seed(seed: int, index: int) -> int:
+    """Keep choice 0 on the request seed; give each other choice its own stream.
+
+    Reusing one seed would make every sampled choice identical. Hashing, rather
+    than seed + index, keeps choice 1 of seed s distinct from choice 0 of s + 1.
+    """
+    if index == 0:
+        return seed
+    digest = hashlib.sha256(f"{seed}:{index}".encode()).digest()
+    return int.from_bytes(digest[:8], "little")
 
 
 def _generate(arguments: dict[str, Any]):
@@ -772,6 +785,8 @@ def create_app(
             last_timings = None
 
             for index in range(request.n):
+                if request.seed is not None:
+                    arguments["seed"] = _choice_seed(request.seed, index)
                 result = await _generate_off_event_loop(arguments, app.state.inference_executor)
                 completion_tokens += len(result.token_ids)
                 last_timings = result.timings

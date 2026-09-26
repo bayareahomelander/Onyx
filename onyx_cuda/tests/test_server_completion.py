@@ -191,6 +191,30 @@ def test_stop_length_and_multiple_choices_use_final_choice_metrics(monkeypatch):
     assert all(call["stop_sequences"] == [[40]] for call in calls)
 
 
+@pytest.mark.parametrize("seed", [42, -(2**63), 2**64 - 1, None])
+def test_sampled_choices_get_distinct_reproducible_seeds(monkeypatch, seed):
+    tokenizer = FakeTokenizer({(20,): "a", (21,): "b", (22,): "c"})
+    calls = _fake_generation(
+        monkeypatch, [_result([token], "length") for token in (20, 21, 22) * 2]
+    )
+    body = {"messages": [{"role": "user", "content": "Hi"}], "n": 3, "temperature": 0.8,
+            "seed": seed}
+    with TestClient(create_app(engine=_engine(tokenizer))) as client:
+        for _ in range(2):
+            assert client.post("/v1/chat/completions", json=body).status_code == 200
+
+    seeds = [call["seed"] for call in calls]
+    # A repeated request reproduces every choice.
+    assert seeds[:3] == seeds[3:]
+    if seed is None:
+        assert seeds == [None] * 6
+        return
+    # Choice 0 matches n=1; the same seed for every choice would repeat one sample.
+    assert seeds[0] == seed
+    assert len(set(seeds[:3])) == 3
+    assert all(-(2**63) <= value <= 2**64 - 1 for value in seeds)
+
+
 def test_regex_response_is_grammar_constrained(monkeypatch):
     tokenizer = FakeTokenizer({(30,): "CUDA Ready"})
     engine = _engine(tokenizer)
