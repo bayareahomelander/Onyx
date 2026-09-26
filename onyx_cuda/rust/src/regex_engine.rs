@@ -4,9 +4,12 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use regex_automata::dfa::{dense, Automaton};
+use regex_automata::nfa::thompson;
 use regex_automata::util::primitives::StateID;
 use regex_automata::util::start::Config as StartConfig;
+use regex_automata::util::syntax;
 use regex_automata::Anchored;
+use regex_syntax::hir::{Hir, Look};
 use regex_syntax::utf8::Utf8Sequences;
 
 use crate::constraint::{ConstraintEngine, ConstraintError};
@@ -31,6 +34,10 @@ fn dfa_config_with_limit(limit: usize) -> dense::Config {
         .match_kind(regex_automata::MatchKind::LeftmostFirst)
         .dfa_size_limit(Some(limit))
         .determinize_size_limit(Some(limit))
+}
+
+fn compile_error(error: impl std::fmt::Display) -> ConstraintError {
+    ConstraintError::CompilationError(format!("Failed to compile regex: {error}"))
 }
 
 pub fn compile_pattern_dfa(pattern: &str) -> Result<CompiledDfa, String> {
@@ -206,12 +213,19 @@ pub struct RegexEngine {
 
 impl RegexEngine {
     pub fn new(vocabulary: Vec<Vec<u8>>, pattern: &str) -> Result<Self, ConstraintError> {
+        // Anchor the parsed pattern rather than the text: splicing it into
+        // `\A(?:...)\z` accepts unbalanced input such as `a)|(b`, and a
+        // trailing `(?x)` comment would swallow the closing anchor.
+        let hir = syntax::parse(pattern).map_err(compile_error)?;
+        let hir = Hir::concat(vec![Hir::look(Look::Start), hir, Hir::look(Look::End)]);
+        let nfa = thompson::Compiler::new()
+            .configure(thompson::Config::new().which_captures(thompson::WhichCaptures::None))
+            .build_from_hir(&hir)
+            .map_err(compile_error)?;
         let dfa = dense::Builder::new()
             .configure(dfa_config())
-            .build(&format!(r"\A(?:{})\z", pattern))
-            .map_err(|error| {
-                ConstraintError::CompilationError(format!("Failed to compile regex: {error}"))
-            })?;
+            .build_from_nfa(&nfa)
+            .map_err(compile_error)?;
 
         let start_config = StartConfig::new().anchored(Anchored::Yes);
         let initial_state = dfa.start_state(&start_config).map_err(|error| {
@@ -409,4 +423,20 @@ mod tests {
         assert!(engine.is_finished());
     }
 
+    #[test]
+    fn test_unbalanced_pattern_is_rejected() {
+        // Wrapped as text, `\A(?:a)|(b)\z` would compile with an unanchored end.
+        assert!(RegexEngine::new(make_test_vocab(), "a)|(b").is_err());
+        assert!(RegexEngine::new(make_test_vocab(), "a)(?:b").is_err());
+    }
+
+    #[test]
+    fn test_verbose_pattern_with_trailing_comment_is_anchored() {
+        let vocab = vec![b"a".to_vec(), b"b".to_vec(), b"bc".to_vec()];
+        let mut engine = RegexEngine::new(vocab, "(?x) a b  # letters").unwrap();
+        engine.advance(0).unwrap();
+        assert_eq!(engine.get_valid_tokens(), vec![1]);
+        engine.advance(1).unwrap();
+        assert!(engine.is_finished());
+    }
 }
