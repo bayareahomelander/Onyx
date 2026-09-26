@@ -348,7 +348,8 @@ def create_streaming_response(request: ChatCompletionRequest, engine) -> Generat
             yield chunk(ChatCompletionChunkDelta(content=pending))
         yield chunk(ChatCompletionChunkDelta(), reason)
     except Exception as error:
-        payload = {"error": {"message": str(error), "type": "server_error"}}
+        kind = "invalid_request" if isinstance(error, ValueError) else "server_error"
+        payload = {"error": {"message": str(error), "type": kind}}
         yield f"data: {json.dumps(payload)}\n\n"
     yield "data: [DONE]\n\n"
 
@@ -411,7 +412,12 @@ async def create_chat_completion(request: ChatCompletionRequest):
     try:
         async with engine_lock(request.model):
             # Off the event loop, so other requests and streams keep being served.
-            output, metrics = await run_in_threadpool(generate_loaded, request, engine)
+            try:
+                output, metrics = await run_in_threadpool(generate_loaded, request, engine)
+            except ValueError as error:
+                # The request cannot be satisfied, e.g. an invalid pattern or a
+                # grammar this vocabulary cannot complete.
+                raise HTTPException(status_code=400, detail=str(error)) from error
         text = truncate_at_stop(output, request.stop)
         reason = completion_reason(metrics, text != output)
         prompt_tokens = metrics.get("prompt_tokens", 0)
@@ -427,6 +433,8 @@ async def create_chat_completion(request: ChatCompletionRequest):
                 metrics, request.regex is not None or request.json_schema is not None,
             ),
         )
+    except HTTPException:
+        raise
     except Exception as error:
         raise HTTPException(status_code=500, detail=str(error)) from error
 

@@ -19,6 +19,12 @@ from onyx.cache import PagedKVCache, make_paged_cache
 
 import onyx
 from onyx.output import finish_reason, TokenTextStream
+
+# The committed grammar state is not a match, yet no vocabulary token extends
+# it (regex `ab` when "b" only occurs merged into "bc"). Generation cannot
+# finish, so the request fails instead of looping or returning rejected text.
+_NO_CONTINUATION = "Grammar constraint has no valid token continuation"
+
 _GrammarConstraint = None
 if onyx.RUST_AVAILABLE:
     try:
@@ -512,6 +518,8 @@ class SpeculativeEngine:
                         mask_times.append(time.perf_counter() - mask_start)
                         
                         if not valid_tokens:
+                            if not draft_tokens:
+                                raise ValueError(_NO_CONTINUATION)
                             break
                         
                         draft_last_logits = self._apply_grammar_mask(draft_last_logits, valid_tokens)
@@ -561,6 +569,8 @@ class SpeculativeEngine:
                         mask_times.append(time.perf_counter() - mask_start)
                         
                         if not valid_tokens:
+                            if i == 0:
+                                raise ValueError(_NO_CONTINUATION)
                             break
                         
                         target_pos_logits = self._apply_grammar_mask(target_pos_logits, valid_tokens)
@@ -784,7 +794,7 @@ class SpeculativeEngine:
                     mask_times.append(time.perf_counter() - mask_start)
                     
                     if not valid_tokens:
-                        break
+                        raise ValueError(_NO_CONTINUATION)
                     
                     last_logits = self._apply_grammar_mask(last_logits, valid_tokens)
                 
@@ -956,6 +966,8 @@ class SpeculativeEngine:
                         mask_times.append(time.perf_counter() - mask_start)
 
                         if not valid_tokens:
+                            if not draft_tokens:
+                                raise ValueError(_NO_CONTINUATION)
                             break
 
                         draft_last_logits = self._apply_grammar_mask(draft_last_logits, valid_tokens)
@@ -1005,6 +1017,8 @@ class SpeculativeEngine:
                         mask_times.append(time.perf_counter() - mask_start)
 
                         if not valid_tokens:
+                            if i == 0:
+                                raise ValueError(_NO_CONTINUATION)
                             break
 
                         target_pos_logits = self._apply_grammar_mask(target_pos_logits, valid_tokens)

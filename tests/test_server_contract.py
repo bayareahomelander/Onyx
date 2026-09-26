@@ -113,7 +113,31 @@ def test_missing_terminal_reason_is_an_error(api):
     metrics.pop("finish_reason")
     assert client.post("/v1/chat/completions", json=payload()).status_code == 500
     events = chunks(client.post("/v1/chat/completions", json=payload(stream=True)))
-    assert "error" in events[-1]
+    assert events[-1]["error"]["type"] == "server_error"
+
+
+def test_unsatisfiable_grammar_is_a_client_error(api):
+    _, client, engine, _, closed, _ = api
+    message = "Grammar constraint has no valid token continuation"
+
+    def generate(**kwargs):
+        raise ValueError(message)
+
+    def stream(**kwargs):
+        try:
+            yield "a", None
+            raise ValueError(message)
+        finally:
+            closed.append(True)
+
+    engine.generate = generate
+    engine.stream_generate = stream
+    response = client.post("/v1/chat/completions", json=payload(regex="ab"))
+    assert response.status_code == 400
+    assert response.json()["detail"] == message
+    events = chunks(client.post("/v1/chat/completions", json=payload(regex="ab", stream=True)))
+    assert events[-1]["error"] == {"message": message, "type": "invalid_request"}
+    assert closed == [True]
 
 
 def test_documentation_routes_and_compatibility_fields(api, monkeypatch):
