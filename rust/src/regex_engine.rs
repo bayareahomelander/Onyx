@@ -38,6 +38,11 @@ pub fn compile_pattern_dfa(pattern: &str) -> Result<CompiledDfa, String> {
     Ok(CompiledDfa { dfa, initial_state })
 }
 
+/// requested regexes can determinize exponentially, e.g. `(a|b)*a(a|b){24}`,
+/// taking minutes and gigabytes. realistic patterns, including unicode classes
+/// such as `\w{1,200}` (about 31 MiB), stay below this bound.
+const REGEX_DFA_SIZE_LIMIT: usize = 64 << 20;
+
 /// a regex constraint engine using DFA traversal
 ///
 /// this struct holds a compiled DFA and tracks the current state
@@ -59,7 +64,9 @@ impl RegexEngine {
             .configure(
                 dense::Config::new()
                     .start_kind(regex_automata::dfa::StartKind::Anchored)
-                    .match_kind(regex_automata::MatchKind::LeftmostFirst),
+                    .match_kind(regex_automata::MatchKind::LeftmostFirst)
+                    .dfa_size_limit(Some(REGEX_DFA_SIZE_LIMIT))
+                    .determinize_size_limit(Some(REGEX_DFA_SIZE_LIMIT)),
             )
             .build(pattern)
             .map_err(|e| {
@@ -191,6 +198,14 @@ mod tests {
         assert_eq!(engine.vocab_size(), 10);
         assert!(!engine.is_dead());
         assert!(!engine.is_finished());
+    }
+
+    #[test]
+    fn test_exponential_regex_is_rejected() {
+        let error = RegexEngine::new(make_test_vocab(), "(a|b)*a(a|b){24}")
+            .err()
+            .expect("an exponential DFA must be rejected");
+        assert!(error.to_string().contains("size limit"), "{error}");
     }
 
     #[test]

@@ -363,6 +363,26 @@ def test_unsupported_request_fails_before_generation_or_sse(monkeypatch, stream,
     assert calls == stream_calls == []
 
 
+@pytest.mark.parametrize(
+    "options",
+    [
+        {"regex": "(a|b)*a(a|b){24}"},
+        {"json_schema": {"type": "string", "pattern": "(a|b)*a(a|b){24}"}},
+    ],
+)
+def test_exponential_pattern_is_rejected_instead_of_exhausting_memory(monkeypatch, options):
+    # Unbounded, this DFA needs minutes and gigabytes on the event loop.
+    calls = _fake_generation(monkeypatch, [])
+    with TestClient(create_app(engine=_engine(FakeTokenizer({})))) as client:
+        response = client.post(
+            "/v1/chat/completions",
+            json={"messages": [{"role": "user", "content": "Hi"}], **options},
+        )
+    assert response.status_code == 400
+    assert "size limit" in response.json()["detail"]
+    assert calls == []
+
+
 @pytest.mark.parametrize("stream", [False, True])
 def test_http_schema_rejects_decimal_precision_loss(monkeypatch, stream):
     engine = _engine(FakeTokenizer({}))
