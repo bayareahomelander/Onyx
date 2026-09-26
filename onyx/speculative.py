@@ -607,7 +607,9 @@ class SpeculativeEngine:
                 
                 tokens_added = len(generated_tokens) - generated_before_verify
                 
-                valid_draft_length = min(cache_position_before_draft + 1 + accepted_count,
+                # Like the target, the draft keeps the accepted history minus the new
+                # current token, which the next round feeds again.
+                valid_draft_length = min(cache_position_before_draft + tokens_added,
                                          self._get_cache_size(self.draft_cache))
                 self._rollback_cache(self.draft_cache, valid_draft_length)
                 
@@ -1049,7 +1051,9 @@ class SpeculativeEngine:
 
                 tokens_added = len(generated_tokens) - generated_before_verify
 
-                valid_draft_length = min(cache_position_before_draft + 1 + accepted_count,
+                # Like the target, the draft keeps the accepted history minus the new
+                # current token, which the next round feeds again.
+                valid_draft_length = min(cache_position_before_draft + tokens_added,
                                          self._get_cache_size(self.draft_cache))
                 self._rollback_cache(self.draft_cache, valid_draft_length)
 
