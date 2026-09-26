@@ -13,7 +13,7 @@ import time
 import mlx.core as mx
 
 from onyx.adaptive_controller import AdaptiveGammaConfig, AdaptiveGammaController
-from onyx.speculative import SpeculativeEngine, _GrammarConstraint
+from onyx.speculative import SpeculativeEngine, _GrammarConstraint, _NO_CONTINUATION
 
 
 class AdaptiveSpeculativeEngine(SpeculativeEngine):
@@ -165,6 +165,8 @@ class AdaptiveSpeculativeEngine(SpeculativeEngine):
                         mask_times.append(time.perf_counter() - mask_start)
 
                         if not valid_tokens:
+                            if not draft_tokens:
+                                raise ValueError(_NO_CONTINUATION)
                             break
 
                         draft_last_logits = self._apply_grammar_mask(draft_last_logits, valid_tokens)
@@ -227,6 +229,8 @@ class AdaptiveSpeculativeEngine(SpeculativeEngine):
                         mask_times.append(time.perf_counter() - mask_start)
 
                         if not valid_tokens:
+                            if i == 0:
+                                raise ValueError(_NO_CONTINUATION)
                             break
 
                         target_pos_logits = self._apply_grammar_mask(target_pos_logits, valid_tokens)
