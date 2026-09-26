@@ -16,13 +16,26 @@ pub struct CompiledDfa {
     pub initial_state: StateID,
 }
 
+/// Client patterns can determinize exponentially: `(a|b)*a(a|b){24}` would take
+/// minutes and gigabytes. Bound construction and the result; realistic patterns,
+/// including Unicode classes such as `\w{1,200}` (about 31 MiB), stay below it.
+const DFA_SIZE_LIMIT: usize = 64 << 20;
+
+fn dfa_config() -> dense::Config {
+    dfa_config_with_limit(DFA_SIZE_LIMIT)
+}
+
+fn dfa_config_with_limit(limit: usize) -> dense::Config {
+    dense::Config::new()
+        .start_kind(regex_automata::dfa::StartKind::Anchored)
+        .match_kind(regex_automata::MatchKind::LeftmostFirst)
+        .dfa_size_limit(Some(limit))
+        .determinize_size_limit(Some(limit))
+}
+
 pub fn compile_pattern_dfa(pattern: &str) -> Result<CompiledDfa, String> {
     let dfa = dense::Builder::new()
-        .configure(
-            dense::Config::new()
-                .start_kind(regex_automata::dfa::StartKind::Anchored)
-                .match_kind(regex_automata::MatchKind::LeftmostFirst),
-        )
+        .configure(dfa_config())
         .build(pattern)
         .map_err(|error| format!("Failed to compile regex: {error}"))?;
 
@@ -194,11 +207,7 @@ pub struct RegexEngine {
 impl RegexEngine {
     pub fn new(vocabulary: Vec<Vec<u8>>, pattern: &str) -> Result<Self, ConstraintError> {
         let dfa = dense::Builder::new()
-            .configure(
-                dense::Config::new()
-                    .start_kind(regex_automata::dfa::StartKind::Anchored)
-                    .match_kind(regex_automata::MatchKind::LeftmostFirst),
-            )
+            .configure(dfa_config())
             .build(&format!(r"\A(?:{})\z", pattern))
             .map_err(|error| {
                 ConstraintError::CompilationError(format!("Failed to compile regex: {error}"))
@@ -313,6 +322,26 @@ mod tests {
             b"hello".to_vec(),
             b"world".to_vec(),
         ]
+    }
+
+    #[test]
+    fn test_every_compiled_pattern_is_size_limited() {
+        let config = dfa_config();
+        assert_eq!(config.get_dfa_size_limit(), Some(DFA_SIZE_LIMIT));
+        assert_eq!(config.get_determinize_size_limit(), Some(DFA_SIZE_LIMIT));
+    }
+
+    #[test]
+    fn test_exponential_pattern_fails_instead_of_exhausting_memory() {
+        // Rejecting at the production limit takes seconds in a debug build.
+        let build = |pattern: &str| {
+            dense::Builder::new()
+                .configure(dfa_config_with_limit(1 << 20))
+                .build(pattern)
+        };
+        let error = build("(a|b)*a(a|b){24}").unwrap_err().to_string();
+        assert!(error.contains("size limit"), "{error}");
+        assert!(build("[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{12}").is_ok());
     }
 
     #[test]
