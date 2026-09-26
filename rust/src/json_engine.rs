@@ -19,6 +19,8 @@ use crate::schema::{PropertyBlueprint, SchemaBlueprint, SchemaType};
 pub enum ObjectSyntaxState {
     /// expecting '"' to start a key or '}' for empty/end
     ExpectKeyOrEnd,
+    /// after a comma, a key is mandatory
+    ExpectKey,
     /// inside a key string, accumulating characters
     InKey,
     /// after key closing quote, expecting ':'
@@ -139,6 +141,8 @@ pub struct NullState {
 pub enum ArraySyntaxState {
     /// expecting a value or ']' for empty/end
     ExpectValueOrEnd,
+    /// after a comma, a value is mandatory
+    ExpectValue,
     /// after a value, expecting ',' or ']'
     ExpectCommaOrEnd,
 }
@@ -621,7 +625,7 @@ impl JsonEngine {
                     missing_required_keys,
                 } => {
                     match syntax_state {
-                        ObjectSyntaxState::ExpectKeyOrEnd => {
+                        ObjectSyntaxState::ExpectKeyOrEnd | ObjectSyntaxState::ExpectKey => {
                             if Self::is_whitespace(byte) {
                                 return true;
                             }
@@ -638,7 +642,8 @@ impl JsonEngine {
                                 }
                                 return false;
                             }
-                            if byte == b'}' {
+                            // a trailing comma cannot be followed by '}'
+                            if byte == b'}' && *syntax_state == ObjectSyntaxState::ExpectKeyOrEnd {
                                 // only allow closing if all required keys have been provided
                                 if !missing_required_keys.is_empty() {
                                     return false;
@@ -861,7 +866,7 @@ impl JsonEngine {
                                     .iter()
                                     .any(|k| !used_keys.contains(k));
                                 if has_unused_key {
-                                    *syntax_state = ObjectSyntaxState::ExpectKeyOrEnd;
+                                    *syntax_state = ObjectSyntaxState::ExpectKey;
                                     return true;
                                 }
                                 return false;
@@ -961,11 +966,20 @@ impl JsonEngine {
 
                     // Handle number characters
                     if byte.is_ascii_digit() {
+                        // json forbids leading zeros in the integer part
+                        if !state.has_decimal
+                            && !state.has_exponent
+                            && matches!(state.buffer.as_str(), "0" | "-0")
+                        {
+                            return false;
+                        }
                         state.buffer.push(byte as char);
                         state.expect_digit = false;
                         return true;
                     }
+                    // '.' and 'e' must follow a digit, so "-.5" and "1.e5" are rejected
                     if byte == b'.'
+                        && !state.expect_digit
                         && !state.has_decimal
                         && !state.has_exponent
                         && !state.is_integer
@@ -975,7 +989,11 @@ impl JsonEngine {
                         state.expect_digit = true;
                         return true;
                     }
-                    if (byte == b'e' || byte == b'E') && !state.has_exponent && !state.is_integer {
+                    if (byte == b'e' || byte == b'E')
+                        && !state.expect_digit
+                        && !state.has_exponent
+                        && !state.is_integer
+                    {
                         state.buffer.push(byte as char);
                         state.has_exponent = true;
                         state.expect_digit = true;
@@ -1026,11 +1044,15 @@ impl JsonEngine {
 
                 Scope::Array(state) => {
                     match state.syntax_state {
-                        ArraySyntaxState::ExpectValueOrEnd => {
+                        ArraySyntaxState::ExpectValueOrEnd | ArraySyntaxState::ExpectValue => {
                             if Self::is_whitespace(byte) {
                                 return true;
                             }
                             if byte == b']' {
+                                // a trailing comma cannot be followed by ']'
+                                if state.syntax_state == ArraySyntaxState::ExpectValue {
+                                    return false;
+                                }
                                 // check minitems before allowing close
                                 if let Some(min) = state.min_items {
                                     if state.item_count < min {
@@ -1069,7 +1091,7 @@ impl JsonEngine {
                                         return false;
                                     }
                                 }
-                                state.syntax_state = ArraySyntaxState::ExpectValueOrEnd;
+                                state.syntax_state = ArraySyntaxState::ExpectValue;
                                 return true;
                             }
                             if byte == b']' {
@@ -1106,71 +1128,15 @@ impl JsonEngine {
                         {
                             // pop the enum scope
                             stack.pop();
-                            // update parent state like we do for other primitives
-                            // we need to handle the delimiter in parent scope
-                            // so don't return here, the byte needs to be processed by parent
-                            // for whitespace return true, for delimiters let parent handle it
-                            if Self::is_whitespace(byte) {
-                                return true;
-                            }
-                            // for comma/brace/bracket, let parent handle it by re-validating
-                            // need to update parent state and then let parent handle delimiter
-                            Self::update_parent_after_value(stack);
-                            // now reprocess this byte with the current (parent) scope
-                            if let Some(parent) = stack.last_mut() {
-                                match parent {
-                                    Scope::Object {
-                                        syntax_state,
-                                        missing_required_keys,
-                                        ..
-                                    } => {
-                                        if *syntax_state == ObjectSyntaxState::ExpectCommaOrEnd {
-                                            if byte == b',' {
-                                                *syntax_state = ObjectSyntaxState::ExpectKeyOrEnd;
-                                                return true;
-                                            }
-                                            if byte == b'}' {
-                                                if !missing_required_keys.is_empty() {
-                                                    return false;
-                                                }
-                                                stack.pop();
-                                                if stack.is_empty() {
-                                                    *finished = true;
-                                                } else {
-                                                    Self::update_parent_after_value(stack);
-                                                }
-                                                return true;
-                                            }
-                                        }
-                                    }
-                                    Scope::Array(arr_state) => {
-                                        if arr_state.syntax_state
-                                            == ArraySyntaxState::ExpectCommaOrEnd
-                                        {
-                                            if byte == b',' {
-                                                arr_state.syntax_state =
-                                                    ArraySyntaxState::ExpectValueOrEnd;
-                                                return true;
-                                            }
-                                            if byte == b']' {
-                                                stack.pop();
-                                                if stack.is_empty() {
-                                                    *finished = true;
-                                                } else {
-                                                    Self::update_parent_after_value(stack);
-                                                }
-                                                return true;
-                                            }
-                                        }
-                                    }
-                                    _ => {}
-                                }
-                            } else {
-                                // No parent, we're at root
+                            if stack.is_empty() {
+                                // a root value may only be followed by whitespace
                                 *finished = true;
-                                return true;
+                                return Self::is_whitespace(byte);
                             }
-                            return false;
+                            // reprocess this byte with the parent scope so its own
+                            // comma, close, minitems and required-key rules apply
+                            Self::update_parent_after_value(stack);
+                            continue;
                         }
                     }
 
@@ -1254,7 +1220,13 @@ impl ConstraintEngine for JsonEngine {
             return true;
         }
 
-        matches!(self.stack.as_slice(), [Scope::Number(state)] if Self::number_is_complete(state))
+        // a root number or enum value has no closing delimiter, so it is complete
+        // as soon as its buffer is a full value
+        match self.stack.as_slice() {
+            [Scope::Number(state)] => Self::number_is_complete(state),
+            [Scope::Enum(state)] => state.candidates.iter().any(|c| c.len() == state.cursor),
+            _ => false,
+        }
     }
 
     fn is_dead(&self) -> bool {
@@ -1852,5 +1824,144 @@ mod tests {
         assert!(valid_null.contains(&1));
         null_engine.advance(1).unwrap();
         assert!(null_engine.is_finished());
+    }
+
+    const INT_ARRAY: &str = r#"{"type":"array","items":{"type":"integer"}}"#;
+    const INT_OBJECT: &str =
+        r#"{"type":"object","properties":{"a":{"type":"integer"},"b":{"type":"integer"}}}"#;
+    const INTEGER: &str = r#"{"type":"integer"}"#;
+    const NUMBER: &str = r#"{"type":"number"}"#;
+
+    /// feed `doc` one byte at a time through a byte-level vocabulary, requiring
+    /// each byte to be in the valid token mask before advancing; returns the
+    /// engine, or the offset of the first byte the mask rejected
+    fn feed_bytes(schema: &str, doc: &str) -> Result<JsonEngine, usize> {
+        let vocab = (0..=255u8).map(|b| vec![b]).collect();
+        let mut engine = JsonEngine::new(vocab, schema).unwrap();
+        for (offset, &byte) in doc.as_bytes().iter().enumerate() {
+            if !engine.get_valid_tokens().contains(&(byte as usize)) {
+                return Err(offset);
+            }
+            engine.advance(byte as usize).unwrap();
+        }
+        Ok(engine)
+    }
+
+    fn rejected_at(schema: &str, doc: &str) -> Option<usize> {
+        feed_bytes(schema, doc).err()
+    }
+
+    fn accepts_complete(schema: &str, doc: &str) -> bool {
+        feed_bytes(schema, doc).is_ok_and(|engine| engine.is_finished())
+    }
+
+    #[test]
+    fn test_array_rejects_trailing_comma() {
+        assert!(serde_json::from_str::<Value>("[1,]").is_err());
+        assert_eq!(rejected_at(INT_ARRAY, "[1,]"), Some(3));
+        assert_eq!(rejected_at(INT_ARRAY, "[1, ]"), Some(4));
+        assert_eq!(rejected_at(INT_ARRAY, "[1,2,]"), Some(5));
+    }
+
+    #[test]
+    fn test_object_rejects_trailing_comma() {
+        assert!(serde_json::from_str::<Value>(r#"{"a":1,}"#).is_err());
+        assert_eq!(rejected_at(INT_OBJECT, r#"{"a":1,}"#), Some(7));
+        assert_eq!(rejected_at(INT_OBJECT, r#"{"a":1, }"#), Some(8));
+    }
+
+    #[test]
+    fn test_number_rejects_leading_zeros() {
+        assert!(serde_json::from_str::<Value>("007").is_err());
+        assert_eq!(rejected_at(INTEGER, "007"), Some(1));
+        assert_eq!(rejected_at(INTEGER, "-01"), Some(2));
+        assert_eq!(rejected_at(NUMBER, "00.5"), Some(1));
+        assert_eq!(rejected_at(INT_ARRAY, "[01]"), Some(2));
+        // zeros after the integer part are fine
+        assert!(accepts_complete(NUMBER, "0.05"));
+        assert!(accepts_complete(NUMBER, "1e05"));
+    }
+
+    #[test]
+    fn test_number_requires_digit_before_decimal_or_exponent() {
+        assert_eq!(rejected_at(NUMBER, "-.5"), Some(1));
+        assert_eq!(rejected_at(NUMBER, "-e5"), Some(1));
+        assert_eq!(rejected_at(NUMBER, "1.e5"), Some(2));
+        assert_eq!(rejected_at(NUMBER, "1.E5"), Some(2));
+    }
+
+    #[test]
+    fn test_enum_value_rejects_trailing_comma_and_defers_to_parent() {
+        // single-byte candidates stay on the stack until a delimiter arrives
+        let enum_object =
+            r#"{"type":"object","properties":{"n":{"enum":[1,2]},"b":{"type":"integer"}}}"#;
+        let enum_array = r#"{"type":"array","items":{"enum":[1,2]}}"#;
+        let enum_array_min = r#"{"type":"array","minItems":2,"items":{"enum":[1,2]}}"#;
+        let root_enum = r#"{"enum":[1,2]}"#;
+
+        assert_eq!(rejected_at(enum_object, r#"{"n":1,}"#), Some(7));
+        assert_eq!(rejected_at(enum_array, "[1,]"), Some(3));
+        // the parent's minitems check applies after an enum item
+        assert_eq!(rejected_at(enum_array_min, "[1]"), Some(2));
+        // a root value cannot be followed by a delimiter
+        assert_eq!(rejected_at(root_enum, "1,"), Some(1));
+        assert_eq!(rejected_at(root_enum, "1]"), Some(1));
+
+        assert!(accepts_complete(enum_object, r#"{"n":1,"b":2}"#));
+        assert!(accepts_complete(enum_object, r#"{"n":2 }"#));
+        assert!(accepts_complete(enum_array, "[1,2]"));
+        assert!(accepts_complete(enum_array_min, "[1, 2]"));
+        assert!(accepts_complete(root_enum, "1"));
+        assert!(accepts_complete(root_enum, "2 "));
+    }
+
+    #[test]
+    fn test_accepts_valid_json_documents() {
+        let cases = [
+            (INT_ARRAY, "[1,2]"),
+            (INT_ARRAY, "[ 1 , 2 ]"),
+            (INT_ARRAY, "[]"),
+            (INT_ARRAY, "[0,-0,10]"),
+            (INT_OBJECT, r#"{"a":1,"b":2}"#),
+            (INT_OBJECT, r#"{ "a" : 1 , "b" : 2 }"#),
+            (INT_OBJECT, "{}"),
+            (INTEGER, "0"),
+            (INTEGER, "-0"),
+            (INTEGER, "10"),
+            (NUMBER, "-0.5"),
+            (NUMBER, "1e+2"),
+            (NUMBER, "1E-2"),
+            (NUMBER, "0e5"),
+            (NUMBER, "12.50e10"),
+        ];
+        for (schema, doc) in cases {
+            assert!(
+                serde_json::from_str::<Value>(doc).is_ok(),
+                "{doc} is not JSON"
+            );
+            assert!(accepts_complete(schema, doc), "rejected {doc} for {schema}");
+        }
+    }
+
+    #[test]
+    fn test_number_syntax_matches_serde() {
+        // every string up to 4 bytes over the number alphabet completes a
+        // number schema exactly when serde parses it as a JSON number
+        let alphabet = b"01-+.eE";
+        let mut docs = Vec::new();
+        let mut frontier = vec![String::new()];
+        for _ in 0..4 {
+            frontier = frontier
+                .iter()
+                .flat_map(|doc| alphabet.iter().map(move |&b| format!("{doc}{}", b as char)))
+                .collect();
+            docs.extend(frontier.iter().cloned());
+        }
+        for doc in &docs {
+            let is_number = serde_json::from_str::<serde_json::Number>(doc).is_ok();
+            let is_integer = is_number && !doc.contains(['.', 'e', 'E']);
+            assert_eq!(accepts_complete(NUMBER, doc), is_number, "number {doc}");
+            assert_eq!(accepts_complete(INTEGER, doc), is_integer, "integer {doc}");
+        }
     }
 }
