@@ -72,6 +72,11 @@ def _fake_generation(monkeypatch, results):
         return result
 
     monkeypatch.setattr(server, "_generate", generate)
+    # Without stop strings, collection must not pay for per-token decoding.
+    monkeypatch.setattr(
+        server, "_completion_event_iter",
+        lambda *_: pytest.fail("non-streaming requests without stop must not decode events"),
+    )
     return calls
 
 
@@ -135,21 +140,28 @@ def test_stop_length_and_multiple_choices_use_final_choice_metrics(monkeypatch):
             (22,): "second",
         }
     )
-    calls = _fake_generation(
-        monkeypatch,
-        [
-            _result(
-                [20, 21],
-                "stop",
-                _timings(speed=5.0, acceptance=1.0, ttft=0.01, iterations=2),
-            ),
-            _result(
-                [22],
-                "length",
-                _timings(speed=7.0, acceptance=0.25, ttft=0.02, iterations=4),
-            ),
-        ],
-    )
+    results = [
+        _result(
+            [20, 21],
+            "stop",
+            _timings(speed=5.0, acceptance=1.0, ttft=0.01, iterations=2),
+        ),
+        _result(
+            [22],
+            "length",
+            _timings(speed=7.0, acceptance=0.25, ttft=0.02, iterations=4),
+        ),
+    ]
+    calls = []
+
+    def fake_iter(arguments, _tokenizer, stop):
+        # Text stops end non-streaming generation through the decoded event stream.
+        calls.append(arguments.copy())
+        assert stop == ["STOP"]
+        return iter([SimpleNamespace(result=results[len(calls) - 1])])
+
+    monkeypatch.setattr(server, "_completion_event_iter", fake_iter)
+    monkeypatch.setattr(server, "_generate", lambda _arguments: pytest.fail("stop requests use text stops"))
 
     with TestClient(create_app(engine=_engine(tokenizer))) as client:
         response = client.post(
@@ -913,6 +925,45 @@ def test_real_cuda_two_client_requests_match_direct_generation_without_model_cop
             "completion_tokens": len(direct.token_ids),
             "total_tokens": len(arguments["prompt_token_ids"]) + len(direct.token_ids),
         }
+
+
+@pytest.mark.gpu
+def test_real_cuda_text_stop_ends_non_streaming_generation_early():
+    from onyx_cuda.model import load_model_pair
+    from onyx_cuda.speculative import generate_speculative
+
+    pair = load_model_pair()
+    payload = {
+        "messages": [
+            {"role": "system", "content": "You are a concise assistant."},
+            {"role": "user", "content": "Write the numbers one through ten, separated by commas."},
+        ],
+        "max_tokens": 64,
+    }
+    request = ChatCompletionRequest.model_validate(payload)
+    arguments = prepare_generation(request, pair)
+    direct = generate_speculative(**arguments)
+    full = pair.target.tokenizer.decode(direct.token_ids, skip_special_tokens=True)
+    # A stop taken from the middle of the model's own output must end inference there.
+    stop = full[len(full) // 2:len(full) // 2 + 3]
+    assert stop.strip() and len(direct.token_ids) > 8
+    expected = server.truncate_at_stop(full, [stop])
+
+    with TestClient(create_app(engine=pair)) as client:
+        for _ in range(2):  # The draft graph cache must be reusable after a text stop.
+            stopped = client.post("/v1/chat/completions", json={**payload, "stop": [stop]})
+            assert stopped.status_code == 200
+            body = stopped.json()
+            assert body["choices"][0]["message"]["content"] == expected
+            assert body["choices"][0]["finish_reason"] == "stop"
+            assert body["usage"]["completion_tokens"] < len(direct.token_ids)
+            streamed = client.post("/v1/chat/completions",
+                                   json={**payload, "stop": [stop], "stream": True})
+            chunks = [json.loads(item) for item in _parse_sse(streamed.text)[:-1]]
+            assert not any("error" in chunk for chunk in chunks)
+            assert "".join(chunk["choices"][0]["delta"].get("content") or "" for chunk in chunks) == expected
+            unstopped = client.post("/v1/chat/completions", json=payload)
+            assert unstopped.json()["choices"][0]["message"]["content"] == full
 
 
 @pytest.mark.gpu

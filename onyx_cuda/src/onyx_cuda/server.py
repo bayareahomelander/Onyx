@@ -417,6 +417,24 @@ def _completion_event_iter(arguments: dict[str, Any], tokenizer, stop: list[str]
     )
 
 
+def _generate_until_text_stop(arguments: dict[str, Any], tokenizer, stop: list[str]):
+    """Collect one choice, ending inference once decoded text reaches a stop.
+
+    Token-ID stop sequences miss stops the model spells with other tokens.
+    """
+    events = _completion_event_iter(arguments, tokenizer, stop)
+    try:
+        for event in events:
+            result = getattr(event, "result", None)
+            if result is not None:
+                return result
+        raise RuntimeError("Generation ended without a terminal event")
+    finally:
+        close = getattr(events, "close", None)
+        if close is not None:
+            close()
+
+
 def _sse(data: str) -> str:
     return f"data: {data}\n\n"
 
@@ -787,7 +805,13 @@ def create_app(
             for index in range(request.n):
                 if request.seed is not None:
                     arguments["seed"] = _choice_seed(request.seed, index)
-                result = await _generate_off_event_loop(arguments, app.state.inference_executor)
+                if request.stop:
+                    result = await _off_event_loop(
+                        _generate_until_text_stop, arguments, tokenizer, request.stop,
+                        executor=app.state.inference_executor,
+                    )
+                else:
+                    result = await _generate_off_event_loop(arguments, app.state.inference_executor)
                 completion_tokens += len(result.token_ids)
                 last_timings = result.timings
                 output = tokenizer.decode(result.token_ids, skip_special_tokens=True)

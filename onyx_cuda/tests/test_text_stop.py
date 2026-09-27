@@ -245,6 +245,58 @@ def test_sse_text_stop_finishes_once_and_allows_next_request(runtime, monkeypatc
 
 
 @pytest.mark.parametrize("mode", ["target", "sampled", "fixed", "adaptive"])
+@pytest.mark.parametrize("n", [1, 2])
+def test_non_streaming_text_stop_ends_inference(runtime, monkeypatch, mode, n):
+    import onyx_cuda.draft_backend as draft_backend
+
+    monkeypatch.setattr(draft_backend, "prepare_draft_backend", lambda *_, **__: {"active": "eager"})
+    forwards_at_stop = []
+
+    def decode(ids, **_):
+        text = "".join({1: "Hello ", 2: "END"}.get(i, "wasted") for i in ids)
+        if "END" in text:
+            forwards_at_stop.append(list(runtime.forwards))
+        return text
+
+    tokenizer = SimpleNamespace(
+        eos_token_id=31,
+        apply_chat_template=lambda *_, **kwargs: [0] * 4,
+        encode=lambda *_, **kwargs: [30],  # Different tokenization from generated text.
+        decode=decode,
+    )
+    engine = SimpleNamespace(
+        target=SimpleNamespace(model=runtime.target, tokenizer=tokenizer),
+        draft=SimpleNamespace(model=runtime.draft, tokenizer=tokenizer),
+    )
+    app = create_app(
+        engine=engine, gamma=0 if mode == "target" else 2,
+        speculative_mode="adaptive" if mode == "adaptive" else "fixed",
+    )
+    with TestClient(app) as client:
+        for _ in range(2):
+            forwards_at_stop.clear()
+            runtime.forwards.clear()
+            response = client.post("/v1/chat/completions", json={
+                "messages": [{"role": "user", "content": "Hi"}], "n": n,
+                "stop": "END", "max_tokens": 8, "temperature": 0.8 if mode == "sampled" else 0,
+            })
+            assert response.status_code == 200
+            body = response.json()
+            assert [choice["message"]["content"] for choice in body["choices"]] == ["Hello "] * n
+            assert [choice["finish_reason"] for choice in body["choices"]] == ["stop"] * n
+            # Only the consumed prefix through the stop-completing token was generated.
+            assert body["usage"] == {"prompt_tokens": 4, "completion_tokens": 2 * n,
+                                     "total_tokens": 4 + 2 * n}
+            # Per choice, the decoder reaches the stop and the handler then decodes
+            # the result. Equal snapshots mean no forward ran after the stop.
+            assert len(forwards_at_stop) == 2 * n
+            assert forwards_at_stop[0::2] == forwards_at_stop[1::2]
+            assert runtime.forwards == forwards_at_stop[-1]
+            assert not app.state.engine_locks[MODEL_ID].locked()
+            assert not runtime.backend.active
+
+
+@pytest.mark.parametrize("mode", ["target", "sampled", "fixed", "adaptive"])
 @pytest.mark.parametrize("stop_in_first_token", [False, True])
 def test_closing_decoder_around_text_stop_releases_producer(runtime, mode, stop_in_first_token):
     tokenizer = SimpleNamespace(decode=lambda *_, **__: "Hello END" if stop_in_first_token else "Hello ")
