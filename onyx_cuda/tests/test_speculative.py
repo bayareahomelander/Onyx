@@ -532,6 +532,32 @@ def test_text_events_emit_safe_text_before_consuming_next_token():
         stream.close()
 
 
+def test_text_stop_closes_source_without_consuming_later_tokens():
+    consumed = []
+    closed = []
+
+    def source():
+        try:
+            for token in (1, 2, 3, 4):
+                consumed.append(token)
+                yield AcceptedTokenEvent(token)
+            yield GenerationFinishedEvent(GenerationResult([1, 2, 3, 4], None, "length"))
+        finally:
+            closed.append(True)
+
+    stream = decode_speculative_events(
+        source(), _MappedTokenizer({1: "Hello ", 2: "END", 3: "wasted", 4: " work"}),
+        stop=["END"],
+    )
+    assert next(stream) == TextDeltaEvent("Hello ")
+    terminal = next(stream)
+    assert consumed == [1, 2]
+    assert closed == [True]
+    assert terminal.result.token_ids == [1, 2]
+    assert terminal.result.finish_reason == "stop"
+    assert list(stream) == []
+
+
 @pytest.mark.parametrize("pieces,stops,text,reason", [
     (["Hello [", "EN", "D] ignored"], ["[END]"], "Hello ", "stop"),
     (["Hello [EN", "X", " world"], ["[END]"], "Hello [ENX world", "length"),

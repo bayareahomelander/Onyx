@@ -23,6 +23,7 @@ from onyx_cuda.generation import (
     _validate_grammar_request,
     _validate_generation_options,
     _validate_json_result,
+    _TextStop,
     generate_token_events,
 )
 from onyx_cuda.masking import grammar_argmax
@@ -491,6 +492,9 @@ def generate_speculative_events(
                 finish_reason = "stop"
                 finished = True
 
+        checkpoint = GreedyCheckpoint(target_model, prompt_token_ids, constraint,
+                                      live_grammar_states, greedy_backend,
+                                      eos_token_ids=eos_token_ids, measure=measure)
         if not finished:
             if constraint is None:
                 first_token = target_prefill.token_id
@@ -539,9 +543,6 @@ def generate_speculative_events(
 
         # A numerical repair can replace target_cache's underlying KV object;
         # do not retain the obsolete object through the prefill result.
-        checkpoint = GreedyCheckpoint(target_model, prompt_token_ids, constraint,
-                                      live_grammar_states, greedy_backend,
-                                      eos_token_ids=eos_token_ids, measure=measure)
         if not finished and len(generated) < max_tokens:
             checkpoint.seed(target_cache, target_prefill.logits)
         del target_prefill
@@ -701,6 +702,15 @@ def generate_speculative_events(
         if json_schema is not None and finish_reason != "length":
             _validate_json_result(json_schema, token_byte_vocabulary, generated)
         past_key_values = target_cache.past_key_values
+    except _TextStop as stop:
+        generated = stop.token_ids
+        finish_reason = "stop"
+        # Verification may have computed later tokens in this same batch.
+        # Return only the consumed prefix, with its last token still outside KV.
+        target_cache.crop(len(prompt_token_ids) + len(generated) - 1)
+        past_key_values = target_cache.past_key_values
+        if json_schema is not None:
+            _validate_json_result(json_schema, token_byte_vocabulary, generated)
     finally:
         # A graph draft cache is shared model state; free it for the next generation.
         release = getattr(draft_cache, "release", None)
@@ -796,18 +806,42 @@ def generate_speculative(
         events.close()
 
 
+def _finish_text_stop(event_iterator, token_ids: list[int]) -> GenerationFinishedEvent:
+    """Finalize native generators; foreign iterators have no cache or timings."""
+    signal = _TextStop(token_ids)
+    throw = getattr(event_iterator, "throw", None)
+    if throw is not None:
+        try:
+            terminal = throw(signal)
+        except _TextStop as escaped:
+            if escaped is not signal:
+                raise
+        else:
+            if (not isinstance(terminal, GenerationFinishedEvent)
+                    or terminal.result.token_ids != token_ids
+                    or terminal.result.finish_reason != "stop"):
+                raise RuntimeError("Generation did not finalize at the decoded text stop")
+            return terminal
+    return GenerationFinishedEvent(GenerationResult(list(token_ids), None, "stop"))
+
+
 def decode_speculative_events(
     events: Iterable[AcceptedTokenEvent | GenerationFinishedEvent],
     tokenizer,
     stop: list[str] | None = None,
 ) -> Iterator[TextDeltaEvent | GenerationFinishedEvent]:
-    """Incrementally decode token events and preserve one terminal event."""
+    """Decode events, stopping the producer as soon as a text stop is detected.
+
+    Native producers retain cache and timing metadata when stopped. For a plain
+    iterable, the early terminal result has only the consumed token IDs; cache
+    and timings are unavailable. Stop-containing tokens remain in this prefix.
+    """
     token_ids: list[int] = []
     decoded = ""
     emitted = ""
     pending = ""
-    stopped = False
     terminal_seen = False
+    source_closed = False
     event_iterator = iter(events)
     try:
         for event in event_iterator:
@@ -815,8 +849,6 @@ def decode_speculative_events(
                 raise RuntimeError("Generation emitted events after completion")
             if isinstance(event, AcceptedTokenEvent):
                 token_ids.append(event.token_id)
-                if stopped:
-                    continue
                 # ponytail: cumulative decode is bounded by max_tokens; use
                 # raw token bytes only if profiling shows this helper matters.
                 current = tokenizer.decode(token_ids, skip_special_tokens=True)
@@ -827,6 +859,16 @@ def decode_speculative_events(
                 pending += stable[len(decoded) :]
                 decoded = stable
                 text, pending, stopped = _flush_stream_text(pending, stop)
+                if stopped:
+                    terminal = _finish_text_stop(event_iterator, token_ids)
+                    close = getattr(event_iterator, "close", None)
+                    source_closed = True
+                    if close is not None:
+                        close()
+                    if text:
+                        yield TextDeltaEvent(text)
+                    yield terminal
+                    return
                 if text:
                     emitted += text
                     yield TextDeltaEvent(text)
@@ -850,5 +892,5 @@ def decode_speculative_events(
             raise RuntimeError("Generation ended without a terminal event")
     finally:
         close = getattr(event_iterator, "close", None)
-        if close is not None:
+        if close is not None and not source_closed:
             close()

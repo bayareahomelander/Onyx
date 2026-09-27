@@ -18,7 +18,7 @@ from onyx_cuda.vocabulary import TokenByteVocabulary
 
 class GenerationResult(NamedTuple):
     token_ids: list[int]
-    past_key_values: Cache
+    past_key_values: Cache | None
     finish_reason: Literal["eos", "stop", "length"]
     timings: "GenerationTimings | None" = None
 
@@ -29,6 +29,19 @@ class AcceptedTokenEvent(NamedTuple):
 
 class GenerationFinishedEvent(NamedTuple):
     result: GenerationResult
+
+
+class _TextStop(Exception):
+    """Ask a suspended token generator to finalize at a decoded-text stop.
+
+    The prefix includes the token completing the stop, which can also contain
+    visible text. Throwing this signal at a token yield skips buffered tokens
+    and further inference, while letting the producer finalize its metadata.
+    """
+
+    def __init__(self, token_ids: list[int]):
+        super().__init__("Decoded text reached a stop")
+        self.token_ids = list(token_ids)
 
 
 def _take_ready_tokens(pending: list[int], retain: int = 0) -> list[int]:
@@ -304,6 +317,11 @@ def generate_token_events(
                 logits = cache.extend(model, token_id[:, None])[:, -1, :]
         for ready_token in _take_ready_tokens(pending):
             yield AcceptedTokenEvent(ready_token)
+    except _TextStop as stop:
+        generated = stop.token_ids
+        finish_reason = "stop"
+        # As in ordinary generation, the last returned token is not in KV yet.
+        cache.crop(len(prompt_token_ids) + len(generated) - 1)
     finally:
         if constraint is not None and grammar_state is not None:
             constraint.release_state(grammar_state)
