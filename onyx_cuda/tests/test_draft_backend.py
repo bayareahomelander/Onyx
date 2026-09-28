@@ -241,12 +241,11 @@ def test_speculation_with_graph_draft_matches_target_only():
                 args.update(regex=case["regex"], token_byte_vocabulary=vocabulary,
                             json_schema=json.dumps(case["json_schema"]) if case["json_schema"] else None)
             oracle = generate_speculative(**args, gamma=0)
-            for adaptive in (False, True):
-                started.clear()
-                result = generate_speculative(**args, gamma=2, adaptive=adaptive)
-                assert (result.token_ids, result.finish_reason) == (oracle.token_ids, oracle.finish_reason), name
-                assert started and all(started), name
-                assert backend._owner is None, name
+            started.clear()
+            result = generate_speculative(**args, gamma=2)
+            assert (result.token_ids, result.finish_reason) == (oracle.token_ids, oracle.finish_reason), name
+            assert started and all(started), name
+            assert backend._owner is None, name
         # Beyond the static capacity, generation keeps the ordinary draft cache.
         started.clear()
         args["max_tokens"] = 4096

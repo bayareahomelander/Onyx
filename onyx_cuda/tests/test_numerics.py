@@ -94,9 +94,8 @@ def test_rounding_guard_checks_only_relevant_eligible_tokens():
     assert ambiguous_logits(logits, 2, [[0, 2], [0, 1]])
 
 
-@pytest.mark.parametrize("adaptive", [False, True])
 @pytest.mark.parametrize("constrained", [False, True])
-def test_replay_uses_clean_prefix_and_releases_grammar(monkeypatch, adaptive, constrained):
+def test_replay_uses_clean_prefix_and_releases_grammar(monkeypatch, constrained):
     import onyx_cuda.generation as generation
     import onyx_cuda.speculative as speculative
     import onyx_cuda.numerics as numerics
@@ -184,14 +183,13 @@ def test_replay_uses_clean_prefix_and_releases_grammar(monkeypatch, adaptive, co
             [str(i).encode() for i in range(9)], 0, 0))
     oracle = generation.generate_tokens(target, **args)
     prefills.clear()
-    result = speculative.generate_speculative(draft, target, gamma=2, adaptive=adaptive, **args)
+    result = speculative.generate_speculative(draft, target, gamma=2, measure=True, **args)
     assert (result.token_ids, result.finish_reason) == (oracle.token_ids, oracle.finish_reason)
     assert prefills.count("target") == 1  # Reuse the original clean prompt cache.
     assert all(not grammar.active_states for grammar in grammars)
-    if adaptive:
-        assert result.timings.verification_replays > 0
+    assert result.timings.verification_replays > 0
     # Closing a stream after replay releases checkpoint-owned grammar handles.
-    events = speculative.generate_speculative_events(draft, target, gamma=2, adaptive=adaptive, **args)
+    events = speculative.generate_speculative_events(draft, target, gamma=2, **args)
     for _ in range(5):
         next(events)
     events.close()
@@ -216,9 +214,10 @@ def test_real_rounding_regressions_match_target_only_with_and_without_profiling(
         oracle = generate_speculative(**args, gamma=0)
         expected = (oracle.token_ids.copy(), oracle.finish_reason)
         del oracle
-        for adaptive, measure in ((False, True), (True, False), (True, True)):
-            result = generate_speculative(**args, gamma=2, adaptive=adaptive, measure=measure)
+        for measure in (True, False):
+            result = generate_speculative(**args, gamma=2, measure=measure)
             assert (result.token_ids, result.finish_reason) == expected
-            replay_count += result.timings.verification_replays
+            if measure:
+                replay_count += result.timings.verification_replays
             del result
     assert replay_count > 0

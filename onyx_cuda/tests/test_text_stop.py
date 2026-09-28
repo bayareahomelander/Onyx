@@ -97,11 +97,11 @@ def arguments(runtime, mode, **kwargs):
         prompt_token_ids=[0] * 4, max_tokens=8, eos_token_ids=[],
         gamma=0 if mode == "target" else 2,
         temperature=0.8 if mode == "sampled" else 0.0,
-        adaptive=mode.startswith("adaptive"), measure=True, **kwargs,
+        measure=True, **kwargs,
     )
 
 
-@pytest.mark.parametrize("mode", ["target", "sampled", "fixed", "adaptive", "adaptive_scalar"])
+@pytest.mark.parametrize("mode", ["target", "sampled", "fixed"])
 @pytest.mark.parametrize("pieces,expected", [
     ([b"Hello END trailing"], "Hello "),
     ([b"Hello ", b"END trailing"], "Hello "),
@@ -109,8 +109,6 @@ def arguments(runtime, mode, **kwargs):
     ([b"caf\xc3", b"\xa9 EN", b"D trailing"], "café "),
 ])
 def test_text_stop_finalizes_without_another_forward(runtime, monkeypatch, mode, pieces, expected):
-    if mode == "adaptive_scalar":
-        monkeypatch.setattr(speculative.AdaptiveController, "choose", lambda self, remaining: 0)
     calls_at_stop = []
 
     def decode(ids, **kwargs):
@@ -141,15 +139,13 @@ def test_text_stop_finalizes_without_another_forward(runtime, monkeypatch, mode,
             assert result.timings.decode_tokens_per_second is None
         else:
             assert result.timings.decode_tokens_per_second > 0
-        if mode.startswith("adaptive"):
-            assert result.timings.adaptive_stats is not None
         assert not runtime.backend.active
         assert not torch.is_inference_mode_enabled()
-    if mode in ("fixed", "adaptive") and (mode == "fixed" or len(pieces) > 1):
+    if mode == "fixed":
         assert runtime.releases == [True, True]
 
 
-@pytest.mark.parametrize("mode", ["target", "sampled", "fixed", "adaptive"])
+@pytest.mark.parametrize("mode", ["target", "sampled", "fixed"])
 @pytest.mark.parametrize("budget,stop_tokens", [
     (2, None), (3, [[29, 30, 31]]), (8, [[29, 30, 31]]),
 ])
@@ -174,7 +170,7 @@ def test_text_stop_during_pending_token_flush(runtime, mode, budget, stop_tokens
     assert not runtime.backend.active
 
 
-@pytest.mark.parametrize("mode", ["target", "sampled", "fixed", "adaptive"])
+@pytest.mark.parametrize("mode", ["target", "sampled", "fixed"])
 def test_text_stop_releases_native_grammar_states(runtime, monkeypatch, mode):
     constraints = []
     original = generation._initialize_grammar_constraint
@@ -207,7 +203,7 @@ def test_text_stop_releases_native_grammar_states(runtime, monkeypatch, mode):
     assert not runtime.backend.active
 
 
-@pytest.mark.parametrize("mode", ["target", "sampled", "fixed", "adaptive"])
+@pytest.mark.parametrize("mode", ["target", "sampled", "fixed"])
 def test_sse_text_stop_finishes_once_and_allows_next_request(runtime, monkeypatch, mode):
     import onyx_cuda.draft_backend as draft_backend
 
@@ -224,7 +220,6 @@ def test_sse_text_stop_finishes_once_and_allows_next_request(runtime, monkeypatc
     )
     app = create_app(
         engine=engine, gamma=0 if mode == "target" else 2,
-        speculative_mode="adaptive" if mode == "adaptive" else "fixed",
     )
     with TestClient(app) as client:
         for _ in range(2):
@@ -244,7 +239,7 @@ def test_sse_text_stop_finishes_once_and_allows_next_request(runtime, monkeypatc
             assert not runtime.backend.active
 
 
-@pytest.mark.parametrize("mode", ["target", "sampled", "fixed", "adaptive"])
+@pytest.mark.parametrize("mode", ["target", "sampled", "fixed"])
 @pytest.mark.parametrize("n", [1, 2])
 def test_non_streaming_text_stop_ends_inference(runtime, monkeypatch, mode, n):
     import onyx_cuda.draft_backend as draft_backend
@@ -270,7 +265,6 @@ def test_non_streaming_text_stop_ends_inference(runtime, monkeypatch, mode, n):
     )
     app = create_app(
         engine=engine, gamma=0 if mode == "target" else 2,
-        speculative_mode="adaptive" if mode == "adaptive" else "fixed",
     )
     with TestClient(app) as client:
         for _ in range(2):
@@ -296,7 +290,7 @@ def test_non_streaming_text_stop_ends_inference(runtime, monkeypatch, mode, n):
             assert not runtime.backend.active
 
 
-@pytest.mark.parametrize("mode", ["target", "sampled", "fixed", "adaptive"])
+@pytest.mark.parametrize("mode", ["target", "sampled", "fixed"])
 @pytest.mark.parametrize("stop_in_first_token", [False, True])
 def test_closing_decoder_around_text_stop_releases_producer(runtime, mode, stop_in_first_token):
     tokenizer = SimpleNamespace(decode=lambda *_, **__: "Hello END" if stop_in_first_token else "Hello ")

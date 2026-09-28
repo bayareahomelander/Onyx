@@ -9,13 +9,6 @@ from onyx_cuda.revisions import MODEL_REVISIONS
 DEFAULT_DRAFT_MODEL = "Qwen/Qwen2.5-0.5B-Instruct"
 DEFAULT_TARGET_MODEL = "Qwen/Qwen3-8B"
 DEFAULT_GAMMA = 2
-
-
-def resolve_speculative_mode(value: str | None = None) -> str:
-    mode = value if value is not None else os.environ.get("ONYX_SPECULATIVE_MODE", "fixed")
-    if mode not in ("fixed", "adaptive"):
-        raise ValueError("ONYX_SPECULATIVE_MODE must be fixed or adaptive")
-    return mode
 DEFAULT_CONTEXT_TOKENS = 8192
 DEFAULT_OUTPUT_TOKENS = 4096
 
@@ -87,7 +80,7 @@ def resolve_model_selection(*, target_model: str | None = None, target_revision:
 
 
 # Settings for removed features, with the value that matched current behavior.
-REMOVED_SETTINGS = {"ONYX_GREEDY_BACKEND": "torch"}
+REMOVED_SETTINGS = {"ONYX_GREEDY_BACKEND": "torch", "ONYX_SPECULATIVE_MODE": "fixed"}
 
 
 def reject_removed_settings() -> None:

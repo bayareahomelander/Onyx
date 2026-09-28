@@ -145,15 +145,14 @@ def run(monkeypatch):
         if mode == "sampled":
             return generation.generate_tokens(target, temperature=0.01, seed=0, **arguments)
         return speculative.generate_speculative(
-            draft, target, gamma=2, adaptive=mode == "adaptive",
-            measure=measure or mode == "measured", **arguments)
+            draft, target, gamma=2, measure=measure or mode == "measured", **arguments)
 
     execute.forwards = forwards
     yield execute
     assert all(not constraint.live for constraint in TrackedConstraint.instances)
 
 
-MODES = ["target", "sampled", "fixed", "adaptive", "measured"]
+MODES = ["target", "sampled", "fixed", "measured"]
 OPEN_ENDED = [{"regex": "[0-9]+"}, {"json_schema": json.dumps({"type": "integer"})}]
 
 
@@ -204,12 +203,11 @@ def test_enum_value_prefix_does_not_end_a_longer_value(run, mode, target_text, e
     assert (result.token_ids, result.finish_reason) == (expected, reason)
 
 
-@pytest.mark.parametrize("adaptive", [False, True])
 @pytest.mark.parametrize("constraint", OPEN_ENDED)
 @pytest.mark.parametrize("draft_text", [None, "4271", "4"])
-def test_eos_rounding_ties_replay_to_the_target_only_result(run, adaptive, constraint, draft_text):
+def test_eos_rounding_ties_replay_to_the_target_only_result(run, constraint, draft_text):
     oracle = run("target", "427", **constraint)
-    result = run("adaptive" if adaptive else "fixed", "427", draft_text, rounding=True,
+    result = run("fixed", "427", draft_text, rounding=True,
                  measure=True, **constraint)
     assert (result.token_ids, result.finish_reason) == (oracle.token_ids, oracle.finish_reason)
     assert oracle.token_ids == [*ids("427"), EOS]

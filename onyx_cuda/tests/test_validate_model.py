@@ -47,7 +47,7 @@ def test_validation_failure_records_stage_and_does_not_claim_tested(monkeypatch,
     seen = []
     def precheck(selection, **kwargs):
         return selection._replace() if hasattr(selection, "_replace") else selection
-    def fail(selection, *, gamma, context_tokens, report, speculative_mode):
+    def fail(selection, *, gamma, context_tokens, report):
         seen.append((selection, gamma))
         report["support_level"] = "startup-verified"
         raise RuntimeError("secret local path")
@@ -75,7 +75,7 @@ def test_generation_gate_detects_wrong_tokens_even_when_text_matches(monkeypatch
         GenerationFinishedEvent(GenerationResult([2], None, "stop", None))]))
     pair = SimpleNamespace(target=SimpleNamespace(tokenizer=SimpleNamespace(decode=lambda *a, **k: "same")))
     with pytest.raises(RuntimeError, match="token oracle"):
-        validation.generation_check(pair, {"messages": [{"role": "user", "content": "hi"}]}, 2, "torch")
+        validation.generation_check(pair, {"messages": [{"role": "user", "content": "hi"}]}, 2)
 
 
 def test_check_preserves_nested_stage_failure():

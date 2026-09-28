@@ -57,7 +57,7 @@ def validate_output(payload, text, finish_reason):
     require(finish_reason in ("stop", "eos", "length"), "Unknown finish reason")
 
 
-def generation_check(pair, payload, gamma, adaptive=False):
+def generation_check(pair, payload, gamma):
     from onyx_cuda.generation import GenerationFinishedEvent
     from onyx_cuda.server import ChatCompletionRequest, prepare_generation
     from onyx_cuda.speculative import generate_speculative, generate_speculative_events, decode_speculative_events
@@ -69,7 +69,6 @@ def generation_check(pair, payload, gamma, adaptive=False):
     # Drop returned caches before running the next mode.
     del baseline
     arguments["gamma"] = gamma
-    arguments["adaptive"] = adaptive
     parts, terminal, timings = [], None, None
     for event in decode_speculative_events(generate_speculative_events(**arguments), pair.target.tokenizer):
         if isinstance(event, GenerationFinishedEvent):
@@ -190,8 +189,7 @@ def context_cache_check(loaded, context_tokens):
             "max_replay_logit_difference": (expected - replay).abs().max().item()}
 
 
-def validate_selected(selection, *, gamma, report, context_tokens=DEFAULT_CONTEXT_TOKENS,
-                      speculative_mode="fixed"):
+def validate_selected(selection, *, gamma, report, context_tokens=DEFAULT_CONTEXT_TOKENS):
     from fastapi.testclient import TestClient
     from onyx_cuda.device import require_cuda
     from onyx_cuda.server import create_app
@@ -202,7 +200,7 @@ def validate_selected(selection, *, gamma, report, context_tokens=DEFAULT_CONTEX
                         "cuda_runtime": torch.version.cuda}
     torch.cuda.reset_peak_memory_stats(device)
     app = create_app(load_engine=lambda: load_model_pair(include_draft=gamma > 0, selection=selection),
-                     gamma=gamma, speculative_mode=speculative_mode)
+                     gamma=gamma)
     try:
         with TestClient(app) as client:
             report["support_level"] = "startup-verified"
@@ -217,7 +215,7 @@ def validate_selected(selection, *, gamma, report, context_tokens=DEFAULT_CONTEX
             del loaded
             for name, payload in validation_cases():
                 expected = check(report, f"{name}.generation", lambda: executor.submit(
-                    generation_check, pair, payload, gamma, speculative_mode == "adaptive").result())
+                    generation_check, pair, payload, gamma).result())
                 report["checks"][-1]["result"] = expected
                 check(report, f"{name}.api_and_sse", lambda: api_check(client, payload, expected))
             if gamma > 0:
@@ -236,13 +234,11 @@ def validate_selected(selection, *, gamma, report, context_tokens=DEFAULT_CONTEX
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     add_selection_arguments(parser)
-    parser.add_argument("--speculative-mode", choices=("fixed", "adaptive"), default="fixed")
     parser.add_argument("--context-tokens", type=int, choices=range(64, 131073), metavar="64..131072", default=DEFAULT_CONTEXT_TOKENS)
     args = parser.parse_args(argv)
     reserve_report(args.output)
     report = evidence("selected-model-validation")
     report["settings"] = {"gamma": args.gamma,
-                          "speculative_mode": args.speculative_mode,
                           "corpus": "onyx-selected-model-v1", "precision": "float16",
                           "max_output_tokens": 64, "sampling_seed": 17, "context_tokens": args.context_tokens}
     report["limitations"] = [
@@ -259,8 +255,7 @@ def main(argv=None):
             selection, gamma=args.gamma, context_tokens=args.context_tokens, report=report["preflight"]))
         report["support_level"] = "prechecked"
         check(report, "cuda.validation", lambda: validate_selected(
-            selection, gamma=args.gamma, context_tokens=args.context_tokens,
-            speculative_mode=args.speculative_mode, report=report))
+            selection, gamma=args.gamma, context_tokens=args.context_tokens, report=report))
     except Exception as error:
         report["status"] = "failed"
         print(f"Selected model validation failed: {error}", file=sys.stderr)

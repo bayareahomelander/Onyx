@@ -1,4 +1,4 @@
-"""Fixed and adaptive speculative token generation through one event loop."""
+"""Fixed-gamma speculative token generation through one event loop."""
 
 import time
 from collections.abc import Iterable, Iterator, Sequence
@@ -8,7 +8,6 @@ import torch
 from transformers import PreTrainedModel
 
 from onyx_cuda.cache import CacheState
-from onyx_cuda.adaptive import AdaptiveController
 from onyx_cuda.numerics import GreedyCheckpoint, ambiguous_logits
 from onyx_cuda.generation import (
     AcceptedTokenEvent,
@@ -217,7 +216,6 @@ def _verify_proposal(
     grammar_state: int | None = None,
     live_grammar_states: set[int] | None = None,
     mask_times: list[float] | None = None,
-    maintain_draft: bool = True,
     checkpoint: GreedyCheckpoint | None = None,
     generated_token_ids: list[int] | None = None,
     eos_token_ids: Sequence[int] = (),
@@ -315,7 +313,7 @@ def _verify_proposal(
             continue
         break
 
-    if maintain_draft and accepted == len(proposal.token_ids):
+    if accepted == len(proposal.token_ids):
         draft_token_id = proposal.token_ids[-1] if proposal.token_ids else current_token_id
         with torch.inference_mode():
             draft_cache.extend(
@@ -327,9 +325,7 @@ def _verify_proposal(
             )
 
     target_cache.crop(target_length_before + accepted + 1)
-    if draft_cache is not None:
-        retained_length = proposal.draft_cache_length_before + accepted + 1
-        draft_cache.crop(retained_length if maintain_draft else min(draft_cache.length, retained_length))
+    draft_cache.crop(proposal.draft_cache_length_before + accepted + 1)
     if replayed:
         checkpoint.commit(target_cache, input_ids, accepted, target_logits)
     elif checkpoint is not None and input_ids.shape[1] == 1:
@@ -370,24 +366,6 @@ def _start_draft_cache(draft_model, prompt_token_ids, max_tokens):
     return cache
 
 
-def _catch_up_draft(draft_model, draft_cache, prompt_token_ids, generated) -> None:
-    """Consume accepted history, leaving the current token for the next proposal.
-
-    Chunking bounds vocabulary logits and attention workspace during recovery.
-    The cache may lag after target-only steps or a fully accepted proposal.
-    """
-    offset = draft_cache.length - len(prompt_token_ids)
-    end = len(generated) - 1
-    if not 0 <= offset <= end:
-        raise RuntimeError("Draft cache is not a prefix of accepted history")
-    with torch.inference_mode():
-        for start in range(offset, end, 32):
-            draft_cache.extend(draft_model, torch.tensor(
-                [generated[start:min(start + 32, end)]],
-                device=draft_cache.device,
-            ))
-
-
 def generate_speculative_events(
     draft_model: PreTrainedModel | None,
     target_model: PreTrainedModel,
@@ -404,11 +382,8 @@ def generate_speculative_events(
     regex: str | None = None,
     token_byte_vocabulary: TokenByteVocabulary | None = None,
     json_schema: str | None = None,
-    adaptive: bool = False,
 ) -> Iterator[AcceptedTokenEvent | GenerationFinishedEvent]:
     """Yield accepted tokens and one terminal result from one generation loop."""
-    if not isinstance(adaptive, bool):
-        raise ValueError("adaptive must be a boolean")
     if isinstance(gamma, bool) or not isinstance(gamma, int) or gamma < 0:
         raise ValueError("gamma must be a nonnegative integer (0 disables speculation)")
     _validate_generation_options(max_tokens, temperature, top_p, seed)
@@ -461,21 +436,14 @@ def generate_speculative_events(
     draft_seconds = 0.0
     verify_seconds = 0.0
     measurement_device = None
-    controller = AdaptiveController() if adaptive else None
-    runtime_device = next(target_model.parameters()).device if adaptive else None
-    draft_setup_seconds = 0.0
     if measure:
         measurement_device = next(target_model.parameters()).device
         _synchronize_device(measurement_device)
         started_at = time.perf_counter()
-    elif adaptive:
-        _synchronize_device(runtime_device)
-        started_at = time.perf_counter()
 
+    draft_cache = None
     try:
-        draft_cache = None
-        if not adaptive:
-            draft_cache = _start_draft_cache(draft_model, prompt_token_ids, max_tokens)
+        draft_cache = _start_draft_cache(draft_model, prompt_token_ids, max_tokens)
         target_prefill = prefill(target_model, prompt_token_ids)
         target_cache = CacheState.from_prefill(
             target_prefill.past_key_values, target_prefill.logits.device
@@ -554,41 +522,23 @@ def generate_speculative_events(
             checkpoint.seed(target_cache, target_prefill.logits)
         del target_prefill
         while not finished and len(generated) < max_tokens:
-            active_gamma = controller.choose(max_tokens - len(generated)) if controller else gamma
             ready_events = []
-            generated_before = len(generated)
-            catchup_seconds = 0.0
-            if controller:
-                # A completed host-visible token fences every target step. The
-                # boundary here also excludes time suspended at a stream yield.
-                iteration_started = time.perf_counter()
-                if active_gamma and draft_cache is None:
-                    draft_cache = _start_draft_cache(draft_model, prompt_token_ids, max_tokens)
-                    _synchronize_device(runtime_device)
-                    draft_setup_seconds += time.perf_counter() - iteration_started
-                    iteration_started = time.perf_counter()
-                if active_gamma:
-                    catchup_started = time.perf_counter()
-                    _catch_up_draft(draft_model, draft_cache, prompt_token_ids, generated)
-                    _synchronize_device(runtime_device)
-                    catchup_seconds = time.perf_counter() - catchup_started
             if constraint is not None and grammar_choices is None:
                 # Shared by the draft's first proposal and the target's first check.
                 grammar_choices = _timed_grammar_choices(
                     constraint, grammar_state, eos_token_ids, mask_times
                 )
-            speculative_iteration_count += int(active_gamma > 0)
+            speculative_iteration_count += 1
             if measurement_device is not None:
                 _synchronize_device(measurement_device)
                 draft_started_at = time.perf_counter()
                 mask_seconds_before = sum(mask_times)
             states_before_draft = set(live_grammar_states)
-            proposal_started = time.perf_counter() if controller else None
             proposal = propose_tokens(
                 draft_model,
                 draft_cache,
                 generated,
-                active_gamma,
+                gamma,
                 max_tokens - len(generated) - 1,
                 eos_token_ids,
                 stop_sequences,
@@ -597,8 +547,7 @@ def generate_speculative_events(
                 live_grammar_states=(live_grammar_states if constraint is not None else None),
                 mask_times=mask_times,
                 grammar_choices=grammar_choices,
-            ) if active_gamma else ProposalResult([], 0, 0)
-            proposal_seconds = time.perf_counter() - proposal_started if controller else None
+            )
             proposed_token_count += len(proposal.token_ids)
             if measurement_device is not None:
                 _synchronize_device(measurement_device)
@@ -615,7 +564,7 @@ def generate_speculative_events(
                 mask_seconds_before = sum(mask_times)
             verified, verified_grammar_states = _verify_proposal(
                 draft_model,
-                draft_cache if active_gamma or not adaptive else None,
+                draft_cache,
                 target_model,
                 target_cache,
                 generated[-1],
@@ -624,7 +573,6 @@ def generate_speculative_events(
                 grammar_state=grammar_state,
                 live_grammar_states=(live_grammar_states if constraint is not None else None),
                 mask_times=mask_times,
-                maintain_draft=not adaptive,
                 checkpoint=checkpoint,
                 generated_token_ids=generated,
                 eos_token_ids=eos_token_ids,
@@ -690,14 +638,6 @@ def generate_speculative_events(
                 )
                 grammar_state = retained_grammar_state
 
-            if controller:
-                _synchronize_device(runtime_device)
-                controller.observe(active_gamma, len(proposal.token_ids),
-                                   verified.accepted_proposal_count,
-                                   max(len(generated) - generated_before, 0),
-                                   time.perf_counter() - iteration_started,
-                                   catchup_seconds=catchup_seconds,
-                                   proposal_seconds=proposal_seconds)
             for ready_token_id in ready_events:
                 yield AcceptedTokenEvent(ready_token_id)
 
@@ -751,8 +691,6 @@ def generate_speculative_events(
             verification_replays=checkpoint.replays,
             canonical_replay_tokens=checkpoint.replayed_tokens,
             replay_stats=checkpoint.report(),
-            adaptive_stats=({**controller.report(), **checkpoint.report(), "draft_setup_seconds": draft_setup_seconds}
-                            if controller else None),
         )
     yield GenerationFinishedEvent(
         GenerationResult(generated, past_key_values, finish_reason, timings)
@@ -775,7 +713,6 @@ def generate_speculative(
     regex: str | None = None,
     token_byte_vocabulary: TokenByteVocabulary | None = None,
     json_schema: str | None = None,
-    adaptive: bool = False,
 ) -> GenerationResult:
     """Collect the shared event stream into the established result shape."""
     accepted_token_ids = []
@@ -794,7 +731,6 @@ def generate_speculative(
         regex=regex,
         token_byte_vocabulary=token_byte_vocabulary,
         json_schema=json_schema,
-        adaptive=adaptive,
     )
     try:
         for event in events:

@@ -247,18 +247,7 @@ def test_server_defaults_to_speculation_and_allows_target_only(monkeypatch):
         create_app(gamma=-1)
 
 
-def test_adaptive_mode_is_explicit_and_frozen_at_creation(monkeypatch):
-    monkeypatch.setenv("ONYX_SPECULATIVE_MODE", "adaptive")
-    app = create_app(load_engine=lambda: object())
-    monkeypatch.setenv("ONYX_SPECULATIVE_MODE", "fixed")
-    with TestClient(app) as client:
-        assert client.get("/").json()["speculative_mode"] == "adaptive"
-    assert create_app(speculative_mode="fixed").state.speculative_mode == "fixed"
-    with pytest.raises(ValueError, match="SPECULATIVE_MODE"):
-        create_app(speculative_mode="typo")
-
-
-@pytest.mark.parametrize("name,value", [("ONYX_GREEDY_BACKEND", "cuda")])
+@pytest.mark.parametrize("name,value", [("ONYX_GREEDY_BACKEND", "cuda"), ("ONYX_SPECULATIVE_MODE", "adaptive")])
 def test_removed_settings_fail_before_startup(monkeypatch, name, value):
     monkeypatch.setenv(name, value)
     with pytest.raises(ValueError, match=f"{name}={value} is no longer supported"):
@@ -266,4 +255,5 @@ def test_removed_settings_fail_before_startup(monkeypatch, name, value):
     # The value that matched the remaining behavior is accepted.
     monkeypatch.setenv(name, REMOVED_SETTINGS[name])
     with TestClient(create_app(engine=object())) as client:
-        assert "greedy_backend" not in client.get("/").json()
+        root = client.get("/").json()
+        assert "greedy_backend" not in root and "speculative_mode" not in root

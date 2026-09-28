@@ -1,4 +1,4 @@
-"""Predetermined, paired comparison of fixed gamma 0/2 and adaptive generation.
+"""Paired speed comparison of target-only and fixed gamma 2 speculative generation.
 
 Every mode runs in one interleaved comparison. On a target that supports graph
 recovery, graphs are prepared once and stay resident for all modes, but only
@@ -13,7 +13,6 @@ import json
 import platform
 import statistics
 import time
-import random
 from pathlib import Path
 
 import torch
@@ -30,22 +29,18 @@ from onyx_cuda.speculative import generate_speculative_events
 from onyx_cuda.vocabulary import get_token_byte_vocabulary
 from onyx_cuda._validation_report import evidence
 
-# Mode: (gamma, adaptive, graph recovery). Promotion gates use the scalar modes.
+# Mode: (gamma, graph recovery).
 MODES = {
-    "gamma0": (0, False, False),
-    "gamma2": (2, False, False),
-    "adaptive": (2, True, False),
-    "gamma2_graph": (2, False, True),
-    "adaptive_graph": (2, True, True),
+    "gamma0": (0, False),
+    "gamma2": (2, False),
+    "gamma2_graph": (2, True),
 }
-GATES = {"retained_savings_fraction": 0.9, "remaining_regression_fraction": 0.8,
-         "aggregate_latency_tolerance": 0.02}
 
 
 def select_modes(replay_configuration):
     """Graph modes run only when graphs are active; otherwise they would repeat scalar timings."""
     graph = replay_configuration["active"] == "graph"
-    return [mode for mode, (_, _, uses_graph) in MODES.items() if graph or not uses_graph]
+    return [mode for mode, (_, uses_graph) in MODES.items() if graph or not uses_graph]
 
 
 def use_replay_backend(model, backend):
@@ -59,45 +54,17 @@ def use_replay_backend(model, backend):
 def summarize(cases):
     modes = [mode for mode in MODES if cases and mode in cases[0]["median_seconds"]]
     totals = {mode: sum(c["median_seconds"][mode] for c in cases) for mode in modes}
-    winners = [c for c in cases if c["original"] and c["median_seconds"]["gamma2"] < c["median_seconds"]["gamma0"]]
-    losers = [c for c in cases if c["median_seconds"]["gamma2"] > c["median_seconds"]["gamma0"]]
-    savings = sum(c["median_seconds"]["gamma0"] - c["median_seconds"]["gamma2"] for c in winners)
-    retained = sum(c["median_seconds"]["gamma0"] - c["median_seconds"]["adaptive"] for c in winners)
-    excess = {mode: sum(max(c["median_seconds"][mode] - c["median_seconds"]["gamma0"], 0) for c in losers)
-              for mode in ("gamma2", "adaptive")}
+    slower = {mode: [c["name"] for c in cases if c["median_seconds"][mode] > c["median_seconds"]["gamma0"]]
+              for mode in modes if mode != "gamma0"}
     summary = {"total_median_seconds": totals,
                "speedup_vs_target": {m: totals["gamma0"] / totals[m] for m in modes},
-               "original_winner_savings_retained": retained / savings if savings else None,
-               "regression_seconds": excess,
-               "gates": {
-                   "retained_gains": retained >= GATES["retained_savings_fraction"] * savings if winners else None,
-                   "reduced_regressions": excess["adaptive"] <= GATES["remaining_regression_fraction"] * excess["gamma2"] if losers else None,
-                   "aggregate": totals["adaptive"] <= totals["gamma2"] * (1 + GATES["aggregate_latency_tolerance"]),
-                   "recovery_observed": any(
-                       (r.get("adaptive_stats") or {}).get("recovery_count", 0) > 0
-                       for c in cases for r in c["runs"]["adaptive"]),
-               }}
+               "slower_than_target": slower}
     if "gamma2_graph" in totals:
         summary["graph_latency_reduction_vs_scalar"] = 1 - totals["gamma2_graph"] / totals["gamma2"]
     return summary
 
 
-def paired_latency_interval(runs, reference="gamma2", draws=1000):
-    """Reproducible paired-bootstrap interval for the ratio of median latencies."""
-    count = len(runs[reference])
-    if count < 2:
-        return None
-    rng = random.Random(0)
-    ratios = []
-    for _ in range(draws):
-        indices = [rng.randrange(count) for _ in range(count)]
-        ratios.append(statistics.median(runs["adaptive"][i]["seconds"] for i in indices) /
-                      statistics.median(runs[reference][i]["seconds"] for i in indices))
-    ratios.sort()
-    return [ratios[int(draws * 0.025)], ratios[int(draws * 0.975)]]
-
-
-def run(output, *, repetitions=10, split="all", measure=False):
+def run(output, *, repetitions=3, split="all", measure=False):
     if output.exists():
         raise ValueError("Choose a new output filename; benchmark evidence is not overwritten")
     corpus_bytes = json.dumps(CORPUS, sort_keys=True).encode()
@@ -113,8 +80,8 @@ def run(output, *, repetitions=10, split="all", measure=False):
     report = {"corpus_sha256": hashlib.sha256(corpus_bytes).hexdigest(), "corpus_version": 1,
               "settings": {"repetitions": repetitions, "warmups": 1, "split": split,
                            "measure": measure, "temperature": 0, "enable_thinking": False,
-                           "dtype": "float16", "gates": GATES,
-                           "modes": {mode: dict(zip(("gamma", "adaptive", "graph_recovery"), MODES[mode]))
+                           "dtype": "float16",
+                           "modes": {mode: dict(zip(("gamma", "graph_recovery"), MODES[mode]))
                                      for mode in modes},
                            "replay_backend": replay_configuration,
                            "draft_backend": draft_configuration},
@@ -122,9 +89,8 @@ def run(output, *, repetitions=10, split="all", measure=False):
                          for role in ("draft", "target")},
               "environment": {"python": platform.python_version(), "torch": str(torch.__version__),
                               "transformers": transformers.__version__, "gpu": torch.cuda.get_device_name()},
-              "cases": [], "complete": False, "correctness_passed": False,
-              "eligible_for_promotion": False}
-    report["source"] = evidence("adaptive-comparison")["source"]
+              "cases": [], "complete": False, "correctness_passed": False}
+    report["source"] = evidence("speedup-comparison")["source"]
     report["settings"]["allow_fp16_reduced_precision_reduction"] = torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction
     output.parent.mkdir(parents=True, exist_ok=True)
 
@@ -144,7 +110,7 @@ def run(output, *, repetitions=10, split="all", measure=False):
 
             def generate(mode):
                 nonlocal expected
-                gamma, adaptive, graph = MODES[mode]
+                gamma, graph = MODES[mode]
                 use_replay_backend(target_model, graphs if graph else None)
                 torch.cuda.synchronize(device)
                 torch.cuda.reset_peak_memory_stats(device)
@@ -152,7 +118,7 @@ def run(output, *, repetitions=10, split="all", measure=False):
                 first = None
                 ids = []
                 result = None
-                events = generate_speculative_events(**args, gamma=gamma, adaptive=adaptive, measure=measure)
+                events = generate_speculative_events(**args, gamma=gamma, measure=measure)
                 try:
                     for event in events:
                         if isinstance(event, AcceptedTokenEvent):
@@ -181,7 +147,6 @@ def run(output, *, repetitions=10, split="all", measure=False):
                     raise RuntimeError(f"Incomplete output: {case['name']} / {mode}")
                 return {"seconds": seconds, "ttft_seconds": first, "token_ids": ids,
                         "finish_reason": result.finish_reason,
-                        "adaptive_stats": getattr(result.timings, "adaptive_stats", None),
                         "replay_stats": getattr(result.timings, "replay_stats", None),
                         "peak_allocated_bytes": torch.cuda.max_memory_allocated(device)}
 
@@ -201,7 +166,6 @@ def run(output, *, repetitions=10, split="all", measure=False):
                 raise RuntimeError(f"Retained GPU allocation: {case['name']}")
             row = {**case, "prompt_token_count": len(prompt.token_ids), "runs": runs,
                    "median_seconds": {mode: statistics.median(r["seconds"] for r in runs[mode]) for mode in modes},
-                   "adaptive_latency_ratio_95pct_interval": paired_latency_interval(runs),
                    "min_max_seconds": {mode: [min(r["seconds"] for r in runs[mode]),
                                                 max(r["seconds"] for r in runs[mode])] for mode in modes}}
             report["cases"].append(row)
@@ -210,8 +174,6 @@ def run(output, *, repetitions=10, split="all", measure=False):
             print(case["name"], row["median_seconds"], flush=True)
         report["complete"] = True
         report["correctness_passed"] = True
-        report["eligible_for_promotion"] = (split == "all" and repetitions >= 10 and
-                                            all(report["summary"]["gates"].values()))
     except Exception as error:
         report["error"] = str(error)
         raise
@@ -226,7 +188,7 @@ def run(output, *, repetitions=10, split="all", measure=False):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--repetitions", type=int, default=10)
+    parser.add_argument("--repetitions", type=int, default=3)
     parser.add_argument("--split", choices=("development", "heldout", "all"), default="all")
     parser.add_argument("--measure", action="store_true", help="Separate instrumented diagnostic run")
     args = parser.parse_args()

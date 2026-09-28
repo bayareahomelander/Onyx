@@ -22,7 +22,7 @@ from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator
 
 from onyx_cuda.config import (reject_removed_settings, resolve_model_selection,
                               DEFAULT_GAMMA, DEFAULT_CONTEXT_TOKENS, DEFAULT_OUTPUT_TOKENS,
-                              resolve_service_limits, resolve_speculative_mode)
+                              resolve_service_limits)
 
 MODEL_ID = "onyx-speculative"
 SERVICE_VERSION = "0.1.0"
@@ -478,8 +478,7 @@ def _stream_error_payload(error: BaseException) -> str:
 
 
 def _sse_events(request: ChatCompletionRequest, engine, *, gamma: int = GAMMA,
-                prompt_token_ids: list[int] | None = None,
-                adaptive: bool = False):
+                prompt_token_ids: list[int] | None = None):
     completion_id = f"chatcmpl-{uuid4().hex[:12]}"
     created = int(time())
     model = request.model
@@ -488,7 +487,6 @@ def _sse_events(request: ChatCompletionRequest, engine, *, gamma: int = GAMMA,
         yield _sse(_chunk_json(completion_id, created, model, role="assistant"))
         arguments = prepare_generation(request, engine, gamma=gamma, prompt_token_ids=prompt_token_ids)
         arguments["measure"] = True
-        arguments["adaptive"] = adaptive
         events = _completion_event_iter(arguments, engine.target.tokenizer, request.stop)
         finish_reason = None
         json_parts = []
@@ -536,7 +534,6 @@ async def _stream_chat_completion(app: FastAPI, request: ChatCompletionRequest, 
     def worker() -> None:
         stream = _sse_events(
             request, engine, gamma=app.state.speculative_gamma,
-            adaptive=app.state.speculative_mode == "adaptive",
             prompt_token_ids=prompt_token_ids,
         )
         try:
@@ -598,7 +595,6 @@ def create_app(
     engine: Any | None = None,
     load_engine: Callable[[], Any] | None = None,
     gamma: int | None = None,
-    speculative_mode: str | None = None,
     replay_backend: str | None = None,
     draft_backend: str | None = None,
     target_model: str | None = None,
@@ -608,7 +604,6 @@ def create_app(
 ) -> FastAPI:
     reject_removed_settings()
     limits = resolve_service_limits()
-    speculative_mode = resolve_speculative_mode(speculative_mode)
     from onyx_cuda.replay_backend import resolve_replay_backend
     from onyx_cuda.draft_backend import resolve_draft_backend
     replay_backend = resolve_replay_backend(replay_backend)
@@ -673,8 +668,8 @@ def create_app(
         logging.getLogger("uvicorn.error").info("Onyx CUDA draft backend: %s",
                                                json.dumps(app.state.draft_configuration))
         logging.getLogger("uvicorn.error").info(
-            "Onyx CUDA loaded models: %s; gamma=%s; mode=%s",
-            json.dumps(app.state.model_configuration), gamma, speculative_mode,
+            "Onyx CUDA loaded models: %s; gamma=%s",
+            json.dumps(app.state.model_configuration), gamma,
         )
         app.state.engine_locks = {model_id: asyncio.Lock() for model_id in app.state.engines}
         # Reuse CUDA/cuBLAS thread-local state across every generation mode.
@@ -700,7 +695,6 @@ def create_app(
     )
     app.state.limits = limits
     app.state.speculative_gamma = gamma
-    app.state.speculative_mode = speculative_mode
     app.add_middleware(RequestCapacityMiddleware, capacity=limits.active_requests)
     app.add_exception_handler(ValueError, _invalid_request)
     app.add_exception_handler(OSError, _service_unavailable)
@@ -721,7 +715,6 @@ def create_app(
             "service": "Onyx CUDA API",
             "version": SERVICE_VERSION,
             "speculative_gamma": app.state.speculative_gamma,
-            "speculative_mode": app.state.speculative_mode,
             "replay_backend": active_replay,
             "draft_backend": active_draft,
             "models": app.state.model_configuration,
@@ -789,7 +782,6 @@ def create_app(
             arguments = prepare_generation(request, engine, gamma=app.state.speculative_gamma,
                                            prompt_token_ids=prompt_token_ids)
             arguments["measure"] = True
-            arguments["adaptive"] = app.state.speculative_mode == "adaptive"
             prompt_tokens = len(arguments["prompt_token_ids"])
             completion_tokens = 0
             choices = []

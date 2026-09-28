@@ -64,7 +64,6 @@ class GenerationTimings(NamedTuple):
     draft_seconds: float | None = None
     verify_seconds: float | None = None
     mask_seconds: float | None = None
-    adaptive_stats: dict | None = None
     verification_replays: int | None = None
     canonical_replay_tokens: int | None = None
     replay_stats: dict | None = None

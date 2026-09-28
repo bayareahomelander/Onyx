@@ -113,7 +113,6 @@ Set environment variables in the server's terminal before startup:
 | `ONYX_TARGET_MODEL`, `ONYX_DRAFT_MODEL` | `Qwen/Qwen3-8B`, `Qwen/Qwen2.5-0.5B-Instruct` | Hugging Face model IDs |
 | `ONYX_TARGET_REVISION`, `ONYX_DRAFT_REVISION` | Pinned revisions | Commit hashes for custom models |
 | `ONYX_SPECULATIVE_GAMMA` | `2` | Draft tokens per step; `0` selects target-only generation |
-| `ONYX_SPECULATIVE_MODE` | `fixed` | `adaptive` opts into the experimental adaptive controller |
 | `ONYX_DRAFT_BACKEND` | `graph` | `eager` uses the ordinary draft forward |
 | `ONYX_REPLAY_BACKEND` | `auto` | `scalar` disables graph recovery; `graph` requires it on any CUDA capability 7.5 GPU and fails startup if it cannot be prepared |
 | `ONYX_MAX_CONTEXT_TOKENS` | `8192` | Prompt plus requested output tokens |
@@ -138,8 +137,7 @@ per-case median generation times, excluding model loading and graph setup:
 | Fixed gamma 2, draft graphs, scalar recovery (`ONYX_REPLAY_BACKEND=scalar`) | 1.291x |
 | Fixed gamma 2, draft graphs, graph recovery (default on this GPU) | **1.396x** |
 
-Every output in every mode matched target-only tokens and finish reasons.
-Adaptive speculation, still experimental, measured 1.237x and 1.367x. Ten cases
+Every output in every mode matched target-only tokens and finish reasons. Ten cases
 remain slower than target-only: seven very short requests (at most 24 ms slower)
 and three recovery-heavy prose requests. The September 25 comparison, which also
 timed the ordinary draft forward, measured 1.130x and 1.211x without draft graphs;
@@ -165,8 +163,8 @@ To reproduce the comparison on your GPU, use a new output filename for each run:
 python -m onyx_cuda.benchmark_adaptive --split all --repetitions 3 --output validation/speedups.json
 ```
 
-One interleaved run times target-only, fixed gamma 2, and adaptive speculation,
-and adds graph-recovery modes when the GPU supports them (compute capability 7.5).
+One interleaved run times target-only and fixed gamma 2 generation, and adds a
+graph-recovery mode when the GPU supports it (compute capability 7.5).
 Every mode uses the configured draft backend, draft graphs by default. Every
 speculative output must match target-only generation token for token. The report
 records which modes ran and why a graph backend was unavailable.
