@@ -1,5 +1,5 @@
-# Windows x64 / Python 3.12 validation constraints. Torch's CPU or cu124
-# wheel is selected explicitly by scripts/validate_windows.ps1.
+# Windows x64 / Python 3.12 validation constraints. Install Torch's cu124
+# wheel explicitly, as in the README setup.
 accelerate==1.12.0
 annotated-doc==0.0.5
 annotated-types==0.8.0

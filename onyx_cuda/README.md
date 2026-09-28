@@ -207,7 +207,6 @@ does not apply to constrained requests.
 src/onyx_cuda/  CUDA inference, token selection, and API
 rust/          Native regex and JSON Schema engine
 tests/         Unit, API, and real-GPU tests
-scripts/       Windows package validation
 ```
 
 ## License
