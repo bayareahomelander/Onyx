@@ -54,13 +54,12 @@ class GreedyCheckpoint:
     Its grammar handles share the generation loop's final cleanup registry.
     """
 
-    def __init__(self, model, prompt_ids, constraint, live_states, backend, *,
+    def __init__(self, model, prompt_ids, constraint, live_states, *,
                  eos_token_ids=(), measure=False):
         self.model = model
         self.prompt_ids = prompt_ids
         self.constraint = constraint
         self.live_states = live_states
-        self.backend = backend
         self.eos_token_ids = eos_token_ids
         self.cache = None
         self.logits = None
@@ -128,7 +127,7 @@ class GreedyCheckpoint:
         if self.constraint is None:
             return self.logits.argmax(-1).item()
         choices = _grammar_choices(self.constraint, self.state, self.eos_token_ids)
-        return grammar_argmax(self.logits, choices, backend=self.backend).item()
+        return grammar_argmax(self.logits, choices).item()
 
     def _advance_state(self, token):
         # EOS ends generation and has no grammar bytes to consume.
@@ -210,7 +209,7 @@ class GreedyCheckpoint:
                         choices = _grammar_choices(self.constraint, state, self.eos_token_ids)
                         if not choices:
                             break
-                        token = grammar_argmax(row[:, -1, :], choices, backend=self.backend).item()
+                        token = grammar_argmax(row[:, -1, :], choices).item()
                     else:
                         token = row[:, -1, :].argmax(-1).item()
                     if i + 1 < batch.shape[1] and token != batch[0, i + 1].item():

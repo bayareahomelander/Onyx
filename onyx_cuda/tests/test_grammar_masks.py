@@ -106,5 +106,5 @@ def test_mask_selection_is_bitwise_identical_to_id_selection(dtype):
         blocked[valid] = False
         mask = TokenMask(blocked, len(valid))
         assert torch.equal(apply_grammar_mask(logits, mask), apply_grammar_mask(logits, valid))
-        assert torch.equal(grammar_argmax(logits, mask, backend="torch"),
-                           grammar_argmax(logits, valid, backend="torch"))
+        assert torch.equal(grammar_argmax(logits, mask),
+                           grammar_argmax(logits, valid))

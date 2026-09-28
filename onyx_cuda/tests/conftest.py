@@ -12,26 +12,18 @@ def isolate_model_selection(monkeypatch):
     from onyx_cuda.config import MODEL_ENVIRONMENT_VARIABLES
 
     for name in (*MODEL_ENVIRONMENT_VARIABLES, "ONYX_MAX_CONTEXT_TOKENS", "ONYX_MAX_OUTPUT_TOKENS",
-                 "ONYX_MAX_ACTIVE_REQUESTS", "ONYX_STREAM_BUFFER_CHUNKS", "ONYX_SPECULATIVE_MODE",
+                 "ONYX_MAX_ACTIVE_REQUESTS", "ONYX_STREAM_BUFFER_CHUNKS", "ONYX_SPECULATIVE_MODE", "ONYX_GREEDY_BACKEND",
                  "ONYX_REPLAY_BACKEND", "ONYX_DRAFT_BACKEND"):
         monkeypatch.delenv(name, raising=False)
 
 
 def pytest_addoption(parser):
-    parser.addoption("--require-kernels", action="store_true", help="Require CUDA and initialize custom kernels")
     parser.addoption("--require-cuda", action="store_true", help="Fail if CUDA is unavailable")
 
 
 def pytest_configure(config):
     if config.getoption("--require-cuda") and not torch.cuda.is_available():
         raise pytest.UsageError("--require-cuda needs an NVIDIA GPU and a CUDA PyTorch build")
-    if config.getoption("--require-kernels"):
-        from onyx_cuda.config import initialize_greedy_backend
-
-        try:
-            initialize_greedy_backend("cuda")
-        except Exception as error:
-            raise pytest.UsageError(f"--require-kernels needs working custom CUDA kernels: {error}") from error
 
 
 def pytest_collection_modifyitems(config, items):

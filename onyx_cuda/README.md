@@ -87,7 +87,7 @@ a successful `stop` finish event; `[DONE]` alone is insufficient.
 | Draft decoding | CUDA graphs for the pinned draft; ordinary forward otherwise |
 | Thinking | Disabled |
 | Context / maximum output | 8192 tokens including prompt / 4096 output tokens |
-| Token selection / recovery | Torch / graph recovery on the validated Linux RTX 2080 Ti, scalar elsewhere |
+| Numerical recovery | Graph recovery on the validated Linux RTX 2080 Ti, scalar elsewhere |
 
 No model overrides are needed for the default setup.
 
@@ -116,7 +116,6 @@ Set environment variables in the server's terminal before startup:
 | `ONYX_SPECULATIVE_MODE` | `fixed` | `adaptive` opts into the experimental adaptive controller |
 | `ONYX_DRAFT_BACKEND` | `graph` | `eager` uses the ordinary draft forward |
 | `ONYX_REPLAY_BACKEND` | `auto` | `scalar` disables graph recovery; `graph` requires it on any CUDA capability 7.5 GPU and fails startup if it cannot be prepared |
-| `ONYX_GREEDY_BACKEND` | `torch` | `cuda` uses the optional custom selector (install `.[kernels]`; needs CUDA Toolkit 12.4) |
 | `ONYX_MAX_CONTEXT_TOKENS` | `8192` | Prompt plus requested output tokens |
 | `ONYX_MAX_OUTPUT_TOKENS` | `4096` | Maximum requested output; omitted budgets use the smaller of 1024 and this limit |
 | `ONYX_MAX_ACTIVE_REQUESTS` | `8` | Running or queued completions; excess requests receive HTTP 429 |

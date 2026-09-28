@@ -51,7 +51,7 @@ def test_chunks_check_prefix_and_rollback_before_scalar_fallback(behavior):
             logits[:, :, 4] = 2
         return logits
     model = SimpleNamespace(_onyx_replay_backend=SimpleNamespace(extend=extend))
-    checkpoint = GreedyCheckpoint(model, [8], None, set(), "torch")
+    checkpoint = GreedyCheckpoint(model, [8], None, set())
     cache = HistoryCache()
     initial = torch.zeros(1, 9); initial[:, 5] = 1
     checkpoint.seed(cache, initial)
@@ -66,7 +66,7 @@ def test_chunks_check_prefix_and_rollback_before_scalar_fallback(behavior):
 
 def test_bad_prefix_still_raises_after_chunk_fallback():
     model = SimpleNamespace(_onyx_replay_backend=SimpleNamespace(extend=lambda cache, ids: cache.extend(None, ids)))
-    checkpoint = GreedyCheckpoint(model, [8], None, set(), "torch")
+    checkpoint = GreedyCheckpoint(model, [8], None, set())
     cache = HistoryCache(); initial = torch.zeros(1, 9); initial[:, 5] = 1
     checkpoint.seed(cache, initial)
     with pytest.raises(RuntimeError, match="noncanonical emitted prefix"):
@@ -87,7 +87,7 @@ def test_history_blocks_preserve_cache_and_proposal_boundary(history, widths):
         calls.append(ids.shape[1])
         return cache.extend(None, ids)
     model = SimpleNamespace(_onyx_replay_backend=SimpleNamespace(extend=extend))
-    checkpoint = GreedyCheckpoint(model, [8], None, set(), "torch")
+    checkpoint = GreedyCheckpoint(model, [8], None, set())
     cache = HistoryCache()
     checkpoint.seed(cache, torch.nn.functional.one_hot(torch.tensor([5]), 9).float())
     # The rejected suffix must never enter either the history or proposal cache.
@@ -118,7 +118,7 @@ def test_wide_block_failure_discards_trial_and_preserves_committed_prefix(commit
             logits[:, bad_row, 4] = 2
         return logits
     model = SimpleNamespace(_onyx_replay_backend=SimpleNamespace(extend=extend))
-    checkpoint = GreedyCheckpoint(model, [8], None, set(), "torch")
+    checkpoint = GreedyCheckpoint(model, [8], None, set())
     cache = HistoryCache()
     checkpoint.seed(cache, torch.nn.functional.one_hot(torch.tensor([5]), 9).float())
     history = committed + 16
@@ -135,7 +135,7 @@ def test_wide_block_failure_discards_trial_and_preserves_committed_prefix(commit
 def test_wide_history_rejects_corrupt_emitted_and_current_tokens(bad_index):
     model = SimpleNamespace(_onyx_replay_backend=SimpleNamespace(
         extend=lambda cache, ids: cache.extend(None, ids)))
-    checkpoint = GreedyCheckpoint(model, [8], None, set(), "torch")
+    checkpoint = GreedyCheckpoint(model, [8], None, set())
     cache = HistoryCache()
     checkpoint.seed(cache, torch.nn.functional.one_hot(torch.tensor([5]), 9).float())
     generated = [5] * 18
@@ -159,7 +159,7 @@ def test_scalar_and_constrained_history_never_use_graphs(constrained, monkeypatc
         pytest.fail("Constrained history used graph recovery")
     model = SimpleNamespace(_onyx_replay_backend=SimpleNamespace(extend=unexpected)) if constrained else None
     monkeypatch.setattr("onyx_cuda.numerics.grammar_argmax", lambda logits, valid, **kw: logits.argmax(-1))
-    checkpoint = GreedyCheckpoint(model, [8], grammar, live, "torch")
+    checkpoint = GreedyCheckpoint(model, [8], grammar, live)
     cache = HistoryCache()
     checkpoint.seed(cache, torch.nn.functional.one_hot(torch.tensor([5]), 9).float())
     output = checkpoint.replay(cache, torch.tensor([[5, 4]]), [5] * 18)

@@ -2,8 +2,6 @@
 
 import torch
 
-from onyx_cuda.config import resolve_greedy_backend
-
 
 def _validate_mask_inputs(
     logits: torch.Tensor, valid_token_ids: list[int]
@@ -85,27 +83,6 @@ def apply_grammar_mask(
     return masked_logits
 
 
-def grammar_argmax(
-    logits: torch.Tensor, valid_token_ids: list[int], *, backend: str | None = None
-) -> torch.Tensor:
-    """Select a constrained greedy token; CUDA is an explicit optional backend.
-
-    Unhandled dtypes/ranks use the dense reference, preserving its precision.
-    Compilation/import failures for supported CUDA inputs are surfaced to callers.
-    """
-    backend = resolve_greedy_backend(backend)
-    if backend == "torch":
-        return apply_grammar_mask(logits, valid_token_ids).argmax(dim=-1)
-    if _usable_mask(logits, valid_token_ids):
-        token_ids = torch.nonzero(~valid_token_ids.blocked).flatten()
-    else:
-        valid_token_ids = _token_id_list(valid_token_ids)
-        _validate_mask_inputs(logits, valid_token_ids)
-        token_ids = None
-    if logits.dtype not in (torch.float16, torch.float32) or logits.ndim not in (1, 2):
-        return apply_grammar_mask(logits, valid_token_ids).argmax(dim=-1)
-    from onyx_cuda._sparse_argmax import sparse_argmax
-
-    if token_ids is None:
-        token_ids = torch.tensor(valid_token_ids, dtype=torch.long, device=logits.device)
-    return sparse_argmax(logits, token_ids)
+def grammar_argmax(logits: torch.Tensor, valid_token_ids: list[int]) -> torch.Tensor:
+    """Select the greedy token among the grammar's valid tokens."""
+    return apply_grammar_mask(logits, valid_token_ids).argmax(dim=-1)

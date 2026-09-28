@@ -55,7 +55,7 @@ def write_report(path, report):
 def evidence(kind):
     dependencies = {}
     for name in ("onyx-cuda", "torch", "transformers", "accelerate", "tokenizers", "huggingface-hub",
-                 "fastapi", "pydantic", "httpx", "cupy-cuda12x"):
+                 "fastapi", "pydantic", "httpx"):
         try:
             dependencies[name] = version(name)
         except PackageNotFoundError:

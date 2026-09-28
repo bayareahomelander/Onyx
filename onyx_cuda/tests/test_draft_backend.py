@@ -236,7 +236,7 @@ def test_speculation_with_graph_draft_matches_target_only():
                         prompt_token_ids=format_prompt(pair.target.tokenizer, case["messages"],
                                                        enable_thinking=False).token_ids,
                         max_tokens=min(case["max_tokens"], 160),
-                        eos_token_ids=pair.target.tokenizer.eos_token_id, greedy_backend="torch")
+                        eos_token_ids=pair.target.tokenizer.eos_token_id)
             if case["regex"] or case["json_schema"]:
                 args.update(regex=case["regex"], token_byte_vocabulary=vocabulary,
                             json_schema=json.dumps(case["json_schema"]) if case["json_schema"] else None)

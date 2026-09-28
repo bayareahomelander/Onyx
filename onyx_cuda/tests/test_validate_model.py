@@ -47,8 +47,8 @@ def test_validation_failure_records_stage_and_does_not_claim_tested(monkeypatch,
     seen = []
     def precheck(selection, **kwargs):
         return selection._replace() if hasattr(selection, "_replace") else selection
-    def fail(selection, *, gamma, backend, context_tokens, report, speculative_mode):
-        seen.append((selection, gamma, backend))
+    def fail(selection, *, gamma, context_tokens, report, speculative_mode):
+        seen.append((selection, gamma))
         report["support_level"] = "startup-verified"
         raise RuntimeError("secret local path")
     monkeypatch.setattr(validation, "precheck", precheck)
@@ -57,7 +57,7 @@ def test_validation_failure_records_stage_and_does_not_claim_tested(monkeypatch,
     assert validation.main(["--target-model", "example/custom", "--gamma", "2", "--output", str(output)]) == 1
     report = json.loads(output.read_text())
     assert seen[0][0].target_model == "example/custom"
-    assert seen[0][1:] == (2, "torch")
+    assert seen[0][1:] == (2,)
     assert report["status"] == "failed" and report["support_level"] == "startup-verified"
     assert report["checks"][-1]["status"] == "failed"
     assert "secret local path" not in output.read_text()

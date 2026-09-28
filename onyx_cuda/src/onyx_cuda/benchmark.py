@@ -15,7 +15,6 @@ import torch
 import transformers
 
 from onyx_cuda.generation import generate_tokens
-from onyx_cuda.config import resolve_greedy_backend
 from onyx_cuda.model import load_model_pair
 from onyx_cuda.prompt import format_prompt
 from onyx_cuda.speculative import generate_speculative
@@ -39,13 +38,11 @@ class BenchmarkOptions:
 
 
 def _comparison_settings(options=BenchmarkOptions()) -> dict:
-    backend = resolve_greedy_backend()
     return {
         "warmups": WARMUPS, "repetitions": REPETITIONS, "max_tokens": options.max_tokens,
         "enable_thinking": options.enable_thinking, "require_complete": options.require_complete,
-        "temperature": 0.0, "top_p": 1.0, "greedy_backend": backend,
+        "temperature": 0.0, "top_p": 1.0,
         "dtype": "float16", "timing_contract": "generation-includes-validation-v2",
-        "cupy": version("cupy-cuda12x") if backend == "cuda" else None,
     }
 
 

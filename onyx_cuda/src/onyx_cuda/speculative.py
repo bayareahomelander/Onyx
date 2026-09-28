@@ -10,7 +10,6 @@ from transformers import PreTrainedModel
 from onyx_cuda.cache import CacheState
 from onyx_cuda.adaptive import AdaptiveController
 from onyx_cuda.numerics import GreedyCheckpoint, ambiguous_logits
-from onyx_cuda.config import resolve_greedy_backend
 from onyx_cuda.generation import (
     AcceptedTokenEvent,
     GenerationFinishedEvent,
@@ -91,13 +90,12 @@ def _grammar_token(
     choices: list[int],
     logits: torch.Tensor,
     mask_times: list[float] | None = None,
-    greedy_backend: str | None = None,
 ):
     if mask_times is not None:
         if logits.device.type == "cuda":
             torch.cuda.synchronize(logits.device)
         started_at = time.perf_counter()
-    token_id = grammar_argmax(logits, choices, backend=greedy_backend)
+    token_id = grammar_argmax(logits, choices)
     if mask_times is not None:
         if logits.device.type == "cuda":
             torch.cuda.synchronize(logits.device)
@@ -136,7 +134,6 @@ def propose_tokens(
     grammar_state: int | None = None,
     live_grammar_states: set[int] | None = None,
     mask_times: list[float] | None = None,
-    greedy_backend: str | None = None,
     grammar_choices: list[int] | None = None,
 ) -> ProposalResult:
     """Greedily propose tokens after the target-selected current token.
@@ -178,7 +175,7 @@ def propose_tokens(
                     choices = _timed_grammar_choices(
                         grammar_constraint, draft_grammar_state, eos_token_ids, mask_times
                     )
-                token_id = _grammar_token(choices, logits, mask_times, greedy_backend)
+                token_id = _grammar_token(choices, logits, mask_times)
                 choices = None
             else:
                 token_id = logits.argmax(dim=-1)
@@ -220,7 +217,6 @@ def _verify_proposal(
     grammar_state: int | None = None,
     live_grammar_states: set[int] | None = None,
     mask_times: list[float] | None = None,
-    greedy_backend: str | None = None,
     maintain_draft: bool = True,
     checkpoint: GreedyCheckpoint | None = None,
     generated_token_ids: list[int] | None = None,
@@ -282,7 +278,7 @@ def _verify_proposal(
                 if not choices:
                     break
                 target = _grammar_token(
-                    choices, target_logits[:, position, :], mask_times, greedy_backend
+                    choices, target_logits[:, position, :], mask_times
                 ).item()
                 position_choices.append(choices)
                 choices = None
@@ -408,11 +404,9 @@ def generate_speculative_events(
     regex: str | None = None,
     token_byte_vocabulary: TokenByteVocabulary | None = None,
     json_schema: str | None = None,
-    greedy_backend: str | None = None,
     adaptive: bool = False,
 ) -> Iterator[AcceptedTokenEvent | GenerationFinishedEvent]:
     """Yield accepted tokens and one terminal result from one generation loop."""
-    greedy_backend = resolve_greedy_backend(greedy_backend)
     if not isinstance(adaptive, bool):
         raise ValueError("adaptive must be a boolean")
     if isinstance(gamma, bool) or not isinstance(gamma, int) or gamma < 0:
@@ -433,7 +427,6 @@ def generate_speculative_events(
             regex=regex,
             token_byte_vocabulary=token_byte_vocabulary,
             json_schema=json_schema,
-            greedy_backend=greedy_backend,
         )
         return
 
@@ -507,14 +500,14 @@ def generate_speculative_events(
                 finished = True
 
         checkpoint = GreedyCheckpoint(target_model, prompt_token_ids, constraint,
-                                      live_grammar_states, greedy_backend,
+                                      live_grammar_states,
                                       eos_token_ids=eos_token_ids, measure=measure)
         if not finished:
             if constraint is None:
                 first_token = target_prefill.token_id
             else:
                 first_token = _grammar_token(
-                    grammar_choices, target_prefill.logits, mask_times, greedy_backend
+                    grammar_choices, target_prefill.logits, mask_times
                 )
                 grammar_choices = None
             generated.append(first_token.item())
@@ -603,7 +596,6 @@ def generate_speculative_events(
                 grammar_state=grammar_state,
                 live_grammar_states=(live_grammar_states if constraint is not None else None),
                 mask_times=mask_times,
-                greedy_backend=greedy_backend,
                 grammar_choices=grammar_choices,
             ) if active_gamma else ProposalResult([], 0, 0)
             proposal_seconds = time.perf_counter() - proposal_started if controller else None
@@ -632,7 +624,6 @@ def generate_speculative_events(
                 grammar_state=grammar_state,
                 live_grammar_states=(live_grammar_states if constraint is not None else None),
                 mask_times=mask_times,
-                greedy_backend=greedy_backend,
                 maintain_draft=not adaptive,
                 checkpoint=checkpoint,
                 generated_token_ids=generated,
@@ -784,7 +775,6 @@ def generate_speculative(
     regex: str | None = None,
     token_byte_vocabulary: TokenByteVocabulary | None = None,
     json_schema: str | None = None,
-    greedy_backend: str | None = None,
     adaptive: bool = False,
 ) -> GenerationResult:
     """Collect the shared event stream into the established result shape."""
@@ -804,7 +794,6 @@ def generate_speculative(
         regex=regex,
         token_byte_vocabulary=token_byte_vocabulary,
         json_schema=json_schema,
-        greedy_backend=greedy_backend,
         adaptive=adaptive,
     )
     try:

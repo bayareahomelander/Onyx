@@ -48,7 +48,7 @@ def test_replay_stops_before_rejected_suffix_and_keeps_checkpoint_prefix(
 
     grammar = Grammar({}, set()) if constrained else None
     live = set()
-    checkpoint = GreedyCheckpoint(None, [8, 8], grammar, live, "torch")
+    checkpoint = GreedyCheckpoint(None, [8, 8], grammar, live)
     target = Cache()
     initial = torch.full((1, 9), -10.0)
     initial[0, 5] = 1
@@ -77,7 +77,7 @@ def test_replay_stops_before_rejected_suffix_and_keeps_checkpoint_prefix(
 def test_replay_rejects_noncanonical_emitted_prefix():
     from onyx_cuda.numerics import GreedyCheckpoint
 
-    checkpoint = GreedyCheckpoint(None, [8], None, set(), "torch")
+    checkpoint = GreedyCheckpoint(None, [8], None, set())
     checkpoint.cache = SimpleNamespace(length=1)
     checkpoint.logits = torch.tensor([[0., 2.]])
     with pytest.raises(RuntimeError, match="noncanonical emitted prefix"):

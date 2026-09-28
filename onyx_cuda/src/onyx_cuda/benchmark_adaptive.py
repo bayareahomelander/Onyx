@@ -113,7 +113,7 @@ def run(output, *, repetitions=10, split="all", measure=False):
     report = {"corpus_sha256": hashlib.sha256(corpus_bytes).hexdigest(), "corpus_version": 1,
               "settings": {"repetitions": repetitions, "warmups": 1, "split": split,
                            "measure": measure, "temperature": 0, "enable_thinking": False,
-                           "greedy_backend": "torch", "dtype": "float16", "gates": GATES,
+                           "dtype": "float16", "gates": GATES,
                            "modes": {mode: dict(zip(("gamma", "adaptive", "graph_recovery"), MODES[mode]))
                                      for mode in modes},
                            "replay_backend": replay_configuration,
@@ -136,7 +136,7 @@ def run(output, *, repetitions=10, split="all", measure=False):
             prompt = format_prompt(pair.target.tokenizer, case["messages"], enable_thinking=False)
             args = dict(draft_model=pair.draft.model, target_model=pair.target.model,
                         prompt_token_ids=prompt.token_ids, max_tokens=case["max_tokens"],
-                        eos_token_ids=pair.target.tokenizer.eos_token_id, greedy_backend="torch")
+                        eos_token_ids=pair.target.tokenizer.eos_token_id)
             if case["regex"] or case["json_schema"]:
                 args.update(regex=case["regex"], json_schema=json.dumps(case["json_schema"]) if case["json_schema"] else None,
                             token_byte_vocabulary=vocabulary)

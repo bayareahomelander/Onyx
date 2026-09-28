@@ -10,7 +10,6 @@ from transformers import PreTrainedModel
 from transformers.cache_utils import Cache
 
 from onyx_cuda.cache import CacheState
-from onyx_cuda.config import resolve_greedy_backend
 from onyx_cuda.masking import TokenMask, apply_grammar_mask, grammar_argmax
 from onyx_cuda.prefill import prefill
 from onyx_cuda.vocabulary import TokenByteVocabulary
@@ -255,10 +254,8 @@ def generate_token_events(
     regex: str | None = None,
     token_byte_vocabulary: TokenByteVocabulary | None = None,
     json_schema: str | None = None,
-    greedy_backend: str | None = None,
 ) -> Iterator[AcceptedTokenEvent | GenerationFinishedEvent]:
     """Generate at most max_tokens with greedy or top-p sampling."""
-    greedy_backend = resolve_greedy_backend(greedy_backend)
     _validate_generation_options(max_tokens, temperature, top_p, seed)
     grammar_requested = _validate_grammar_request(regex, token_byte_vocabulary, json_schema)
 
@@ -328,7 +325,7 @@ def generate_token_events(
                     torch.cuda.synchronize(logits.device)
                     mask_started_at = time.perf_counter()
                 if temperature == 0:
-                    token_id = grammar_argmax(logits, grammar_choices, backend=greedy_backend)
+                    token_id = grammar_argmax(logits, grammar_choices)
                 else:
                     logits = apply_grammar_mask(logits, grammar_choices)
                 grammar_choices = None
@@ -424,7 +421,6 @@ def generate_tokens(
     regex: str | None = None,
     token_byte_vocabulary: TokenByteVocabulary | None = None,
     json_schema: str | None = None,
-    greedy_backend: str | None = None,
 ) -> GenerationResult:
     """Collect the same incremental loop used by sampled streaming."""
     events = generate_token_events(
@@ -440,7 +436,6 @@ def generate_tokens(
         regex=regex,
         token_byte_vocabulary=token_byte_vocabulary,
         json_schema=json_schema,
-        greedy_backend=greedy_backend,
     )
     try:
         for event in events:

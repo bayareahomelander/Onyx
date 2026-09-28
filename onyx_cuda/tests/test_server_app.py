@@ -7,6 +7,7 @@ import pytest
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
+from onyx_cuda.config import REMOVED_SETTINGS
 from onyx_cuda.server import MODEL_ID, create_app, get_engine
 import onyx_cuda.server as server
 
@@ -257,29 +258,12 @@ def test_adaptive_mode_is_explicit_and_frozen_at_creation(monkeypatch):
         create_app(speculative_mode="typo")
 
 
-def test_backend_is_validated_and_frozen_before_startup(monkeypatch):
-    monkeypatch.setenv("ONYX_GREEDY_BACKEND", "typo")
-    with pytest.raises(ValueError, match="ONYX_GREEDY_BACKEND"):
+@pytest.mark.parametrize("name,value", [("ONYX_GREEDY_BACKEND", "cuda")])
+def test_removed_settings_fail_before_startup(monkeypatch, name, value):
+    monkeypatch.setenv(name, value)
+    with pytest.raises(ValueError, match=f"{name}={value} is no longer supported"):
         create_app(engine=object())
-    calls = []
-    monkeypatch.setattr(server, "initialize_greedy_backend", calls.append)
-    app = create_app(engine=object(), greedy_backend="cuda")
-    monkeypatch.setenv("ONYX_GREEDY_BACKEND", "torch")
-    assert calls == []
-    with TestClient(app) as client:
-        assert calls == ["cuda"]
-        assert client.get("/").json()["greedy_backend"] == "cuda"
-
-
-def test_backend_startup_failure_prevents_model_loading(monkeypatch):
-    def unavailable(_):
-        raise RuntimeError("kernel unavailable")
-
-    monkeypatch.setattr(server, "initialize_greedy_backend", unavailable)
-    app = create_app(
-        load_engine=lambda: pytest.fail("Do not load models after kernel initialization fails"),
-        greedy_backend="cuda",
-    )
-    with pytest.raises(RuntimeError, match="kernel unavailable"):
-        with TestClient(app):
-            pass
+    # The value that matched the remaining behavior is accepted.
+    monkeypatch.setenv(name, REMOVED_SETTINGS[name])
+    with TestClient(create_app(engine=object())) as client:
+        assert "greedy_backend" not in client.get("/").json()

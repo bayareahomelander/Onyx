@@ -128,7 +128,6 @@ def test_non_streaming_chat_completion_returns_usage_reason_and_metrics(monkeypa
     assert len(calls) == 1
     assert calls[0]["measure"] is True
     assert calls[0]["adaptive"] is (mode == "adaptive")
-    assert calls[0]["greedy_backend"] == client.app.state.greedy_backend
     assert calls[0]["draft_model"] is engine.draft.model
     assert calls[0]["target_model"] is engine.target.model
 
@@ -557,26 +556,6 @@ def test_streaming_chunks_preserve_id_and_real_finish_reason(monkeypatch, mode):
     assert calls[0]["arguments"]["measure"] is True
     assert calls[0]["arguments"]["adaptive"] is (mode == "adaptive")
     assert calls[0]["stop"] == ["END"]
-
-
-@pytest.mark.parametrize("stream", [False, True])
-def test_requests_keep_application_backend_after_environment_changes(monkeypatch, stream):
-    engine = _engine(FakeTokenizer({(10,): "Hello"}))
-    if stream:
-        calls = _fake_stream(monkeypatch, [
-            SimpleNamespace(text="Hello"),
-            SimpleNamespace(result=_result([10], "eos")),
-        ])
-    else:
-        calls = _fake_generation(monkeypatch, [_result([10], "eos")])
-    with TestClient(create_app(engine=engine, greedy_backend="torch")) as client:
-        monkeypatch.setenv("ONYX_GREEDY_BACKEND", "invalid-after-startup")
-        response = client.post("/v1/chat/completions", json={
-            "messages": [{"role": "user", "content": "Hi"}], "stream": stream,
-        })
-        assert response.status_code == 200
-    arguments = calls[0]["arguments"] if stream else calls[0]
-    assert arguments["greedy_backend"] == "torch"
 
 
 def test_streaming_rejects_n_and_unknown_model_before_generation(monkeypatch):

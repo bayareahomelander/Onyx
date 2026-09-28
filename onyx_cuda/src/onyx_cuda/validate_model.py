@@ -13,7 +13,6 @@ import torch
 from onyx_cuda._validation_report import (
     add_selection_arguments, check, evidence, reserve_report, selected_models, write_report,
 )
-from onyx_cuda.config import initialize_greedy_backend
 from onyx_cuda.model import describe_model_pair, load_model_pair
 from onyx_cuda.preflight import precheck
 
@@ -58,13 +57,13 @@ def validate_output(payload, text, finish_reason):
     require(finish_reason in ("stop", "eos", "length"), "Unknown finish reason")
 
 
-def generation_check(pair, payload, gamma, backend, adaptive=False):
+def generation_check(pair, payload, gamma, adaptive=False):
     from onyx_cuda.generation import GenerationFinishedEvent
     from onyx_cuda.server import ChatCompletionRequest, prepare_generation
     from onyx_cuda.speculative import generate_speculative, generate_speculative_events, decode_speculative_events
 
     arguments = prepare_generation(ChatCompletionRequest(**payload), pair, gamma=0)
-    arguments.update(greedy_backend=backend, measure=True)
+    arguments["measure"] = True
     baseline = generate_speculative(**arguments)
     expected_ids, expected_reason = baseline.token_ids, baseline.finish_reason
     # Drop returned caches before running the next mode.
@@ -191,7 +190,7 @@ def context_cache_check(loaded, context_tokens):
             "max_replay_logit_difference": (expected - replay).abs().max().item()}
 
 
-def validate_selected(selection, *, gamma, backend, report, context_tokens=DEFAULT_CONTEXT_TOKENS,
+def validate_selected(selection, *, gamma, report, context_tokens=DEFAULT_CONTEXT_TOKENS,
                       speculative_mode="fixed"):
     from fastapi.testclient import TestClient
     from onyx_cuda.device import require_cuda
@@ -201,10 +200,9 @@ def validate_selected(selection, *, gamma, backend, report, context_tokens=DEFAU
     report["device"] = {"name": torch.cuda.get_device_name(device),
                         "total_vram_bytes": torch.cuda.get_device_properties(device).total_memory,
                         "cuda_runtime": torch.version.cuda}
-    check(report, "selector.startup", lambda: initialize_greedy_backend(backend))
     torch.cuda.reset_peak_memory_stats(device)
     app = create_app(load_engine=lambda: load_model_pair(include_draft=gamma > 0, selection=selection),
-                     gamma=gamma, greedy_backend=backend, speculative_mode=speculative_mode)
+                     gamma=gamma, speculative_mode=speculative_mode)
     try:
         with TestClient(app) as client:
             report["support_level"] = "startup-verified"
@@ -219,7 +217,7 @@ def validate_selected(selection, *, gamma, backend, report, context_tokens=DEFAU
             del loaded
             for name, payload in validation_cases():
                 expected = check(report, f"{name}.generation", lambda: executor.submit(
-                    generation_check, pair, payload, gamma, backend, speculative_mode == "adaptive").result())
+                    generation_check, pair, payload, gamma, speculative_mode == "adaptive").result())
                 report["checks"][-1]["result"] = expected
                 check(report, f"{name}.api_and_sse", lambda: api_check(client, payload, expected))
             if gamma > 0:
@@ -238,13 +236,12 @@ def validate_selected(selection, *, gamma, backend, report, context_tokens=DEFAU
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     add_selection_arguments(parser)
-    parser.add_argument("--greedy-backend", choices=("torch", "cuda"), default="torch")
     parser.add_argument("--speculative-mode", choices=("fixed", "adaptive"), default="fixed")
     parser.add_argument("--context-tokens", type=int, choices=range(64, 131073), metavar="64..131072", default=DEFAULT_CONTEXT_TOKENS)
     args = parser.parse_args(argv)
     reserve_report(args.output)
     report = evidence("selected-model-validation")
-    report["settings"] = {"gamma": args.gamma, "greedy_backend": args.greedy_backend,
+    report["settings"] = {"gamma": args.gamma,
                           "speculative_mode": args.speculative_mode,
                           "corpus": "onyx-selected-model-v1", "precision": "float16",
                           "max_output_tokens": 64, "sampling_seed": 17, "context_tokens": args.context_tokens}
@@ -262,7 +259,7 @@ def main(argv=None):
             selection, gamma=args.gamma, context_tokens=args.context_tokens, report=report["preflight"]))
         report["support_level"] = "prechecked"
         check(report, "cuda.validation", lambda: validate_selected(
-            selection, gamma=args.gamma, backend=args.greedy_backend, context_tokens=args.context_tokens,
+            selection, gamma=args.gamma, context_tokens=args.context_tokens,
             speculative_mode=args.speculative_mode, report=report))
     except Exception as error:
         report["status"] = "failed"
