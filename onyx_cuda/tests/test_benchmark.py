@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from onyx_cuda.benchmark_adaptive import select_modes, summarize
+from onyx_cuda.benchmark import select_modes, summarize
 
 
 def row(name, baseline, fixed, graph=None):
@@ -36,7 +36,7 @@ def test_graph_summary_reports_every_mode_and_graph_saving():
 @pytest.fixture
 def benchmark(monkeypatch):
     import torch
-    import onyx_cuda.benchmark_adaptive as module
+    import onyx_cuda.benchmark as module
     from onyx_cuda.benchmark_corpus import CORPUS
     from onyx_cuda.generation import AcceptedTokenEvent, GenerationFinishedEvent, GenerationResult
 

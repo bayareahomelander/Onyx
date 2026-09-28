@@ -4,7 +4,7 @@ import json
 import pytest
 import torch
 
-from onyx_cuda.benchmark import MAX_TOKENS, PROMPTS
+from onyx_cuda.benchmark_corpus import SMOKE_MAX_TOKENS as MAX_TOKENS, SMOKE_PROMPTS as PROMPTS
 from onyx_cuda.generation import generate_tokens
 from onyx_cuda.model import TARGET_MODEL_ID, load_model
 from onyx_cuda.prompt import format_prompt

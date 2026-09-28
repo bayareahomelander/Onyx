@@ -419,7 +419,6 @@ impl SchemaType {
 pub struct PropertyBlueprint {
     /// allowed types (supports union types)
     pub schema_types: Vec<SchemaType>,
-    pub properties: HashMap<String, PropertyBlueprint>,
     /// for arrays: item schema
     pub items: Option<Arc<PropertyBlueprint>>,
     pub required: bool,
@@ -518,7 +517,6 @@ impl PropertyBlueprint {
             let mut allowed_keys: Vec<String> = properties.keys().cloned().collect();
             allowed_keys.sort();
             Some(Arc::new(SchemaBlueprint {
-                root_type: SchemaType::Object,
                 properties: properties.clone(),
                 required: required_keys.clone(),
                 allowed_keys,
@@ -529,7 +527,6 @@ impl PropertyBlueprint {
 
         PropertyBlueprint {
             schema_types,
-            properties,
             items,
             required: false,
             enum_values,
@@ -549,21 +546,12 @@ impl PropertyBlueprint {
 /// from a JSON schema that is needed for constraint enforcement
 #[derive(Debug, Clone)]
 pub struct SchemaBlueprint {
-    pub root_type: SchemaType,
     pub properties: HashMap<String, PropertyBlueprint>,
     pub required: HashSet<String>,
     pub allowed_keys: Vec<String>,
 }
 
 impl SchemaBlueprint {
-    /// parse a JSON schema string and extract its blueprint
-    pub fn from_json(schema: &str) -> Result<Self, ConstraintError> {
-        let value = serde_json::from_str(schema).map_err(|error| {
-            ConstraintError::CompilationError(format!("Failed to parse JSON schema: {error}"))
-        })?;
-        Self::from_value(&value)
-    }
-
     /// parse a JSON schema from a serde_json::Value
     pub fn from_value(schema: &Value) -> Result<Self, ConstraintError> {
         validate_schema(schema, "$")?;
@@ -601,7 +589,6 @@ impl SchemaBlueprint {
         allowed_keys.sort();
 
         Ok(SchemaBlueprint {
-            root_type,
             properties,
             required,
             allowed_keys,
@@ -616,11 +603,6 @@ impl SchemaBlueprint {
     /// check if a key is allowed
     pub fn is_key_allowed(&self, key: &str) -> bool {
         self.properties.contains_key(key)
-    }
-
-    /// check if a string is a valid prefix of any allowed key
-    pub fn is_valid_key_prefix(&self, prefix: &str) -> bool {
-        self.allowed_keys.iter().any(|key| key.starts_with(prefix))
     }
 }
 
@@ -641,32 +623,10 @@ mod tests {
 
         let blueprint = SchemaBlueprint::from_value(&schema).unwrap();
 
-        assert_eq!(blueprint.root_type, SchemaType::Object);
         assert_eq!(blueprint.allowed_keys.len(), 2);
         assert!(blueprint.is_key_allowed("name"));
         assert!(blueprint.is_key_allowed("age"));
         assert!(!blueprint.is_key_allowed("unknown"));
-    }
-
-    #[test]
-    fn test_schema_blueprint_prefix_matching() {
-        let schema = json!({
-            "type": "object",
-            "properties": {
-                "name": {"type": "string"},
-                "nickname": {"type": "string"},
-                "age": {"type": "integer"}
-            }
-        });
-
-        let blueprint = SchemaBlueprint::from_value(&schema).unwrap();
-
-        assert!(blueprint.is_valid_key_prefix("n"));
-        assert!(blueprint.is_valid_key_prefix("na"));
-        assert!(blueprint.is_valid_key_prefix("name"));
-        assert!(blueprint.is_valid_key_prefix("nick"));
-        assert!(!blueprint.is_valid_key_prefix("namex"));
-        assert!(!blueprint.is_valid_key_prefix("z"));
     }
 
     #[test]
@@ -707,17 +667,8 @@ mod tests {
 
         let person_prop = blueprint.get_property("person").unwrap();
         assert!(person_prop.schema_types.contains(&SchemaType::Object));
-        assert!(person_prop.properties.contains_key("name"));
-        assert!(person_prop.properties.contains_key("age"));
-    }
-
-    #[test]
-    fn test_schema_blueprint_rejects_malformed_json() {
-        let error = SchemaBlueprint::from_json(r#"{"type":"object""#).unwrap_err();
-        assert!(matches!(
-            error,
-            ConstraintError::CompilationError(message)
-                if message.starts_with("Failed to parse JSON schema:")
-        ));
+        let person = person_prop.object_blueprint.as_ref().unwrap();
+        assert!(person.properties.contains_key("name"));
+        assert!(person.properties.contains_key("age"));
     }
 }

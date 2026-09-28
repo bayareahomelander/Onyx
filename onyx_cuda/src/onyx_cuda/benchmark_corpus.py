@@ -1,9 +1,17 @@
-"""Adaptive evaluation v1. Freeze prompts/settings before policy tuning.
+"""Frozen 48-case speed corpus, v1. Changing it makes new reports incomparable.
 
 The last sixteen new cases are held out. Categories are report metadata only.
 """
 
 SYSTEM = "You are a concise assistant."
+
+# Short user prompts for model and speculation smoke checks; not part of CORPUS.
+SMOKE_MAX_TOKENS = 256
+SMOKE_PROMPTS = {
+    "cuda_ready": "Reply with CUDA ready.",
+    "gpu_summary": "In one concise sentence, explain what a GPU does.",
+    "number_sequence": "Write the numbers one through ten, separated by commas.",
+}
 
 
 def case(name, prompt, category="text", *, regex=None, schema=None, budget=512,

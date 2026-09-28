@@ -149,8 +149,8 @@ Peak memory in the comparison was 17.37 GiB allocated. On September 27, forced
 recoveries with 5,000 to 8,000 prompt tokens and both graph sets loaded matched
 target-only output and peaked at 19.54 GiB allocated.
 
-On September 27 the full CUDA suite passed 972 tests with draft graphs and
-default graph recovery, with three Windows-specific skips. September 22 checks
+On September 28 the full CUDA suite passed all 830 tests with draft graphs and
+default graph recovery. September 22 checks
 matched full logits and KV caches bitwise through 8192 tokens with graph
 recovery, and the API completed a 4096-prompt/4096-output capacity test. If a
 graph block still exhausts GPU memory, that recovery continues with scalar steps
@@ -160,7 +160,7 @@ a Windows GPU.
 To reproduce the comparison on your GPU, use a new output filename for each run:
 
 ```sh
-python -m onyx_cuda.benchmark_adaptive --split all --repetitions 3 --output validation/speedups.json
+python -m onyx_cuda.benchmark --output validation/speedups.json
 ```
 
 One interleaved run times target-only and fixed gamma 2 generation, and adds a

@@ -41,12 +41,10 @@ pub enum ScanKey {
 }
 
 pub trait ConstraintEngine: Send + Sync {
-    fn reset(&mut self);
     fn get_valid_tokens(&self) -> Vec<usize>;
     fn advance(&mut self, token_id: usize) -> Result<(), ConstraintError>;
     fn is_finished(&self) -> bool;
     fn is_dead(&self) -> bool;
-    fn current_state_id(&self) -> u32;
     fn clone_box(&self) -> Box<dyn ConstraintEngine>;
 
     /// Cache key for this state's scan; None disables caching.

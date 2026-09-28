@@ -20,11 +20,11 @@ from onyx_cuda.preflight import precheck
 def validation_cases():
     # Share the existing benchmark's public prompt corpus; no arbitrary user input
     # or generated text is copied into the portable report.
-    from onyx_cuda.benchmark import PROMPTS
+    from onyx_cuda.benchmark_corpus import SMOKE_PROMPTS
 
     cases = [(name, {"messages": [{"role": "system", "content": "You are a concise assistant."},
                                   {"role": "user", "content": prompt}], "max_tokens": 32})
-             for name, prompt in PROMPTS.items()]
+             for name, prompt in SMOKE_PROMPTS.items()]
     cases.extend([
         ("regex", {"messages": [{"role": "user", "content": "Reply with CUDA ready."}],
                    "regex": "CUDA Ready", "max_tokens": 32}),

@@ -5,7 +5,7 @@ import pytest
 import torch
 
 import onyx_cuda.speculative as speculative_module
-from onyx_cuda.benchmark import MAX_TOKENS, PROMPTS
+from onyx_cuda.benchmark_corpus import SMOKE_MAX_TOKENS as MAX_TOKENS, SMOKE_PROMPTS as PROMPTS
 from onyx_cuda.cache import CacheState
 from onyx_cuda.generation import GenerationResult, generate_tokens
 from onyx_cuda.model import load_model_pair

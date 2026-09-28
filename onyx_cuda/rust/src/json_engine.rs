@@ -797,7 +797,6 @@ impl JsonEngine {
                                 (Arc::clone(obp), obp.required.clone())
                             } else {
                                 let empty = Arc::new(SchemaBlueprint {
-                                    root_type: SchemaType::Object,
                                     properties: std::collections::HashMap::new(),
                                     required: std::collections::HashSet::new(),
                                     allowed_keys: Vec::new(),
@@ -806,7 +805,6 @@ impl JsonEngine {
                             }
                         } else {
                             let empty = Arc::new(SchemaBlueprint {
-                                root_type: SchemaType::Object,
                                 properties: std::collections::HashMap::new(),
                                 required: std::collections::HashSet::new(),
                                 allowed_keys: Vec::new(),
@@ -868,7 +866,6 @@ impl JsonEngine {
                     }
                     if byte == b'{' {
                         let empty = Arc::new(SchemaBlueprint {
-                            root_type: SchemaType::Object,
                             properties: std::collections::HashMap::new(),
                             required: std::collections::HashSet::new(),
                             allowed_keys: Vec::new(),
@@ -1346,13 +1343,6 @@ impl JsonEngine {
 }
 
 impl ConstraintEngine for JsonEngine {
-    fn reset(&mut self) {
-        self.stack = vec![Scope::Root];
-        self.output.clear();
-        self.finished = false;
-        self.dead = false;
-    }
-
     fn get_valid_tokens(&self) -> Vec<usize> {
         self.scan().0
     }
@@ -1443,10 +1433,6 @@ impl ConstraintEngine for JsonEngine {
 
     fn is_dead(&self) -> bool {
         self.dead
-    }
-
-    fn current_state_id(&self) -> u32 {
-        self.stack.len() as u32
     }
 
     fn clone_box(&self) -> Box<dyn ConstraintEngine> {

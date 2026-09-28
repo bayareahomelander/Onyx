@@ -178,25 +178,6 @@ def test_failed_model_load_prevents_application_startup(monkeypatch):
             pytest.fail("Application became ready")
 
 
-@pytest.mark.parametrize("flags", [[], ["--compare"]])
-def test_comparison_cli_uses_selected_models_and_answer_settings(monkeypatch, tmp_path, flags):
-    import sys
-    import onyx_cuda.benchmark as benchmark
-
-    monkeypatch.setenv("ONYX_TARGET_MODEL", "example/target")
-    monkeypatch.setenv("ONYX_DRAFT_MODEL", "example/draft")
-    monkeypatch.setattr(torch.cuda, "set_device", lambda *_: None)
-    calls = []
-    monkeypatch.setattr(benchmark, "run_comparison", lambda *args, **kw: calls.append((args, kw)))
-    output = tmp_path / "result.json"
-    monkeypatch.setattr(sys, "argv", ["benchmark", *flags, "--output", str(output),
-                                      "--disable-thinking", "--max-tokens", "256", "--require-complete"])
-    benchmark.main()
-    args, kwargs = calls[0]
-    assert args == (output, torch.device("cuda:0"), resolve_model_selection())
-    assert kwargs["options"] == benchmark.BenchmarkOptions(256, False, True)
-
-
 @pytest.mark.gpu
 def test_real_nondefault_pair_selection_and_target_baseline(monkeypatch, record_model_revision):
     from onyx_cuda.speculative import generate_speculative

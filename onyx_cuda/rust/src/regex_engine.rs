@@ -208,7 +208,6 @@ pub struct RegexEngine {
     vocabulary: Arc<Vec<Vec<u8>>>,
     dfa: Arc<dense::DFA<Vec<u32>>>,
     current_state: StateID,
-    initial_state: StateID,
 }
 
 impl RegexEngine {
@@ -236,12 +235,7 @@ impl RegexEngine {
             vocabulary: Arc::new(vocabulary),
             dfa: Arc::new(dfa),
             current_state: initial_state,
-            initial_state,
         })
-    }
-
-    pub fn vocab_size(&self) -> usize {
-        self.vocabulary.len()
     }
 
     fn advance_state_by_token(&self, state: StateID, token_id: usize) -> StateID {
@@ -254,10 +248,6 @@ impl RegexEngine {
 }
 
 impl ConstraintEngine for RegexEngine {
-    fn reset(&mut self) {
-        self.current_state = self.initial_state;
-    }
-
     fn get_valid_tokens(&self) -> Vec<usize> {
         let mut valid_tokens = Vec::new();
 
@@ -305,16 +295,11 @@ impl ConstraintEngine for RegexEngine {
         self.dfa.is_dead_state(self.current_state)
     }
 
-    fn current_state_id(&self) -> u32 {
-        self.current_state.as_u32()
-    }
-
     fn clone_box(&self) -> Box<dyn ConstraintEngine> {
         Box::new(Self {
             vocabulary: Arc::clone(&self.vocabulary),
             dfa: Arc::clone(&self.dfa),
             current_state: self.current_state,
-            initial_state: self.initial_state,
         })
     }
 
@@ -366,7 +351,6 @@ mod tests {
     #[test]
     fn test_regex_engine_creation() {
         let engine = RegexEngine::new(make_test_vocab(), "The year is [0-9]{4}").unwrap();
-        assert_eq!(engine.vocab_size(), 10);
         assert!(!engine.is_dead());
         assert!(!engine.is_finished());
     }
@@ -379,7 +363,7 @@ mod tests {
         assert!(!engine.is_dead());
         assert!(!engine.is_finished());
 
-        engine.reset();
+        let mut engine = RegexEngine::new(make_test_vocab(), "The year is [0-9]{4}").unwrap();
         engine.advance(8).unwrap();
         assert!(engine.is_dead());
     }
@@ -391,17 +375,6 @@ mod tests {
 
         assert!(valid.contains(&0));
         assert!(!valid.contains(&8));
-    }
-
-    #[test]
-    fn test_regex_engine_reset() {
-        let mut engine = RegexEngine::new(make_test_vocab(), "The year is [0-9]{4}").unwrap();
-        let initial_state = engine.current_state_id();
-
-        engine.advance(0).unwrap();
-        assert_ne!(engine.current_state_id(), initial_state);
-        engine.reset();
-        assert_eq!(engine.current_state_id(), initial_state);
     }
 
     #[test]
