@@ -130,33 +130,35 @@ backends. Validate custom models or larger limits on the target GPU first with
 
 ## Measured performance
 
-On a Linux RTX 2080 Ti reporting 22 GiB, the September 25, 2026 comparison covered
+On a Linux RTX 2080 Ti reporting 22 GiB, the September 27, 2026 comparison covered
 48 cases with one warmup and three measured runs per mode. Aggregates sum
 per-case median generation times, excluding model loading and graph setup:
 
 | Mode | Aggregate speedup over target-only |
 | --- | ---: |
-| Fixed gamma 2, draft graphs, scalar recovery (`ONYX_REPLAY_BACKEND=scalar`) | 1.292x |
-| Fixed gamma 2, draft graphs, graph recovery (default on this GPU) | **1.398x** |
+| Fixed gamma 2, draft graphs, scalar recovery (`ONYX_REPLAY_BACKEND=scalar`) | 1.291x |
+| Fixed gamma 2, draft graphs, graph recovery (default on this GPU) | **1.396x** |
 
-In the same run, the ordinary draft forward measured 1.130x and 1.211x; draft
-graphs reduced total generation time by 12.6% and 13.4%. Every output in every
-mode matched target-only tokens and finish reasons, and no case was slower with
-draft graphs. Nine cases remain slower than target-only: six very short
-requests (at most 23 ms slower) and three recovery-heavy prose requests.
+Every output in every mode matched target-only tokens and finish reasons.
+Adaptive speculation, still experimental, measured 1.237x and 1.367x. Ten cases
+remain slower than target-only: seven very short requests (at most 24 ms slower)
+and three recovery-heavy prose requests. The September 25 comparison, which also
+timed the ordinary draft forward, measured 1.130x and 1.211x without draft graphs;
+draft graphs reduced total generation time by 12.6% and 13.4%.
 
 Draft graphs cut draft cost from about 7.5-9.8 ms to 4.1-4.4 ms per token and
-add about 2 seconds of startup; graph recovery preparation adds about 45 seconds.
-Peak memory in the comparison was 17.29 GiB allocated.
+add about 2 seconds of startup; graph recovery preparation adds about 42 seconds.
+Peak memory in the comparison was 17.37 GiB allocated. On September 27, forced
+recoveries with 5,000 to 8,000 prompt tokens and both graph sets loaded matched
+target-only output and peaked at 19.54 GiB allocated.
 
-The full CUDA suite passed 872 tests with draft graphs enabled, with three
-Windows-specific skips. September 22 checks matched full logits and KV caches
-bitwise through 8192 tokens with graph recovery, and the API completed a
-4096-prompt/4096-output capacity test. If a graph block still exhausts GPU
-memory, that recovery continues with scalar steps and later requests keep the
-graphs. Draft graphs have
-not yet been validated on a Windows GPU. Adaptive speculation remains
-experimental and was not remeasured with draft graphs.
+On September 27 the full CUDA suite passed 972 tests with draft graphs and
+default graph recovery, with three Windows-specific skips. September 22 checks
+matched full logits and KV caches bitwise through 8192 tokens with graph
+recovery, and the API completed a 4096-prompt/4096-output capacity test. If a
+graph block still exhausts GPU memory, that recovery continues with scalar steps
+and later requests keep the graphs. Draft graphs have not yet been validated on
+a Windows GPU.
 
 To reproduce the comparison on your GPU, use a new output filename for each run:
 
@@ -168,22 +170,20 @@ One interleaved run times target-only, fixed gamma 2, and adaptive speculation,
 and adds graph-recovery modes when the GPU supports them (compute capability 7.5).
 Every mode uses the configured draft backend, draft graphs by default. Every
 speculative output must match target-only generation token for token. The report
-records which modes ran and why a graph backend was unavailable. The September 25
-figures come from an equivalent validation run that also timed the ordinary draft
-forward side by side.
+records which modes ran and why a graph backend was unavailable.
 
 ### Speedup by workload
 
-Category results from the same September 25 comparison:
+Category results from the same September 27 comparison:
 
 | Workload | Scalar recovery | Graph recovery (default) |
 | --- | ---: | ---: |
-| Code generation | **2.02x** | **2.02x** |
-| Regex-constrained output | **1.79x** | **1.79x** |
+| Code generation | **2.01x** | **2.01x** |
+| JSON Schema output | **1.82x** | **1.81x** |
+| Regex-constrained output | **1.80x** | **1.80x** |
 | Information extraction | **1.61x** | **1.61x** |
-| JSON Schema output | **1.58x** | **1.58x** |
 | Prose | 1.08x | 1.20x |
-| Short replies | 1.06x | 1.06x |
+| Short replies | 1.05x | 1.05x |
 
 Each baseline uses the same target model, prompt, precision, and output budget.
 Regex and JSON baselines enforce the same constraints; these figures measure
@@ -191,6 +191,15 @@ the benefit of speculation over already-constrained target-only generation.
 Graph recovery changes only requests that need numerical recovery, which in this
 corpus were prose and changing-pattern requests. Category results describe the
 tested cases and do not guarantee a speedup for every request.
+
+Constrained generation caches each grammar state's valid tokens and reuses them
+as GPU masks, so long text inside a JSON string no longer rescans the vocabulary
+at every token. In a separate September 27 check of four long-text requests (a
+JSON summary, JSON records with descriptions, code in a JSON string, and a broad
+regex), speculation measured 0.74x-2.01x against target-only, up from
+0.49x-0.99x before the cache, with identical output. The JSON summary stays
+slower because its one numerical recovery runs in scalar steps: graph recovery
+does not apply to constrained requests.
 
 ## Structure
 

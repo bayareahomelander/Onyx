@@ -1,3 +1,5 @@
+import json
+
 import pytest
 
 from onyx_cuda import _rust
@@ -78,3 +80,49 @@ def test_json_state_handles_branch_and_release_from_python():
     invalid = _rust.GrammarConstraint(vocab)
     with pytest.raises(ValueError, match="Compilation error"):
         invalid.compile_json_schema("{")
+
+
+def _byte_vocabulary():
+    return [bytes([byte]) for byte in range(256)] + [b'"}', b'","', b"ab", "é".encode(), b"\n", b""]
+
+
+@pytest.mark.parametrize("grammar,document", [
+    ({"type": "object", "properties": {"title": {"type": "string"}, "text": {"type": "string", "maxLength": 9}},
+      "required": ["title", "text"]}, '{"title":"ab é","text":"q\\"x"}'),
+    ("[a-c]+(de)?", "abcde"),
+])
+def test_cached_scans_masks_and_ids_match_uncached_scans(grammar, document):
+    def compiled(**options):
+        constraint = _rust.GrammarConstraint(_byte_vocabulary(), **options)
+        if isinstance(grammar, dict):
+            constraint.compile_json_schema(json.dumps(grammar))
+        else:
+            constraint.compile_regex(grammar)
+        return constraint, constraint.init_state()
+
+    cached, cached_state = compiled()
+    fresh, fresh_state = compiled(scan_cache_entries=0)
+    for byte in [*document.encode(), None]:
+        expected = fresh.get_valid_token_ids(fresh_state)
+        assert cached.get_valid_token_ids(cached_state) == expected
+        scan_id, count = cached.scan_valid_tokens(cached_state)
+        assert count == len(expected)
+        blocked = cached.blocked_token_mask(cached_state)
+        assert isinstance(blocked, bytearray) and len(blocked) == cached.vocab_size()
+        assert [token for token, value in enumerate(blocked) if not value] == expected
+        assert cached.scan_valid_tokens(cached_state)[0] == scan_id
+        if byte is not None:
+            cached_state = cached.advance_state(cached_state, byte)
+            fresh_state = fresh.advance_state(fresh_state, byte)
+
+
+def test_plain_string_positions_reuse_one_scan_id():
+    constraint = _rust.GrammarConstraint(_byte_vocabulary())
+    constraint.compile_json_schema('{"type":"object","properties":{"text":{"type":"string"}}}')
+    state = constraint.init_state()
+    ids = set()
+    for index, byte in enumerate(b'{"text":"a longer value'):
+        state = constraint.advance_state(state, byte)
+        if index >= 8:
+            ids.add(constraint.scan_valid_tokens(state)[0])
+    assert len(ids) == 1

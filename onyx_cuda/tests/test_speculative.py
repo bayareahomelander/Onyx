@@ -319,6 +319,31 @@ def test_constrained_draft_masks_invalid_token_and_validates_json(monkeypatch):
     assert not grammar.active_states
 
 
+def test_verifier_prefetches_the_draft_final_state_before_scanning_it(monkeypatch):
+    class PrefetchingGrammar(TrackingGrammar):
+        def __init__(self):
+            super().__init__({}, set())
+            self.events = []
+
+        def get_valid_token_ids(self, state):
+            self.events.append(("scan", self.states[state]))
+            return [1, 2, 3, 4]
+
+        def prefetch(self, state):
+            self.events.append(("prefetch", self.states[state]))
+
+    grammar = PrefetchingGrammar()
+    result, _, _ = _run_scripted_constrained_speculation(
+        monkeypatch, grammar, draft_tokens=[2, 3, 0], target_tokens=[2, 3, 4], max_tokens=4,
+    )
+
+    assert result.token_ids == [1, 2, 3, 4]
+    prefetched = grammar.events.index(("prefetch", (1, 2, 3)))
+    assert ("scan", (1, 2, 3)) not in grammar.events[:prefetched]
+    assert ("scan", (1, 2, 3)) in grammar.events[prefetched:]
+    assert not grammar.active_states
+
+
 def test_constrained_error_releases_every_state(monkeypatch):
     grammar = TrackingGrammar({(): [1], (1,): []}, set())
 

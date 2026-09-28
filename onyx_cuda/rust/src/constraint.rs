@@ -30,6 +30,16 @@ impl fmt::Display for ConstraintError {
 
 impl Error for ConstraintError {}
 
+/// Identifies engine states with the same valid-token scan. Only tokens that
+/// `scan` reports as output-dependent may differ between states with equal keys.
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub enum ScanKey {
+    /// A state that permits no token, such as a finished document.
+    Empty,
+    Regex(u32),
+    Json(crate::json_engine::JsonScanKey),
+}
+
 pub trait ConstraintEngine: Send + Sync {
     fn reset(&mut self);
     fn get_valid_tokens(&self) -> Vec<usize>;
@@ -38,6 +48,21 @@ pub trait ConstraintEngine: Send + Sync {
     fn is_dead(&self) -> bool;
     fn current_state_id(&self) -> u32;
     fn clone_box(&self) -> Box<dyn ConstraintEngine>;
+
+    /// Cache key for this state's scan; None disables caching.
+    fn scan_key(&self) -> Option<ScanKey> {
+        None
+    }
+
+    /// Valid tokens, and the scanned tokens whose validity also depends on
+    /// state outside the scan key. Cache hits recheck the latter.
+    fn scan(&self) -> (Vec<usize>, Vec<usize>) {
+        (self.get_valid_tokens(), Vec::new())
+    }
+
+    fn is_valid_token(&self, token_id: usize) -> bool {
+        self.get_valid_tokens().contains(&token_id)
+    }
 }
 
 #[cfg(test)]

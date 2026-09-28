@@ -6,7 +6,7 @@ import torch
 
 from onyx_cuda.cache import CacheState, snapshot_cache
 from onyx_cuda.generation import _grammar_choices
-from onyx_cuda.masking import grammar_argmax
+from onyx_cuda.masking import TokenMask, grammar_argmax
 from onyx_cuda.prefill import prefill
 
 
@@ -23,7 +23,18 @@ def ambiguous_logits(logits, token_count, choices=None):
         values = logits[0, :token_count].topk(2).values.float()
         tolerance = torch.finfo(logits.dtype).eps * values.abs().amax(-1).clamp_min(1)
         return bool(torch.any(values[:, 0] - values[:, 1] <= tolerance).item())
-    for position, valid in enumerate(choices[:token_count]):
+    choices = choices[:token_count]
+    if choices and all(isinstance(valid, TokenMask) for valid in choices):
+        # One synchronization for all positions. With two or more eligible
+        # tokens, the top two of the masked row are the eligible top two.
+        rows = [position for position, valid in enumerate(choices) if len(valid) >= 2]
+        if not rows:
+            return False
+        blocked = torch.stack([choices[position].blocked for position in rows])
+        values = logits[0, rows].masked_fill(blocked, -torch.inf).topk(2).values.float()
+        tolerance = torch.finfo(logits.dtype).eps * values.abs().amax(-1).clamp_min(1)
+        return bool(torch.any(values[:, 0] - values[:, 1] <= tolerance).item())
+    for position, valid in enumerate(choices):
         if len(valid) < 2:
             continue
         eligible = logits[0, position].index_select(

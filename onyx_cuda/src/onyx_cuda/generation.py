@@ -11,7 +11,7 @@ from transformers.cache_utils import Cache
 
 from onyx_cuda.cache import CacheState
 from onyx_cuda.config import resolve_greedy_backend
-from onyx_cuda.masking import apply_grammar_mask, grammar_argmax
+from onyx_cuda.masking import TokenMask, apply_grammar_mask, grammar_argmax
 from onyx_cuda.prefill import prefill
 from onyx_cuda.vocabulary import TokenByteVocabulary
 
@@ -156,7 +156,11 @@ def _grammar_choices(constraint, grammar_state: int, eos_token_ids: list[int]) -
     permits EOS, so the model rather than the first match decides where output
     ends. An empty list means the match is complete and cannot be extended.
     EOS tokens decode to no bytes, so the grammar never lists them itself.
+    Native constraints on CUDA return the same set as a cached device mask.
     """
+    choices = getattr(constraint, "choices", None)
+    if choices is not None:
+        return choices(grammar_state, eos_token_ids)
     valid_token_ids = constraint.get_valid_token_ids(grammar_state)
     if not constraint.is_match_state(grammar_state):
         if not valid_token_ids:
@@ -167,11 +171,61 @@ def _grammar_choices(constraint, grammar_state: int, eos_token_ids: list[int]) -
     return [*valid_token_ids, *eos_token_ids]
 
 
+class _MaskedGrammar:
+    """A native constraint whose selectable tokens are cached device masks.
+
+    The engine caches scans by grammar state and names each exact token set by
+    a scan id, so a mask is uploaded once per set, not once per position. The
+    cache is bounded; a mask is one byte per vocabulary token.
+    """
+
+    _MASK_CAPACITY = 32
+
+    def __init__(self, constraint, device: torch.device):
+        self._constraint = constraint
+        self._device = device
+        self._masks: dict[tuple, torch.Tensor] = {}
+
+    def __getattr__(self, name):
+        if name.startswith("_"):
+            raise AttributeError(name)
+        return getattr(self._constraint, name)
+
+    def choices(self, grammar_state: int, eos_token_ids: list[int]):
+        scan_id, count = self._constraint.scan_valid_tokens(grammar_state)
+        # Same rules and list length as _grammar_choices for plain constraints.
+        match = self._constraint.is_match_state(grammar_state)
+        if not match and not count:
+            raise ValueError("Grammar constraint has no valid token continuation")
+        if match and not count:
+            return []
+        eos = tuple(eos_token_ids) if match else ()
+        if len(set(eos)) != len(eos):
+            # A repeated EOS counts twice in the list form; a mask cannot.
+            return [*self._constraint.get_valid_token_ids(grammar_state), *eos]
+        key = (scan_id, eos)
+        blocked = self._masks.pop(key, None)
+        if blocked is None:
+            host = torch.frombuffer(self._constraint.blocked_token_mask(grammar_state), dtype=torch.bool)
+            blocked = host.to(self._device)
+            if eos:
+                blocked[list(eos)] = False
+            if len(self._masks) >= self._MASK_CAPACITY:
+                del self._masks[next(iter(self._masks))]
+        self._masks[key] = blocked
+        return TokenMask(blocked, count + len(eos))
+
+    def prefetch(self, grammar_state: int) -> None:
+        """Fill the engine's scan cache now, typically while the GPU is busy."""
+        self._constraint.scan_valid_tokens(grammar_state)
+
+
 def _initialize_grammar_constraint(
     logits_vocab_size: int,
     regex: str | None,
     token_byte_vocabulary: TokenByteVocabulary,
     json_schema: str | None,
+    device: torch.device | None = None,
 ):
     from onyx_cuda import _rust
 
@@ -183,6 +237,8 @@ def _initialize_grammar_constraint(
         constraint.compile_json_schema(json_schema)
     else:
         constraint.compile_regex(regex)
+    if device is not None and device.type == "cuda":
+        constraint = _MaskedGrammar(constraint, device)
     return constraint, constraint.init_state()
 
 
@@ -248,6 +304,7 @@ def generate_token_events(
                 regex,
                 token_byte_vocabulary,
                 json_schema,
+                logits.device,
             )
             if compile_started_at is not None:
                 grammar_compile_seconds = time.perf_counter() - compile_started_at

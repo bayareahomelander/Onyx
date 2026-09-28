@@ -7,14 +7,15 @@
 use regex_automata::dfa::Automaton;
 use regex_automata::util::primitives::StateID;
 use serde_json::Value;
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
-use crate::constraint::{ConstraintEngine, ConstraintError};
+use crate::constraint::{ConstraintEngine, ConstraintError, ScanKey};
 use crate::schema::{PropertyBlueprint, SchemaBlueprint, SchemaType};
 use crate::regex_engine::StringPattern;
 
 /// syntax state within an object scope
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ObjectSyntaxState {
     /// expecting '"' to start a key or '}' for empty/end
     ExpectKeyOrEnd,
@@ -72,6 +73,30 @@ impl StringState {
         state.min_length = min_length;
         state.max_length = max_length;
         state
+    }
+
+    /// Without a maximum length, the count matters only until it reaches the
+    /// minimum length; scan-cache keys drop the rest.
+    fn canonicalize_count(&mut self) {
+        if self.max_length.is_none() {
+            self.char_count = self.char_count.min(self.min_length.unwrap_or(0));
+        }
+    }
+
+    fn same_state(&self, other: &Self) -> bool {
+        self.pending == other.pending
+            && same_arc(&self.pattern, &other.pattern)
+            && self.dfa_state == other.dfa_state
+            && self.char_count == other.char_count
+            && self.min_length == other.min_length
+            && self.max_length == other.max_length
+    }
+
+    fn hash_state<H: Hasher>(&self, state: &mut H) {
+        self.pending.hash(state);
+        self.pattern.as_ref().map(Arc::as_ptr).hash(state);
+        self.dfa_state.map(|id| id.as_u32()).hash(state);
+        (self.char_count, self.min_length, self.max_length).hash(state);
     }
 
     fn decode_byte(&mut self, byte: u8) -> Option<StringStep> {
@@ -341,7 +366,7 @@ pub struct NullState {
 }
 
 /// syntax state within an array scope
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ArraySyntaxState {
     /// expecting a value or ']' for empty/end
     ExpectValueOrEnd,
@@ -433,6 +458,140 @@ pub enum Scope {
     Array(ArrayState),
     /// parsing an enum value (one of a fixed set of allowed JSON values)
     Enum(EnumState),
+}
+
+fn same_arc<T>(left: &Option<Arc<T>>, right: &Option<Arc<T>>) -> bool {
+    match (left, right) {
+        (Some(left), Some(right)) => Arc::ptr_eq(left, right),
+        (None, None) => true,
+        _ => false,
+    }
+}
+
+/// A parser stack used as a scan-cache key. Byte validation reads only the
+/// stack, so equal keys have equal scans except for tokens that complete the
+/// document, whose final check also reads the output. Blueprints and patterns
+/// compare by identity; the key owns them, so a cached address cannot be
+/// reused by a different blueprint.
+#[derive(Clone)]
+pub struct JsonScanKey(Vec<Scope>);
+
+impl JsonScanKey {
+    fn new(stack: &[Scope]) -> Self {
+        let mut stack = stack.to_vec();
+        for scope in &mut stack {
+            match scope {
+                Scope::String(state) | Scope::Object { key_state: state, .. } => {
+                    state.canonicalize_count()
+                }
+                _ => {}
+            }
+        }
+        Self(stack)
+    }
+}
+
+impl PartialEq for JsonScanKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.len() == other.0.len()
+            && self.0.iter().zip(&other.0).all(|pair| match pair {
+                (Scope::Root, Scope::Root) => true,
+                (
+                    Scope::Object {
+                        blueprint: b1,
+                        syntax_state: s1,
+                        key_buffer: k1,
+                        used_keys: u1,
+                        key_state: ks1,
+                        missing_required_keys: m1,
+                    },
+                    Scope::Object {
+                        blueprint: b2,
+                        syntax_state: s2,
+                        key_buffer: k2,
+                        used_keys: u2,
+                        key_state: ks2,
+                        missing_required_keys: m2,
+                    },
+                ) => {
+                    Arc::ptr_eq(b1, b2)
+                        && s1 == s2
+                        && k1 == k2
+                        && u1 == u2
+                        && ks1.same_state(ks2)
+                        && m1 == m2
+                }
+                (Scope::String(a), Scope::String(b)) => a.same_state(b),
+                (Scope::Number(a), Scope::Number(b)) => {
+                    a.buffer == b.buffer
+                        && a.has_decimal == b.has_decimal
+                        && a.has_exponent == b.has_exponent
+                        && a.expect_digit == b.expect_digit
+                        && a.is_integer == b.is_integer
+                }
+                (Scope::Boolean(a), Scope::Boolean(b)) => {
+                    a.target == b.target && a.position == b.position
+                }
+                (Scope::Null(a), Scope::Null(b)) => a.position == b.position,
+                (Scope::Array(a), Scope::Array(b)) => {
+                    a.syntax_state == b.syntax_state
+                        && same_arc(&a.item_blueprint, &b.item_blueprint)
+                        && a.item_count == b.item_count
+                        && a.min_items == b.min_items
+                        && a.max_items == b.max_items
+                }
+                (Scope::Enum(a), Scope::Enum(b)) => {
+                    a.candidates == b.candidates && a.cursor == b.cursor
+                }
+                _ => false,
+            })
+    }
+}
+
+impl Eq for JsonScanKey {}
+
+impl Hash for JsonScanKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.0.len().hash(state);
+        for scope in &self.0 {
+            std::mem::discriminant(scope).hash(state);
+            match scope {
+                Scope::Root => {}
+                Scope::Object {
+                    blueprint,
+                    syntax_state,
+                    key_buffer,
+                    used_keys,
+                    key_state,
+                    missing_required_keys,
+                } => {
+                    Arc::as_ptr(blueprint).hash(state);
+                    (syntax_state, key_buffer, used_keys).hash(state);
+                    key_state.hash_state(state);
+                    let mut missing: Vec<&String> = missing_required_keys.iter().collect();
+                    missing.sort();
+                    missing.hash(state);
+                }
+                Scope::String(string) => string.hash_state(state),
+                Scope::Number(number) => (
+                    &number.buffer,
+                    number.has_decimal,
+                    number.has_exponent,
+                    number.expect_digit,
+                    number.is_integer,
+                )
+                    .hash(state),
+                Scope::Boolean(boolean) => (boolean.target, boolean.position).hash(state),
+                Scope::Null(null) => null.position.hash(state),
+                Scope::Array(array) => {
+                    array.syntax_state.hash(state);
+                    array.item_blueprint.as_ref().map(Arc::as_ptr).hash(state);
+                    (array.item_count, array.min_items, array.max_items).hash(state);
+                }
+                Scope::Enum(values) => (&values.candidates, values.cursor).hash(state),
+            }
+        }
+    }
 }
 
 /// a JSON schema constraint engine using stack-based scopes
@@ -746,8 +905,14 @@ impl JsonEngine {
 
     /// check if a token is valid from the current state
     fn validate_token(&self, token_bytes: &[u8]) -> bool {
+        self.check_token(token_bytes).0
+    }
+
+    /// Validity, and whether it also depended on the output (a token that
+    /// completes the document gets the final whole-document check).
+    fn check_token(&self, token_bytes: &[u8]) -> (bool, bool) {
         if token_bytes.is_empty() || self.dead || self.finished {
-            return false;
+            return (false, false);
         }
 
         let mut temp_stack = self.stack.clone();
@@ -761,16 +926,16 @@ impl JsonEngine {
                 &mut temp_finished,
                 byte,
             ) {
-                return false;
+                return (false, false);
             }
         }
 
         if Self::complete(&temp_stack, temp_finished) {
             let mut output = self.output.clone();
             output.extend_from_slice(token_bytes);
-            return self.valid_completion(&output);
+            return (self.valid_completion(&output), true);
         }
-        true
+        (true, false)
     }
 
     /// advance the actual state with a byte
@@ -1189,11 +1354,28 @@ impl ConstraintEngine for JsonEngine {
     }
 
     fn get_valid_tokens(&self) -> Vec<usize> {
+        self.scan().0
+    }
+
+    fn scan_key(&self) -> Option<ScanKey> {
+        Some(if self.dead || self.finished {
+            ScanKey::Empty
+        } else {
+            ScanKey::Json(JsonScanKey::new(&self.stack))
+        })
+    }
+
+    fn is_valid_token(&self, token_id: usize) -> bool {
+        self.vocab.get(token_id).is_some_and(|bytes| self.validate_token(bytes))
+    }
+
+    fn scan(&self) -> (Vec<usize>, Vec<usize>) {
         if self.dead || self.finished {
-            return Vec::new();
+            return (Vec::new(), Vec::new());
         }
 
         let mut valid_tokens = Vec::new();
+        let mut output_dependent = Vec::new();
         let mut first_bytes = [None; 256];
         for (token_id, bytes) in self.vocab.iter().enumerate() {
             let Some(&first) = bytes.first() else {
@@ -1213,12 +1395,19 @@ impl ConstraintEngine for JsonEngine {
                     first,
                 )
             });
-            if allowed && self.validate_token(bytes) {
+            if !allowed {
+                continue;
+            }
+            let (valid, dependent) = self.check_token(bytes);
+            if valid {
                 valid_tokens.push(token_id);
+            }
+            if dependent {
+                output_dependent.push(token_id);
             }
         }
 
-        valid_tokens
+        (valid_tokens, output_dependent)
     }
 
     fn advance(&mut self, token_id: usize) -> Result<(), ConstraintError> {

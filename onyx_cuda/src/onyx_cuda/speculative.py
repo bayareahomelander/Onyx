@@ -35,6 +35,8 @@ class ProposalResult(NamedTuple):
     token_ids: list[int]
     draft_cache_length_before: int
     draft_cache_length_after: int
+    # Grammar state after the last proposed token, when it is not EOS.
+    grammar_state: int | None = None
 
 
 class VerificationResult(NamedTuple):
@@ -201,7 +203,9 @@ def propose_tokens(
                 break
             input_ids = token_id[:, None]
 
-    return ProposalResult(proposed, start_length, draft_cache.length)
+    final_state = (draft_grammar_state if grammar_constraint is not None and proposed
+                   and proposed[-1] not in eos_token_ids else None)
+    return ProposalResult(proposed, start_length, draft_cache.length, final_state)
 
 
 def _verify_proposal(
@@ -236,6 +240,15 @@ def _verify_proposal(
         checkpoint.before_forward(target_cache, input_ids, generated_token_ids)
     with torch.inference_mode():
         target_logits = target_cache.extend(target_model, input_ids)
+    prefetch = getattr(grammar_constraint, "prefetch", None)
+    if prefetch is not None and proposal.grammar_state is not None:
+        # The draft never scans the state after its last token, which the final
+        # verification position needs. Scanning it now overlaps the target
+        # forward; the verifier's own scan of that state is then a cache hit.
+        started_at = time.perf_counter() if mask_times is not None else None
+        prefetch(proposal.grammar_state)
+        if started_at is not None:
+            mask_times.append(time.perf_counter() - started_at)
 
     replayed = False
     for attempt in range(2):
@@ -481,6 +494,7 @@ def generate_speculative_events(
                 regex,
                 token_byte_vocabulary,
                 json_schema,
+                target_prefill.logits.device,
             )
             if compile_started_at is not None:
                 grammar_compile_seconds = time.perf_counter() - compile_started_at

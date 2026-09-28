@@ -12,7 +12,7 @@ use regex_automata::Anchored;
 use regex_syntax::hir::{Hir, Look};
 use regex_syntax::utf8::Utf8Sequences;
 
-use crate::constraint::{ConstraintEngine, ConstraintError};
+use crate::constraint::{ConstraintEngine, ConstraintError, ScanKey};
 
 pub struct CompiledDfa {
     pub dfa: dense::DFA<Vec<u32>>,
@@ -316,6 +316,11 @@ impl ConstraintEngine for RegexEngine {
             current_state: self.current_state,
             initial_state: self.initial_state,
         })
+    }
+
+    fn scan_key(&self) -> Option<ScanKey> {
+        // A scan walks only the DFA from the current state.
+        Some(ScanKey::Regex(self.current_state.as_u32()))
     }
 }
 
