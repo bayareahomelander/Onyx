@@ -1,10 +1,13 @@
-"""Optional, model-owned exact-block recovery for the validated Qwen3 runtime.
+"""Model-owned exact-block recovery for the validated Qwen3 runtime.
 
+The default (auto) enables it only on the qualified Linux RTX 2080 Ti setup;
+graph opts in on any capability 7.5 GPU, and scalar disables it.
 Ordinary model forwards are never patched. Graph buffers are serialized across
 callers/streams; output and cache state remain owned by each generation.
 """
 
 import os
+import sys
 import threading
 import time
 import weakref
@@ -21,12 +24,19 @@ from onyx_cuda.revisions import MODEL_REVISIONS
 
 _lifecycle_lock = threading.RLock()
 _REPLAY_WIDTHS = (2, 3, 8)
+# Bitwise qualification ran on an RTX 2080 Ti (68 SMs); cuBLAS kernel choice
+# can depend on the SM count, so auto does not extend to other Turing GPUs.
+_VALIDATED_SM_COUNT = 68
+# A graph block holds one extra full KV copy while its trial cache is checked.
+# With the draft graphs also resident, longer contexts exhaust the 22 GiB GPU,
+# so they use scalar recovery. Sept 27 probes fit 6.6k tokens and failed at 7.2k.
+_MAX_GRAPH_CONTEXT = 6144
 
 
 def resolve_replay_backend(value=None):
-    value = value if value is not None else os.environ.get("ONYX_REPLAY_BACKEND", "scalar")
-    if value not in ("scalar", "graph"):
-        raise ValueError("ONYX_REPLAY_BACKEND must be scalar or graph")
+    value = value if value is not None else os.environ.get("ONYX_REPLAY_BACKEND", "auto")
+    if value not in ("auto", "scalar", "graph"):
+        raise ValueError("ONYX_REPLAY_BACKEND must be auto, scalar or graph")
     return value
 
 
@@ -48,6 +58,18 @@ def _unsupported_reason(model):
         return "requires one CUDA device with FP16 weights"
     if torch.cuda.get_device_capability(device) != (7, 5):
         return "graph recovery is validated only on CUDA capability 7.5"
+    return None
+
+
+def _auto_unsupported_reason(model):
+    reason = _unsupported_reason(model)
+    if reason:
+        return reason
+    if not sys.platform.startswith("linux"):
+        return "automatic graph recovery is validated only on Linux"
+    device = next(model.parameters()).device
+    if torch.cuda.get_device_properties(device).multi_processor_count != _VALIDATED_SM_COUNT:
+        return "automatic graph recovery is validated only on the RTX 2080 Ti"
     return None
 
 
@@ -121,7 +143,7 @@ class GraphReplayBackend:
                 and all(type(layer) is DynamicLayer for layer in cache.past_key_values.layers)
                 and ids.ndim == 2 and ids.shape[0] == 1 and ids.shape[1] in _REPLAY_WIDTHS
                 and ids.device == self.device and ids.dtype == torch.long
-                and cache.length + ids.shape[1] <= 8192
+                and cache.length + ids.shape[1] <= _MAX_GRAPH_CONTEXT
                 and cache.attention_mask.shape == (1, cache.length)
                 and bool(torch.all(cache.attention_mask == 1).item()))
 
@@ -143,11 +165,9 @@ class GraphReplayBackend:
                 self._event = torch.cuda.Event()
                 self._event.record(torch.cuda.current_stream(self.device))
             if exhausted:
-                # Never publish a partially extended KV cache. Release model
-                # graphs as well as temporaries so scalar recovery regains its
-                # original memory budget for this and subsequent requests.
-                self.fallback_reason = "CUDA memory exhausted during graph recovery"
-                self.close()
+                # Never publish a partially extended KV cache. Only this
+                # recovery continues with scalar steps; later requests keep
+                # the graphs, which the context limit normally keeps in budget.
                 del trial
                 torch.cuda.empty_cache()
                 return None
@@ -231,11 +251,20 @@ def _prepare(model, mode):
     if mode == "scalar":
         close_replay_backend(model)
         return {"requested": mode, "active": "scalar", "setup_seconds": 0.0}
-    reason = _unsupported_reason(model)
+    reason = _auto_unsupported_reason(model) if mode == "auto" else _unsupported_reason(model)
     if reason:
         close_replay_backend(model)
         return {"requested": mode, "active": "scalar", "reason": reason, "setup_seconds": 0.0}
     if existing is None or existing.closed:
-        existing = GraphReplayBackend(model)
+        try:
+            existing = GraphReplayBackend(model)
+        except torch.OutOfMemoryError:
+            # An explicit graph request fails startup; the default keeps serving.
+            if mode != "auto":
+                raise
+            close_replay_backend(model)
+            torch.cuda.empty_cache()
+            return {"requested": mode, "active": "scalar", "setup_seconds": 0.0,
+                    "reason": "CUDA memory exhausted while preparing graph recovery"}
         model._onyx_replay_backend = existing
     return {"requested": mode, "active": "graph", "setup_seconds": existing.setup_seconds}

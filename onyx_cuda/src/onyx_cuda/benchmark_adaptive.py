@@ -166,8 +166,11 @@ def run(output, *, repetitions=10, split="all", measure=False):
                 torch.cuda.synchronize(device)
                 seconds = time.perf_counter() - started
                 if graph and graphs.closed:
-                    # Memory exhaustion releases the graphs; later runs would be scalar.
                     raise RuntimeError(f"Graph recovery closed during {case['name']}: {graphs.fallback_reason}")
+                fallbacks = (getattr(getattr(result, "timings", None), "replay_stats", None) or {}).get("graph_replay_fallbacks", 0)
+                if graph and fallbacks:
+                    # A scalar fallback (such as memory exhaustion) would mislabel graph timings.
+                    raise RuntimeError(f"Graph recovery fell back during {case['name']}")
                 assert result is not None and ids == result.token_ids
                 signature = (ids, result.finish_reason)
                 if expected is None:

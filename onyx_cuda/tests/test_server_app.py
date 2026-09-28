@@ -97,6 +97,22 @@ def test_target_only_does_not_prepare_graphs():
         assert configuration["reason"] == "speculation is disabled"
 
 
+def test_replay_backend_defaults_to_auto(monkeypatch):
+    import onyx_cuda.replay_backend as replay
+    modes = []
+    def prepare(target, mode):
+        modes.append(mode)
+        return {"requested": mode, "active": "scalar", "setup_seconds": 0.0}
+    monkeypatch.setattr(replay, "prepare_replay_backend", prepare)
+    with TestClient(create_app(engine=object())) as client:
+        assert client.get("/").json()["replay_backend"]["requested"] == "auto"
+    with TestClient(create_app(engine=object(), gamma=0)) as client:
+        configuration = client.get("/").json()["replay_backend"]
+        assert configuration["requested"] == "auto"
+        assert configuration["reason"] == "speculation is disabled"
+    assert modes == ["auto", "scalar"]
+
+
 def test_shutdown_releases_injected_engine_even_if_app_is_retained():
     class Engine:
         pass

@@ -4,11 +4,13 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+import onyx_cuda.replay_backend as replay_backend_module
 from onyx_cuda.replay_backend import prepare_replay_backend, close_replay_backend, resolve_replay_backend
 from onyx_cuda.numerics import GreedyCheckpoint
 
 
 def test_backend_selection_and_unsupported_model(monkeypatch):
+    assert resolve_replay_backend() == "auto"
     monkeypatch.setenv("ONYX_REPLAY_BACKEND", "graph")
     assert resolve_replay_backend() == "graph"
     assert resolve_replay_backend("scalar") == "scalar"
@@ -171,10 +173,14 @@ def test_scalar_and_constrained_history_never_use_graphs(constrained, monkeypatc
         assert not grammar.active_states
 
 
+LIMIT = replay_backend_module._MAX_GRAPH_CONTEXT
+
+
 @pytest.mark.parametrize("width, length, supported", [
     (1, 1, False), (2, 1, True), (3, 1, True), (4, 1, False),
     (7, 1, False), (8, 1, True), (9, 1, False),
-    (8, 8184, True), (8, 8185, False), (3, 8189, True), (2, 8190, True),
+    (8, LIMIT - 8, True), (8, LIMIT - 7, False), (3, LIMIT - 3, True), (2, LIMIT - 2, True),
+    (2, LIMIT - 1, False),
 ])
 def test_graph_support_checks_actual_width_and_context(width, length, supported):
     from onyx_cuda.cache import CacheState
@@ -227,6 +233,55 @@ def test_setup_reuse_and_release(monkeypatch):
     close_replay_backend(model)
 
 
+@pytest.mark.parametrize("platform, sm_count, reason", [
+    ("linux", 68, None),
+    ("win32", 68, "automatic graph recovery is validated only on Linux"),
+    ("linux", 72, "automatic graph recovery is validated only on the RTX 2080 Ti"),
+])
+def test_auto_enables_graphs_only_on_validated_setup(monkeypatch, platform, sm_count, reason):
+    import onyx_cuda.replay_backend as replay
+    class Backend:
+        def __init__(self, model):
+            self.closed = False; self.setup_seconds = 3
+        def close(self):
+            self.closed = True
+    monkeypatch.setattr(replay, "_unsupported_reason", lambda model: None)
+    monkeypatch.setattr(replay, "GraphReplayBackend", Backend)
+    monkeypatch.setattr(replay.sys, "platform", platform)
+    monkeypatch.setattr(replay.torch.cuda, "get_device_properties",
+                        lambda device: SimpleNamespace(multi_processor_count=sm_count))
+    model = SimpleNamespace(parameters=lambda: iter([SimpleNamespace(device="cuda:0")]))
+    configuration = prepare_replay_backend(model, "auto")
+    assert configuration["requested"] == "auto"
+    if reason is None:
+        assert configuration["active"] == "graph"
+        assert model._onyx_replay_backend.setup_seconds == 3
+        close_replay_backend(model)
+    else:
+        assert configuration == {"requested": "auto", "active": "scalar", "reason": reason,
+                                 "setup_seconds": 0.0}
+        assert not hasattr(model, "_onyx_replay_backend")
+
+
+def test_auto_keeps_scalar_when_graph_setup_exhausts_memory(monkeypatch):
+    import onyx_cuda.replay_backend as replay
+    def exhausted(model):
+        raise torch.OutOfMemoryError("CUDA out of memory")
+    emptied = []
+    monkeypatch.setattr(replay, "_auto_unsupported_reason", lambda model: None)
+    monkeypatch.setattr(replay, "_unsupported_reason", lambda model: None)
+    monkeypatch.setattr(replay, "GraphReplayBackend", exhausted)
+    monkeypatch.setattr(replay.torch.cuda, "empty_cache", lambda: emptied.append(True))
+    model = SimpleNamespace()
+    assert prepare_replay_backend(model, "auto") == {
+        "requested": "auto", "active": "scalar", "setup_seconds": 0.0,
+        "reason": "CUDA memory exhausted while preparing graph recovery"}
+    assert emptied and not hasattr(model, "_onyx_replay_backend")
+    # An explicit request still fails rather than silently changing speed.
+    with pytest.raises(torch.OutOfMemoryError):
+        prepare_replay_backend(model, "graph")
+
+
 def test_concurrent_setup_and_close_are_idempotent(monkeypatch):
     import time
     from concurrent.futures import ThreadPoolExecutor
@@ -257,7 +312,7 @@ def test_concurrent_setup_and_close_are_idempotent(monkeypatch):
 
 
 @pytest.mark.parametrize("width", [2, 3, 8])
-def test_memory_failure_discards_partial_cache_and_releases_graphs(monkeypatch, width):
+def test_memory_failure_discards_partial_cache_and_keeps_graphs(monkeypatch, width):
     from contextlib import nullcontext
     from threading import RLock
     from onyx_cuda.replay_backend import GraphReplayBackend
@@ -282,8 +337,9 @@ def test_memory_failure_discards_partial_cache_and_releases_graphs(monkeypatch, 
     cache = Cache()
     assert backend.extend(cache, torch.full((1, width), 5)) is None
     assert cache.past_key_values.tokens == [8]
-    assert backend.closed and not backend._graphs and released == [True]
-    assert "memory exhausted" in backend.fallback_reason
+    # Only this recovery falls back; later requests keep the graphs.
+    assert not backend.closed and backend._graphs and released == [True]
+    assert backend.fallback_reason is None
 
 
 @pytest.mark.gpu
@@ -376,7 +432,10 @@ def test_graph_recovery_exact_concurrent_streams_and_cleanup(monkeypatch):
             assert backend.extend(cache, initial.token_id.reshape(1, 1).expand(1, 8)) is None
         assert cache.length == length
         assert all(layer.keys.shape[-2] == length for layer in cache.past_key_values.layers)
-        assert backend.closed and not backend._graphs
+        assert not backend.closed and backend._graphs
+        # The retained graphs still serve the next recovery.
+        assert backend.extend(cache, initial.token_id.reshape(1, 1).expand(1, 8)) is not None
+        assert cache.length == length + 8
         del cache, initial
     finally:
         close_replay_backend(pair.target.model)

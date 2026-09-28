@@ -659,8 +659,8 @@ def create_app(
             app.state.replay_configuration = prepare_replay_backend(
                 getattr(getattr(app.state.engines[MODEL_ID], "target", None), "model", None),
                 replay_backend if gamma > 0 else "scalar")
-            if gamma == 0 and replay_backend == "graph":
-                app.state.replay_configuration.update(requested="graph", reason="speculation is disabled")
+            if gamma == 0 and replay_backend != "scalar":
+                app.state.replay_configuration.update(requested=replay_backend, reason="speculation is disabled")
             app.state.draft_configuration = prepare_draft_backend(
                 getattr(getattr(app.state.engines[MODEL_ID], "draft", None), "model", None),
                 draft_backend if gamma > 0 else "eager", capacity=limits.context_tokens)

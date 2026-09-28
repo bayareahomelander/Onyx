@@ -988,7 +988,8 @@ def test_real_uvicorn_api_phase_gate(monkeypatch):
     server.install_signal_handlers = lambda: None
     thread = threading.Thread(target=server.run, daemon=True)
     thread.start()
-    deadline = time.time() + 60
+    # Default graph recovery preparation takes about 45 seconds on the validated GPU.
+    deadline = time.time() + 180
     while not server.started:
         assert thread.is_alive()
         assert time.time() < deadline
@@ -1030,6 +1031,12 @@ def test_real_uvicorn_api_phase_gate(monkeypatch):
             assert root.status_code == 200
             assert root.json()["status"] == "ok"
             assert "/v1/chat/completions" in root.json()["endpoints"]
+            from onyx_cuda.replay_backend import _auto_unsupported_reason
+            replay = root.json()["replay_backend"]
+            assert replay["requested"] == "auto"
+            reason = _auto_unsupported_reason(pair.target.model)
+            assert replay["active"] == ("scalar" if reason else "graph")
+            assert replay.get("reason") == reason
             assert [item["id"] for item in models.json()["data"]] == [MODEL_ID]
             assert (
                 client.post(

@@ -87,16 +87,22 @@ a successful `stop` finish event; `[DONE]` alone is insufficient.
 | Draft decoding | CUDA graphs for the pinned draft; ordinary forward otherwise |
 | Thinking | Disabled |
 | Context / maximum output | 8192 tokens including prompt / 4096 output tokens |
-| Token selection / recovery | Torch / scalar |
+| Token selection / recovery | Torch / graph recovery on the validated Linux RTX 2080 Ti, scalar elsewhere |
 
 No model overrides are needed for the default setup.
 
 Draft graphs replay each draft token as one CUDA graph over the draft's own
 weights. The target still verifies every proposed token, so they change speed,
 not output. Set `ONYX_DRAFT_BACKEND=eager` to use the ordinary draft forward.
-Opt-in graph recovery processes unconstrained emitted history in eight-token
-blocks, with two/three-token blocks and scalar steps for remainders; set
-`ONYX_REPLAY_BACKEND=graph` to enable it.
+Graph recovery processes unconstrained emitted history in eight-token blocks,
+with two/three-token blocks and scalar steps for remainders. The default
+(`auto`) enables it only where it was qualified: Linux, an RTX 2080 Ti (compute
+capability 7.5, 68 SMs), and the pinned target and library versions. Elsewhere,
+or if preparing its graphs runs out of GPU memory, the server starts with scalar
+recovery and `GET /` reports why. Set `ONYX_REPLAY_BACKEND=scalar` to disable
+it, or `graph` to require it on any capability 7.5 GPU. Recovery beyond 6144
+tokens of context uses scalar steps: each graph block briefly holds an extra
+copy of the KV cache, which no longer fits beside the draft graphs.
 
 ## Settings
 
@@ -109,7 +115,7 @@ Set environment variables in the server's terminal before startup:
 | `ONYX_SPECULATIVE_GAMMA` | `2` | Draft tokens per step; `0` selects target-only generation |
 | `ONYX_SPECULATIVE_MODE` | `fixed` | `adaptive` opts into the experimental adaptive controller |
 | `ONYX_DRAFT_BACKEND` | `graph` | `eager` uses the ordinary draft forward |
-| `ONYX_REPLAY_BACKEND` | `scalar` | `graph` opts into graph recovery, validated on CUDA capability 7.5 |
+| `ONYX_REPLAY_BACKEND` | `auto` | `scalar` disables graph recovery; `graph` requires it on any CUDA capability 7.5 GPU and fails startup if it cannot be prepared |
 | `ONYX_GREEDY_BACKEND` | `torch` | `cuda` uses the optional custom selector (install `.[kernels]`; needs CUDA Toolkit 12.4) |
 | `ONYX_MAX_CONTEXT_TOKENS` | `8192` | Prompt plus requested output tokens |
 | `ONYX_MAX_OUTPUT_TOKENS` | `4096` | Maximum requested output; omitted budgets use the smaller of 1024 and this limit |
@@ -130,8 +136,8 @@ per-case median generation times, excluding model loading and graph setup:
 
 | Mode | Aggregate speedup over target-only |
 | --- | ---: |
-| Fixed gamma 2, draft graphs, scalar recovery (default) | 1.292x |
-| Fixed gamma 2, draft graphs, graph recovery (opt-in) | **1.398x** |
+| Fixed gamma 2, draft graphs, scalar recovery (`ONYX_REPLAY_BACKEND=scalar`) | 1.292x |
+| Fixed gamma 2, draft graphs, graph recovery (default on this GPU) | **1.398x** |
 
 In the same run, the ordinary draft forward measured 1.130x and 1.211x; draft
 graphs reduced total generation time by 12.6% and 13.4%. Every output in every
@@ -146,8 +152,9 @@ Peak memory in the comparison was 17.29 GiB allocated.
 The full CUDA suite passed 872 tests with draft graphs enabled, with three
 Windows-specific skips. September 22 checks matched full logits and KV caches
 bitwise through 8192 tokens with graph recovery, and the API completed a
-4096-prompt/4096-output capacity test. Memory exhaustion during graph recovery
-still releases its graphs and falls back to scalar recovery. Draft graphs have
+4096-prompt/4096-output capacity test. If a graph block still exhausts GPU
+memory, that recovery continues with scalar steps and later requests keep the
+graphs. Draft graphs have
 not yet been validated on a Windows GPU. Adaptive speculation remains
 experimental and was not remeasured with draft graphs.
 
@@ -169,7 +176,7 @@ forward side by side.
 
 Category results from the same September 25 comparison:
 
-| Workload | Default | With graph recovery |
+| Workload | Scalar recovery | Graph recovery (default) |
 | --- | ---: | ---: |
 | Code generation | **2.02x** | **2.02x** |
 | Regex-constrained output | **1.79x** | **1.79x** |
