@@ -1,6 +1,8 @@
-"""Paired speed comparison of target-only and fixed gamma 2 speculative generation.
+"""Paired speed comparison of target-only and fixed-gamma speculative generation.
 
-Every mode runs in one interleaved comparison. On a target that supports graph
+Every mode runs in one interleaved comparison: target-only, then each requested
+gamma (the service default unless --gamma lists others) with scalar recovery
+and, where supported, graph recovery. On a target that supports graph
 recovery, graphs are prepared once and stay resident for all modes, but only
 graph modes use them; model loading and graph setup are excluded from timings.
 Draft graphs follow the service default (ONYX_DRAFT_BACKEND) for every mode.
@@ -19,7 +21,7 @@ import torch
 import transformers
 
 from onyx_cuda.benchmark_corpus import CORPUS
-from onyx_cuda.config import resolve_model_selection
+from onyx_cuda.config import DEFAULT_GAMMA, resolve_model_selection
 from onyx_cuda.draft_backend import close_draft_backend, prepare_draft_backend, resolve_draft_backend
 from onyx_cuda.generation import AcceptedTokenEvent
 from onyx_cuda.model import load_model_pair
@@ -29,18 +31,18 @@ from onyx_cuda.speculative import generate_speculative_events
 from onyx_cuda.vocabulary import get_token_byte_vocabulary
 from onyx_cuda._validation_report import evidence
 
-# Mode: (gamma, graph recovery).
-MODES = {
-    "gamma0": (0, False),
-    "gamma2": (2, False),
-    "gamma2_graph": (2, True),
-}
+def select_modes(replay_configuration, gammas=(DEFAULT_GAMMA,)):
+    """Map mode names to (gamma, graph recovery), target-only first.
 
-
-def select_modes(replay_configuration):
-    """Graph modes run only when graphs are active; otherwise they would repeat scalar timings."""
+    Graph modes run only when graphs are active; otherwise they would repeat scalar timings.
+    """
     graph = replay_configuration["active"] == "graph"
-    return [mode for mode, (_, uses_graph) in MODES.items() if graph or not uses_graph]
+    modes = {"gamma0": (0, False)}
+    for gamma in gammas:
+        modes[f"gamma{gamma}"] = (gamma, False)
+        if graph:
+            modes[f"gamma{gamma}_graph"] = (gamma, True)
+    return modes
 
 
 def use_replay_backend(model, backend):
@@ -52,21 +54,26 @@ def use_replay_backend(model, backend):
 
 
 def summarize(cases):
-    modes = [mode for mode in MODES if cases and mode in cases[0]["median_seconds"]]
+    modes = list(cases[0]["median_seconds"]) if cases else []
     totals = {mode: sum(c["median_seconds"][mode] for c in cases) for mode in modes}
     slower = {mode: [c["name"] for c in cases if c["median_seconds"][mode] > c["median_seconds"]["gamma0"]]
               for mode in modes if mode != "gamma0"}
     summary = {"total_median_seconds": totals,
                "speedup_vs_target": {m: totals["gamma0"] / totals[m] for m in modes},
                "slower_than_target": slower}
-    if "gamma2_graph" in totals:
-        summary["graph_latency_reduction_vs_scalar"] = 1 - totals["gamma2_graph"] / totals["gamma2"]
+    # Keyed by the scalar-recovery mode of each gamma that also ran with graphs.
+    reductions = {mode: 1 - totals[f"{mode}_graph"] / totals[mode] for mode in modes if f"{mode}_graph" in totals}
+    if reductions:
+        summary["graph_latency_reduction_vs_scalar"] = reductions
     return summary
 
 
-def run(output, *, repetitions=3, split="all", measure=False):
+def run(output, *, repetitions=3, split="all", measure=False, gammas=(DEFAULT_GAMMA,)):
     if output.exists():
         raise ValueError("Choose a new output filename; benchmark evidence is not overwritten")
+    if (not gammas or len(set(gammas)) != len(gammas)
+            or any(isinstance(g, bool) or not isinstance(g, int) or g < 1 for g in gammas)):
+        raise ValueError("gammas must be distinct positive integers")
     corpus_bytes = json.dumps(CORPUS, sort_keys=True).encode()
     selected = [c for c in CORPUS if split == "all" or c["split"] == split]
     device = torch.device("cuda:0")
@@ -75,13 +82,13 @@ def run(output, *, repetitions=3, split="all", measure=False):
     replay_configuration = prepare_replay_backend(target_model, "graph")
     graphs = getattr(target_model, "_onyx_replay_backend", None)
     draft_configuration = prepare_draft_backend(pair.draft.model, resolve_draft_backend())
-    modes = select_modes(replay_configuration)
+    modes = select_modes(replay_configuration, gammas)
     vocabulary = get_token_byte_vocabulary(pair.target.tokenizer, pair.target.model.config.vocab_size)
     report = {"corpus_sha256": hashlib.sha256(corpus_bytes).hexdigest(), "corpus_version": 1,
               "settings": {"repetitions": repetitions, "warmups": 1, "split": split,
                            "measure": measure, "temperature": 0, "enable_thinking": False,
                            "dtype": "float16",
-                           "modes": {mode: dict(zip(("gamma", "graph_recovery"), MODES[mode]))
+                           "modes": {mode: dict(zip(("gamma", "graph_recovery"), modes[mode]))
                                      for mode in modes},
                            "replay_backend": replay_configuration,
                            "draft_backend": draft_configuration},
@@ -110,7 +117,7 @@ def run(output, *, repetitions=3, split="all", measure=False):
 
             def generate(mode):
                 nonlocal expected
-                gamma, graph = MODES[mode]
+                gamma, graph = modes[mode]
                 use_replay_backend(target_model, graphs if graph else None)
                 torch.cuda.synchronize(device)
                 torch.cuda.reset_peak_memory_stats(device)
@@ -157,9 +164,10 @@ def run(output, *, repetitions=3, split="all", measure=False):
             torch.cuda.synchronize(device)
             allocation = torch.cuda.memory_allocated(device)
             runs = {mode: [] for mode in modes}
+            names = list(modes)
             for repetition in range(repetitions):
-                offset = (index + repetition) % len(modes)
-                for mode in modes[offset:] + modes[:offset]:
+                offset = (index + repetition) % len(names)
+                for mode in names[offset:] + names[:offset]:
                     runs[mode].append(generate(mode))
             gc.collect()
             torch.cuda.synchronize(device)
@@ -192,10 +200,15 @@ def main():
     parser.add_argument("--repetitions", type=int, default=3)
     parser.add_argument("--split", choices=("development", "heldout", "all"), default="all")
     parser.add_argument("--measure", action="store_true", help="Separate instrumented diagnostic run")
+    parser.add_argument("--gamma", type=int, nargs="+", default=[DEFAULT_GAMMA],
+                        help="Speculative gammas to compare with target-only (default: %(default)s)")
     args = parser.parse_args()
     if args.repetitions < 1:
         parser.error("repetitions must be positive")
-    run(args.output, repetitions=args.repetitions, split=args.split, measure=args.measure)
+    if min(args.gamma) < 1 or len(set(args.gamma)) != len(args.gamma):
+        parser.error("gammas must be distinct positive integers")
+    run(args.output, repetitions=args.repetitions, split=args.split, measure=args.measure,
+        gammas=tuple(args.gamma))
 
 
 if __name__ == "__main__":

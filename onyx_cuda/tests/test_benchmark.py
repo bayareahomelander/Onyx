@@ -22,15 +22,24 @@ def test_summary_keeps_regressions_visible_beside_the_aggregate():
 
 
 def test_graph_modes_run_only_when_graphs_are_active():
-    assert select_modes({"active": "graph"}) == ["gamma0", "gamma2", "gamma2_graph"]
-    assert select_modes({"active": "scalar", "reason": "unsupported"}) == ["gamma0", "gamma2"]
+    assert select_modes({"active": "graph"}) == {"gamma0": (0, False), "gamma2": (2, False),
+                                                 "gamma2_graph": (2, True)}
+    assert list(select_modes({"active": "scalar", "reason": "unsupported"})) == ["gamma0", "gamma2"]
+    assert list(select_modes({"active": "graph"}, (2, 3))) == [
+        "gamma0", "gamma2", "gamma2_graph", "gamma3", "gamma3_graph"]
 
 
 def test_graph_summary_reports_every_mode_and_graph_saving():
     report = summarize([row("winner", 10, 5, 4.5)])
     assert set(report["speedup_vs_target"]) == {"gamma0", "gamma2", "gamma2_graph"}
-    assert report["graph_latency_reduction_vs_scalar"] == pytest.approx(0.1)
+    assert report["graph_latency_reduction_vs_scalar"] == {"gamma2": pytest.approx(0.1)}
     assert "graph_latency_reduction_vs_scalar" not in summarize([row("winner", 10, 5)])
+    extra = row("winner", 10, 5, 4.5)
+    extra["median_seconds"].update(gamma3=4, gamma3_graph=3)
+    report = summarize([extra])
+    assert list(report["speedup_vs_target"]) == ["gamma0", "gamma2", "gamma2_graph", "gamma3", "gamma3_graph"]
+    assert report["graph_latency_reduction_vs_scalar"] == {"gamma2": pytest.approx(0.1),
+                                                           "gamma3": pytest.approx(0.25)}
 
 
 @pytest.fixture
@@ -102,6 +111,21 @@ def test_one_run_interleaves_every_mode_and_attaches_graphs_only_to_graph_modes(
     runs = report["cases"][0]["runs"]
     assert runs["gamma0"][0]["speculation"] is None
     assert runs["gamma2"][0]["speculation"]["accepted_proposal_count"] == 1
+
+
+def test_extra_gammas_join_the_same_interleaved_run(benchmark, tmp_path):
+    report = benchmark.run(tmp_path / "report.json", repetitions=1, gammas=(2, 3))
+    assert set(benchmark.calls) == {(0, False), (2, False), (2, True), (3, False), (3, True)}
+    assert report["settings"]["modes"]["gamma3_graph"] == {"gamma": 3, "graph_recovery": True}
+    assert list(report["summary"]["speedup_vs_target"]) == list(report["settings"]["modes"])
+
+
+@pytest.mark.parametrize("gammas", [(), (2, 2), (0,), (True,)])
+def test_invalid_gammas_fail_before_loading_models(benchmark, tmp_path, monkeypatch, gammas):
+    import onyx_cuda.benchmark as module
+    monkeypatch.setattr(module, "load_model_pair", lambda **_: pytest.fail("models must not load"))
+    with pytest.raises(ValueError, match="gammas"):
+        benchmark.run(tmp_path / "report.json", gammas=gammas)
 
 
 def test_per_request_graph_fallback_fails_without_measurement(benchmark, tmp_path):

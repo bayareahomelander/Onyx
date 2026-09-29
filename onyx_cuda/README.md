@@ -165,6 +165,7 @@ python -m onyx_cuda.benchmark --output validation/speedups.json
 
 One interleaved run times target-only and fixed gamma 2 generation, and adds a
 graph-recovery mode when the GPU supports it (compute capability 7.5).
+`--gamma 2 3` compares several gammas in the same run.
 Every mode uses the configured draft backend, draft graphs by default. Every
 speculative output must match target-only generation token for token. The report
 records which modes ran and why a graph backend was unavailable. Each speculative
