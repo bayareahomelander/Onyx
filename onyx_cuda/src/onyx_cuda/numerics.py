@@ -67,7 +67,6 @@ class GreedyCheckpoint:
         self.replays = 0
         self.replayed_tokens = 0
         self.target_is_canonical = True
-        self.scalar_logits = None
         self.measure = measure
         self.profile = {name: 0.0 for name in (
             "snapshot_seconds", "prefill_seconds", "history_seconds", "proposal_seconds")}
@@ -98,30 +97,17 @@ class GreedyCheckpoint:
         started = self._start()
         self.cache = snapshot_cache(cache)
         self.logits = logits.clone()
-        self.scalar_logits = self.logits
         if self.constraint is not None:
             self.state = self.constraint.init_state()
             self.live_states.add(self.state)
         self._finish("snapshot_seconds", started)
 
-    def before_forward(self, target_cache, batch, generated):
+    def before_forward(self, batch):
+        # A one-token step is scalar decoding and keeps the target canonical.
+        # With fixed gamma it happens only for the final token, so no batched
+        # forward follows it and the checkpoint never needs to adopt its KV.
         if batch.shape[1] > 1:
-            if self.target_is_canonical and self.cache is not None and self.cache.length < target_cache.length:
-                # Target-only steps since the last repair already used clean
-                # scalar KV. Adopt that work before speculation can mutate it.
-                consumed = self.cache.length - len(self.prompt_ids)
-                end = target_cache.length - len(self.prompt_ids)
-                for token in generated[consumed:end]:
-                    self._advance_state(token)
-                started = self._start()
-                self.cache = snapshot_cache(target_cache)
-                self.logits = self.scalar_logits.clone()
-                self._finish("snapshot_seconds", started)
             self.target_is_canonical = False
-
-    def after_scalar(self, logits):
-        if self.target_is_canonical:
-            self.scalar_logits = logits[:, -1, :]
 
     def _select(self):
         if self.constraint is None:
@@ -235,7 +221,6 @@ class GreedyCheckpoint:
         started = self._start()
         self.cache = snapshot_cache(target_cache)
         self.logits = logits[:, accepted, :].clone()
-        self.scalar_logits = self.logits
         self.target_is_canonical = True
         for token in batch[0, :accepted + 1].tolist():
             self._advance_state(token)

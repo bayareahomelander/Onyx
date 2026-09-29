@@ -232,7 +232,7 @@ def _verify_proposal(
     )
     target_length_before = target_cache.length
     if checkpoint is not None:
-        checkpoint.before_forward(target_cache, input_ids, generated_token_ids)
+        checkpoint.before_forward(input_ids)
     with torch.inference_mode():
         target_logits = target_cache.extend(target_model, input_ids)
     prefetch = getattr(grammar_constraint, "prefetch", None)
@@ -329,8 +329,6 @@ def _verify_proposal(
     draft_cache.crop(proposal.draft_cache_length_before + accepted + 1)
     if replayed:
         checkpoint.commit(target_cache, input_ids, accepted, target_logits)
-    elif checkpoint is not None and input_ids.shape[1] == 1:
-        checkpoint.after_scalar(target_logits)
     return (
         VerificationResult(verified_token_ids, accepted),
         verified_grammar_states,

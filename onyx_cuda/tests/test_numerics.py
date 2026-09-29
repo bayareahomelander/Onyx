@@ -9,10 +9,7 @@ from onyx_cuda.numerics import ambiguous_logits
 
 
 @pytest.mark.parametrize("constrained", [False, True])
-@pytest.mark.parametrize("clean_steps", [0, 2])
-def test_replay_stops_before_rejected_suffix_and_keeps_checkpoint_prefix(
-    constrained, clean_steps, monkeypatch
-):
+def test_replay_stops_before_rejected_suffix_and_keeps_checkpoint_prefix(constrained, monkeypatch):
     from onyx_cuda.numerics import GreedyCheckpoint
     from test_speculative import TrackingGrammar
 
@@ -53,11 +50,10 @@ def test_replay_stops_before_rejected_suffix_and_keeps_checkpoint_prefix(
     initial = torch.full((1, 9), -10.0)
     initial[0, 5] = 1
     checkpoint.seed(target, initial)
-    for _ in range(clean_steps):
-        checkpoint.after_scalar(target.extend(None, torch.tensor([[5]])))
     batch = torch.tensor([[5, 4, 4, 4]])
-    generated = [5] * (clean_steps + 1)
-    checkpoint.before_forward(target, batch, generated)
+    generated = [5]
+    checkpoint.before_forward(batch)
+    assert not checkpoint.target_is_canonical
     logits = checkpoint.replay(target, batch, generated)
     assert logits.shape[1] == 1
     assert target.past_key_values.history == [8, 8, *generated]
