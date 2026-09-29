@@ -151,6 +151,12 @@ def test_speculation_uses_graph_cache_and_always_releases_it(monkeypatch, availa
     events = speculative_module.generate_speculative_events(draft_model, target_model, [0] * 4, 3, 2, [15])
     next(events)
     events.close()
+    # The draft cache starts after the first token, so none was acquired yet.
+    assert len(requests) == 1 and released == ([True] if available else [])
+
+    events = speculative_module.generate_speculative_events(draft_model, target_model, [0] * 4, 3, 2, [15])
+    next(events), next(events)
+    events.close()
     assert released == ([True, True] if available else [])
 
 

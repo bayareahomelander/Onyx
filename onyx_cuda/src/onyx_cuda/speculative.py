@@ -444,7 +444,6 @@ def generate_speculative_events(
 
     draft_cache = None
     try:
-        draft_cache = _start_draft_cache(draft_model, prompt_token_ids, max_tokens)
         target_prefill = prefill(target_model, prompt_token_ids)
         target_cache = CacheState.from_prefill(
             target_prefill.past_key_values, target_prefill.logits.device
@@ -521,6 +520,9 @@ def generate_speculative_events(
         # do not retain the obsolete object through the prefill result.
         if not finished and len(generated) < max_tokens:
             checkpoint.seed(target_cache, target_prefill.logits)
+            # The first token needs only the target, so the draft prefill runs
+            # after that token's yield point and is skipped when generation ends there.
+            draft_cache = _start_draft_cache(draft_model, prompt_token_ids, max_tokens)
         del target_prefill
         while not finished and len(generated) < max_tokens:
             ready_events = []

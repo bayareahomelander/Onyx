@@ -141,8 +141,12 @@ def test_text_stop_finalizes_without_another_forward(runtime, monkeypatch, mode,
             assert result.timings.decode_tokens_per_second > 0
         assert not runtime.backend.active
         assert not torch.is_inference_mode_enabled()
-    if mode == "fixed":
+    if mode == "fixed" and len(pieces) > 1:
         assert runtime.releases == [True, True]
+    elif mode == "fixed":
+        # A stop in the first token ends generation before the draft prefill.
+        assert runtime.releases == []
+        assert {role for role, _ in runtime.forwards} == {"target"}
 
 
 @pytest.mark.parametrize("mode", ["target", "sampled", "fixed"])
@@ -293,7 +297,13 @@ def test_non_streaming_text_stop_ends_inference(runtime, monkeypatch, mode, n):
 @pytest.mark.parametrize("mode", ["target", "sampled", "fixed"])
 @pytest.mark.parametrize("stop_in_first_token", [False, True])
 def test_closing_decoder_around_text_stop_releases_producer(runtime, mode, stop_in_first_token):
-    tokenizer = SimpleNamespace(decode=lambda *_, **__: "Hello END" if stop_in_first_token else "Hello ")
+    def decode(ids, **_):
+        if stop_in_first_token:
+            return "Hello END"
+        # Text first appears at the second token, after the draft cache has started.
+        return "Hello " if len(ids) > 1 else ""
+
+    tokenizer = SimpleNamespace(decode=decode)
     events = speculative.decode_speculative_events(
         speculative.generate_speculative_events(**arguments(runtime, mode)), tokenizer, ["END"],
     )
@@ -304,7 +314,8 @@ def test_closing_decoder_around_text_stop_releases_producer(runtime, mode, stop_
     events.close()
     assert runtime.forwards == forwards
     assert not runtime.backend.active
-    assert runtime.releases == ([True] if mode == "fixed" else [])
+    # A stop in the first token finishes before the draft cache is acquired.
+    assert runtime.releases == ([True] if mode == "fixed" and not stop_in_first_token else [])
 
 
 def test_text_stop_does_not_hide_cleanup_failure():

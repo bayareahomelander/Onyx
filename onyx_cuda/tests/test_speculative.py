@@ -477,6 +477,41 @@ def test_speculative_counters_do_not_require_measurement(monkeypatch):
     assert result.speculation.replay_stats["stage_seconds"] is None
 
 
+def _record_prefills(monkeypatch, first_token, draft_tokens, target_tokens):
+    draft_model, target_model = object(), object()
+    caches = {draft_model: ScriptedCache(draft_tokens), target_model: ScriptedCache(target_tokens)}
+    prefilled = []
+
+    def scripted_prefill(model, prompt_token_ids):
+        prefilled.append("draft" if model is draft_model else "target")
+        return SimpleNamespace(logits=torch.zeros((1, 16)), past_key_values=caches[model],
+                               token_id=torch.tensor([first_token]))
+
+    monkeypatch.setattr(speculative_module, "prefill", scripted_prefill)
+    monkeypatch.setattr(speculative_module.CacheState, "from_prefill",
+                        classmethod(lambda cls, cache, device: cache))
+    return draft_model, target_model, prefilled
+
+
+def test_first_token_is_emitted_before_the_draft_prefill(monkeypatch):
+    draft_model, target_model, prefilled = _record_prefills(monkeypatch, 1, [2, 9], [2, 3])
+    events = generate_speculative_events(draft_model, target_model, [0], 3, 2, [15])
+
+    assert next(events) == AcceptedTokenEvent(1)
+    assert prefilled == ["target"]
+    assert [event.token_id for event in events if isinstance(event, AcceptedTokenEvent)] == [2, 3]
+    assert prefilled == ["target", "draft"]
+
+
+@pytest.mark.parametrize(("first_token", "max_tokens", "finish_reason"), [(15, 3, "eos"), (1, 1, "length")])
+def test_single_token_outputs_never_prefill_the_draft(monkeypatch, first_token, max_tokens, finish_reason):
+    draft_model, target_model, prefilled = _record_prefills(monkeypatch, first_token, [], [])
+    result = generate_speculative(draft_model, target_model, [0], max_tokens, 2, [15])
+
+    assert (result.token_ids, result.finish_reason) == ([first_token], finish_reason)
+    assert prefilled == ["target"]
+    assert result.speculation[:3] == (0, 0, 0)
+
 
 @pytest.mark.parametrize(
     (
