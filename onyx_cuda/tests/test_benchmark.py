@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import pytest
 
 from onyx_cuda.benchmark import select_modes, summarize
+from onyx_cuda.config import DEFAULT_GAMMA
 
 
 def row(name, baseline, fixed, graph=None):
@@ -22,9 +23,11 @@ def test_summary_keeps_regressions_visible_beside_the_aggregate():
 
 
 def test_graph_modes_run_only_when_graphs_are_active():
-    assert select_modes({"active": "graph"}) == {"gamma0": (0, False), "gamma2": (2, False),
-                                                 "gamma2_graph": (2, True)}
-    assert list(select_modes({"active": "scalar", "reason": "unsupported"})) == ["gamma0", "gamma2"]
+    assert select_modes({"active": "graph"}, (2,)) == {"gamma0": (0, False), "gamma2": (2, False),
+                                                       "gamma2_graph": (2, True)}
+    assert list(select_modes({"active": "scalar", "reason": "unsupported"}, (2,))) == ["gamma0", "gamma2"]
+    # Without --gamma the comparison covers the service default.
+    assert list(select_modes({"active": "scalar"})) == ["gamma0", f"gamma{DEFAULT_GAMMA}"]
     assert list(select_modes({"active": "graph"}, (2, 3))) == [
         "gamma0", "gamma2", "gamma2_graph", "gamma3", "gamma3_graph"]
 
@@ -98,9 +101,9 @@ def benchmark(monkeypatch):
 def test_one_run_interleaves_every_mode_and_attaches_graphs_only_to_graph_modes(benchmark, tmp_path, graph):
     benchmark.graph = graph
     report = benchmark.run(tmp_path / "report.json", repetitions=2)
-    modes = [(0, False), (2, False)]
+    modes = [(0, False), (DEFAULT_GAMMA, False)]
     if graph:
-        modes += [(2, True)]
+        modes += [(DEFAULT_GAMMA, True)]
     assert set(benchmark.calls) == set(modes)
     assert len(benchmark.calls) == 2 * len(modes) * 3  # Two cases; one warmup and two measured runs.
     assert list(report["settings"]["modes"]) == list(report["cases"][0]["median_seconds"])
@@ -110,7 +113,7 @@ def test_one_run_interleaves_every_mode_and_attaches_graphs_only_to_graph_modes(
     assert benchmark.closes == 1 and not hasattr(benchmark.model, "_onyx_replay_backend")
     runs = report["cases"][0]["runs"]
     assert runs["gamma0"][0]["speculation"] is None
-    assert runs["gamma2"][0]["speculation"]["accepted_proposal_count"] == 1
+    assert runs[f"gamma{DEFAULT_GAMMA}"][0]["speculation"]["accepted_proposal_count"] == 1
 
 
 def test_extra_gammas_join_the_same_interleaved_run(benchmark, tmp_path):

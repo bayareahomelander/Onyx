@@ -4,6 +4,7 @@ import re
 import pytest
 import torch
 
+from onyx_cuda.config import DEFAULT_GAMMA
 from onyx_cuda.model import load_model, load_model_pair
 from onyx_cuda.prefill import prefill
 from onyx_cuda.prompt import format_prompt
@@ -35,7 +36,7 @@ def test_target_only_marker_ids_and_thinking_preserve_target_oracle():
         prompt = format_prompt(tokenizer, messages, enable_thinking=thinking).token_ids
         for marker in ('<think>ok</think>', '<tool_response>ok</tool_response>'):
             signatures = []
-            for gamma in (0, 2):
+            for gamma in (0, DEFAULT_GAMMA):
                 result = generate_speculative(pair.draft.model, pair.target.model, prompt, 32, gamma,
                     tokenizer.eos_token_id, regex=re.escape(marker), token_byte_vocabulary=vocabulary)
                 assert result.finish_reason == 'stop'
@@ -44,7 +45,7 @@ def test_target_only_marker_ids_and_thinking_preserve_target_oracle():
                 del result
             assert signatures[0] == signatures[1]
         signatures = []
-        for gamma in (0, 2):
+        for gamma in (0, DEFAULT_GAMMA):
             result = generate_speculative(pair.draft.model, pair.target.model, prompt, 24, gamma,
                                           tokenizer.eos_token_id)
             signatures.append((result.token_ids.copy(), result.finish_reason))

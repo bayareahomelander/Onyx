@@ -906,7 +906,7 @@ def test_real_speculation_matches_target_oracle_and_rejects_cleanly():
             eos_token_ids=eos_token_id,
         )
         oracle_ids[name] = oracle.token_ids
-        for gamma in (1, 2, 4):
+        for gamma in (1, 2, 3, 4):
             measure = name == "cuda_ready" and gamma == 2
             speculative, streamed_text = _result_from_events(
                 generate_speculative_events(
@@ -975,7 +975,7 @@ def test_real_speculation_matches_target_oracle_and_rejects_cleanly():
         regex="CUDA Ready",
         token_byte_vocabulary=vocabulary,
     )
-    for gamma in (1, 2, 4):
+    for gamma in (1, 2, 3, 4):
         constrained, constrained_text = _result_from_events(
             generate_speculative_events(
                 pair.draft.model,
@@ -1026,7 +1026,7 @@ def test_real_speculation_matches_target_oracle_and_rejects_cleanly():
         json_schema=schema,
         token_byte_vocabulary=vocabulary,
     )
-    for gamma in (1, 2, 4):
+    for gamma in (1, 2, 3, 4):
         constrained, constrained_text = _result_from_events(
             generate_speculative_events(
                 pair.draft.model,

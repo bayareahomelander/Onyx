@@ -83,7 +83,7 @@ a successful `stop` finish event; `[DONE]` alone is insufficient.
 | Setting | Default |
 | --- | --- |
 | Target / draft | Pinned Qwen3-8B / Qwen2.5-0.5B-Instruct, FP16 |
-| Decoding | Fixed gamma 2 speculation for greedy requests; target-only sampling for positive temperature |
+| Decoding | Fixed gamma 3 speculation for greedy requests; target-only sampling for positive temperature |
 | Draft decoding | CUDA graphs for the pinned draft; ordinary forward otherwise |
 | Thinking | Disabled |
 | Context / maximum output | 8192 tokens including prompt / 4096 output tokens |
@@ -112,7 +112,7 @@ Set environment variables in the server's terminal before startup:
 | --- | --- | --- |
 | `ONYX_TARGET_MODEL`, `ONYX_DRAFT_MODEL` | `Qwen/Qwen3-8B`, `Qwen/Qwen2.5-0.5B-Instruct` | Hugging Face model IDs |
 | `ONYX_TARGET_REVISION`, `ONYX_DRAFT_REVISION` | Pinned revisions | Commit hashes for custom models |
-| `ONYX_SPECULATIVE_GAMMA` | `2` | Draft tokens per step; `0` selects target-only generation |
+| `ONYX_SPECULATIVE_GAMMA` | `3` | Draft tokens per step; `0` selects target-only generation |
 | `ONYX_DRAFT_BACKEND` | `graph` | `eager` uses the ordinary draft forward |
 | `ONYX_REPLAY_BACKEND` | `auto` | `scalar` disables graph recovery; `graph` requires it on any CUDA capability 7.5 GPU and fails startup if it cannot be prepared |
 | `ONYX_MAX_CONTEXT_TOKENS` | `8192` | Prompt plus requested output tokens |
@@ -128,29 +128,37 @@ backends. Validate custom models or larger limits on the target GPU first with
 
 ## Measured performance
 
-On a Linux RTX 2080 Ti reporting 22 GiB, the September 27, 2026 comparison covered
+On a Linux RTX 2080 Ti reporting 22 GiB, the September 28, 2026 comparison covered
 48 cases with one warmup and three measured runs per mode. Aggregates sum
 per-case median generation times, excluding model loading and graph setup:
 
 | Mode | Aggregate speedup over target-only |
 | --- | ---: |
-| Fixed gamma 2, draft graphs, scalar recovery (`ONYX_REPLAY_BACKEND=scalar`) | 1.291x |
-| Fixed gamma 2, draft graphs, graph recovery (default on this GPU) | **1.396x** |
+| Fixed gamma 3, draft graphs, scalar recovery (`ONYX_REPLAY_BACKEND=scalar`) | 1.346x |
+| Fixed gamma 3, draft graphs, graph recovery (default on this GPU) | **1.462x** |
+| Fixed gamma 2 (the previous default), scalar / graph recovery | 1.292x / 1.397x |
 
 Every output in every mode matched target-only tokens and finish reasons. Ten cases
 remain slower than target-only: seven very short requests (at most 24 ms slower)
-and three recovery-heavy prose requests. The September 25 comparison, which also
-timed the ordinary draft forward, measured 1.130x and 1.211x without draft graphs;
-draft graphs reduced total generation time by 12.6% and 13.4%.
+and three recovery-heavy prose requests. Gamma 3 improved or held every workload
+category over gamma 2 and needed no additional numerical recoveries. The
+September 25 comparison, which also timed the ordinary draft forward, measured
+1.130x and 1.211x at gamma 2 without draft graphs; draft graphs reduced total
+generation time by 12.6% and 13.4%.
+
+Speculative requests reach their first token as quickly as target-only requests:
+the draft prefills the prompt only after the target has selected the first token,
+and not at all when generation ends there. Across the 48 cases, speculation adds
+0.3 ms in total to time to first token, down from 637 ms on September 27.
 
 Draft graphs cut draft cost from about 7.5-9.8 ms to 4.1-4.4 ms per token and
 add about 2 seconds of startup; graph recovery preparation adds about 42 seconds.
-Peak memory in the comparison was 17.37 GiB allocated. On September 27, forced
+Peak memory in the comparison was 17.29 GiB allocated. On September 27, forced
 recoveries with 5,000 to 8,000 prompt tokens and both graph sets loaded matched
 target-only output and peaked at 19.54 GiB allocated.
 
-On September 28 the full CUDA suite passed all 830 tests with draft graphs and
-default graph recovery. September 22 checks
+On September 28 the full CUDA suite passed all 840 tests with gamma 3, draft
+graphs, and default graph recovery. September 22 checks
 matched full logits and KV caches bitwise through 8192 tokens with graph
 recovery, and the API completed a 4096-prompt/4096-output capacity test. If a
 graph block still exhausts GPU memory, that recovery continues with scalar steps
@@ -163,7 +171,7 @@ To reproduce the comparison on your GPU, use a new output filename for each run:
 python -m onyx_cuda.benchmark --output validation/speedups.json
 ```
 
-One interleaved run times target-only and fixed gamma 2 generation, and adds a
+One interleaved run times target-only and fixed gamma 3 generation, and adds a
 graph-recovery mode when the GPU supports it (compute capability 7.5).
 `--gamma 2 3` compares several gammas in the same run.
 Every mode uses the configured draft backend, draft graphs by default. Every
@@ -174,16 +182,16 @@ fails if any of its recoveries fell back to scalar steps.
 
 ### Speedup by workload
 
-Category results from the same September 27 comparison:
+Gamma 3 category results from the same September 28 comparison:
 
 | Workload | Scalar recovery | Graph recovery (default) |
 | --- | ---: | ---: |
-| Code generation | **2.01x** | **2.01x** |
-| JSON Schema output | **1.82x** | **1.81x** |
-| Regex-constrained output | **1.80x** | **1.80x** |
-| Information extraction | **1.61x** | **1.61x** |
-| Prose | 1.08x | 1.20x |
-| Short replies | 1.05x | 1.05x |
+| Code generation | **2.31x** | **2.31x** |
+| JSON Schema output | **2.10x** | **2.10x** |
+| Regex-constrained output | **2.01x** | **2.01x** |
+| Information extraction | **1.79x** | **1.79x** |
+| Prose | 1.09x | 1.21x |
+| Short replies | 1.10x | 1.10x |
 
 Each baseline uses the same target model, prompt, precision, and output budget.
 Regex and JSON baselines enforce the same constraints; these figures measure

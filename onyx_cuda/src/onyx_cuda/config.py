@@ -8,7 +8,9 @@ from onyx_cuda.revisions import MODEL_REVISIONS
 
 DEFAULT_DRAFT_MODEL = "Qwen/Qwen2.5-0.5B-Instruct"
 DEFAULT_TARGET_MODEL = "Qwen/Qwen3-8B"
-DEFAULT_GAMMA = 2
+# Once draft graphs halved draft cost, gamma 3 beat gamma 2: 1.462x vs 1.397x
+# (2080 Ti, September 28, graph recovery), with no workload category slower.
+DEFAULT_GAMMA = 3
 DEFAULT_CONTEXT_TOKENS = 8192
 DEFAULT_OUTPUT_TOKENS = 4096
 
