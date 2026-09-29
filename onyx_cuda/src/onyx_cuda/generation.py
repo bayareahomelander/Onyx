@@ -52,6 +52,8 @@ def _take_ready_tokens(pending: list[int], retain: int = 0) -> list[int]:
 
 
 class GenerationTimings(NamedTuple):
+    """End-to-end fields are always set; stage and grammar timings need measure."""
+
     time_to_first_token_seconds: float
     decode_tokens_per_second: float | None
     total_seconds: float
@@ -276,16 +278,17 @@ def generate_token_events(
     pending: list[int] = []
     retain = max((len(stop) for stop in stop_sequences if stop), default=1) - 1
     finish_reason: Literal["eos", "stop", "length"] = "length"
-    started_at = None
     time_to_first_token = None
     grammar_compile_seconds = None
     valid_token_enumeration_seconds = None
     mask_transfer_seconds = None
+    # End-to-end timings are always recorded: reading each selected token
+    # already synchronizes. Only measure adds the per-stage synchronizations.
     if measure:
         device = next(model.parameters()).device
         if device.type == "cuda":
             torch.cuda.synchronize(device)
-        started_at = time.perf_counter()
+    started_at = time.perf_counter()
 
     constraint = None
     grammar_state = None
@@ -345,7 +348,7 @@ def generate_token_events(
             if token_id is None:
                 token_id = _sample_token(logits, temperature, top_p, generator)
             token = token_id.item()
-            if started_at is not None and time_to_first_token is None:
+            if time_to_first_token is None:
                 time_to_first_token = time.perf_counter() - started_at
             generated.append(token)
             pending.append(token)
@@ -393,8 +396,8 @@ def generate_token_events(
         _validate_json_result(json_schema, token_byte_vocabulary, generated)
 
     timings = None
-    if started_at is not None and time_to_first_token is not None:
-        torch.cuda.synchronize(result.logits.device)
+    if time_to_first_token is not None:
+        # The last token was read from the GPU; no generation work is queued.
         total_seconds = time.perf_counter() - started_at
         decode_seconds = total_seconds - time_to_first_token
         decode_token_count = max(len(generated) - 1, 0)

@@ -425,7 +425,6 @@ def generate_speculative_events(
     )
     finish_reason = "length"
     finished = False
-    started_at = None
     time_to_first_token = None
     grammar_compile_seconds = None
     mask_times: list[float] | None = [] if measure else None
@@ -434,15 +433,18 @@ def generate_speculative_events(
     speculative_iteration_count = 0
     draft_seconds = 0.0
     verify_seconds = 0.0
+    # End-to-end timings are always recorded: reading each selected token
+    # already synchronizes. Only measure adds the stage synchronizations.
     measurement_device = None
     if measure:
         measurement_device = next(target_model.parameters()).device
         _synchronize_device(measurement_device)
-        started_at = time.perf_counter()
+    started_at = time.perf_counter()
 
     draft_cache = None
     try:
         target_prefill = prefill(target_model, prompt_token_ids)
+        device = target_prefill.logits.device
         target_cache = CacheState.from_prefill(
             target_prefill.past_key_values, target_prefill.logits.device
         )
@@ -478,9 +480,7 @@ def generate_speculative_events(
                 grammar_choices = None
             generated.append(first_token.item())
             pending_events.append(generated[-1])
-            if started_at is not None:
-                _synchronize_device(measurement_device)
-                time_to_first_token = time.perf_counter() - started_at
+            time_to_first_token = time.perf_counter() - started_at
 
             if constraint is not None and generated[-1] not in eos_token_ids:
                 previous_state = grammar_state
@@ -668,8 +668,9 @@ def generate_speculative_events(
     speculation = SpeculationStats(proposed_token_count, accepted_proposal_count,
                                    speculative_iteration_count, checkpoint.report())
     timings = None
-    if started_at is not None and time_to_first_token is not None:
-        _synchronize_device(measurement_device)
+    if time_to_first_token is not None:
+        # A final draft catch-up step may still be queued; wait so it is counted.
+        _synchronize_device(device)
         total_seconds = time.perf_counter() - started_at
         decode_seconds = total_seconds - time_to_first_token
         decode_token_count = max(len(generated) - 1, 0)
@@ -688,9 +689,9 @@ def generate_speculative_events(
                 accepted_proposal_count / proposed_token_count if proposed_token_count else 0.0
             ),
             speculative_iteration_count=speculative_iteration_count,
-            draft_seconds=draft_seconds,
-            verify_seconds=verify_seconds,
-            mask_seconds=sum(mask_times or ()),
+            draft_seconds=draft_seconds if measure else None,
+            verify_seconds=verify_seconds if measure else None,
+            mask_seconds=sum(mask_times) if measure else None,
             verification_replays=checkpoint.replays,
             canonical_replay_tokens=checkpoint.replayed_tokens,
             replay_stats=speculation.replay_stats,

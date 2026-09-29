@@ -254,7 +254,8 @@ def test_load_model_prompt_prefill_and_generation_on_cuda(monkeypatch, record_mo
     assert limited.token_ids == limited_expected == [80285, 30982]
     assert len(limited.token_ids) == 2
     assert limited.finish_reason == "length"
-    assert limited.timings is None
+    # Unmeasured generation still reports end-to-end timings.
+    assert limited.timings.total_seconds >= limited.timings.time_to_first_token_seconds > 0
     assert limited.past_key_values.get_seq_length() == len(prompt.token_ids) + 1
 
     one_token_stop_ids = loaded.tokenizer.encode(" Ready", add_special_tokens=False)

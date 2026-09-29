@@ -125,7 +125,7 @@ def test_non_streaming_chat_completion_returns_usage_reason_and_metrics(monkeypa
         "speculative_iterations": 3,
     }
     assert len(calls) == 1
-    assert calls[0]["measure"] is True
+    assert "measure" not in calls[0]  # The API runs without stage synchronization.
     assert calls[0]["draft_model"] is engine.draft.model
     assert calls[0]["target_model"] is engine.target.model
 
@@ -550,7 +550,7 @@ def test_streaming_chunks_preserve_id_and_real_finish_reason(monkeypatch):
     assert {chunk["created"] for chunk in chunks} == {chunks[0]["created"]}
     assert {chunk["model"] for chunk in chunks} == {MODEL_ID}
     assert collected == []
-    assert calls[0]["arguments"]["measure"] is True
+    assert "measure" not in calls[0]["arguments"]
     assert calls[0]["stop"] == ["END"]
 
 
@@ -884,7 +884,6 @@ def test_real_cuda_two_client_requests_match_direct_generation_without_model_cop
     assert registered.target.model is pair.target.model
     request = ChatCompletionRequest.model_validate(payload)
     arguments = prepare_generation(request, pair, gamma=2)
-    arguments["measure"] = True
     direct = generate_speculative(**arguments)
     expected = pair.target.tokenizer.decode(direct.token_ids, skip_special_tokens=True)
 
@@ -1045,7 +1044,6 @@ def test_real_uvicorn_api_phase_gate(monkeypatch):
             body = warmup.json()
             request = ChatCompletionRequest.model_validate(payload)
             arguments = prepare_generation(request, pair)
-            arguments["measure"] = True
             direct = generate_speculative(**arguments)
             expected = pair.target.tokenizer.decode(direct.token_ids, skip_special_tokens=True)
             assert app.state.engines[MODEL_ID] is pair

@@ -265,7 +265,7 @@ def test_constrained_rejection_verifies_from_canonical_state_and_releases(
         target_tokens=[3, 0],
     )
 
-    assert result._replace(speculation=None) == GenerationResult([1, 3], result.past_key_values, "stop")
+    assert (result.token_ids, result.finish_reason) == ([1, 3], "stop")
     assert ((1,), 2) in grammar.advance_calls
     assert ((1,), 3) in grammar.advance_calls
     assert ((1, 2), 3) not in grammar.advance_calls
@@ -470,7 +470,10 @@ def test_speculative_counters_do_not_require_measurement(monkeypatch):
         gamma=2,
     )
 
-    assert result.timings is None
+    # End-to-end timings remain; stage timings need measure.
+    assert result.timings.total_seconds >= result.timings.time_to_first_token_seconds >= 0
+    assert (result.timings.draft_seconds, result.timings.verify_seconds, result.timings.mask_seconds) == (
+        None, None, None)
     assert result.speculation[:3] == (2, 1, 2)
     assert result.speculation.replay_stats["verification_replays"] == 0
     assert result.speculation.replay_stats["graph_replay_fallbacks"] == 0

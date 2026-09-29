@@ -486,7 +486,6 @@ def _sse_events(request: ChatCompletionRequest, engine, *, gamma: int = GAMMA,
     try:
         yield _sse(_chunk_json(completion_id, created, model, role="assistant"))
         arguments = prepare_generation(request, engine, gamma=gamma, prompt_token_ids=prompt_token_ids)
-        arguments["measure"] = True
         events = _completion_event_iter(arguments, engine.target.tokenizer, request.stop)
         finish_reason = None
         json_parts = []
@@ -785,7 +784,6 @@ def create_app(
             tokenizer = engine.target.tokenizer
             arguments = prepare_generation(request, engine, gamma=app.state.speculative_gamma,
                                            prompt_token_ids=prompt_token_ids)
-            arguments["measure"] = True
             prompt_tokens = len(arguments["prompt_token_ids"])
             completion_tokens = 0
             choices = []
