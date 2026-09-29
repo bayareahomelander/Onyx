@@ -1,10 +1,12 @@
 """Model-owned CUDA-graph decoding for the pinned Qwen2.5 draft (default; eager opts out).
 
 The draft only proposes tokens and the target verifies every one, so this
-backend changes speed, never output. Each single-token draft step replays one
-CUDA graph that reads the model's own weights: fewer kernels than the ordinary
-forward, a chunk-major static KV cache, and attention over only the 256-token
-chunks in use. Prompts are prefilled with the ordinary forward and copied in.
+backend changes speed, never output. Each draft step of one or two tokens
+replays one CUDA graph that reads the model's own weights: fewer kernels than
+the ordinary forward, a chunk-major static KV cache, and attention over only the
+256-token chunks in use. Two-token steps let speculation consume a fully
+accepted round's last proposal with the next token at the cost of about one
+step. Prompts are prefilled with the ordinary forward and copied in.
 
 One generation owns the static cache at a time. start() returns None while it
 is owned, when the required length exceeds capacity, or for an unsupported
@@ -27,6 +29,7 @@ from onyx_cuda.revisions import MODEL_REVISIONS
 _lifecycle_lock = threading.RLock()
 _DRAFT_ID = "Qwen/Qwen2.5-0.5B-Instruct"
 _CHUNK = 256
+_WIDTHS = (1, 2)
 
 
 def resolve_draft_backend(value=None):
@@ -133,47 +136,55 @@ class GraphDraftBackend:
         self._cos = (angles.cos() * rotary.attention_scaling).half()
         self._sin = (angles.sin() * rotary.attention_scaling * sign).half()
         self._key_positions = torch.arange(self.capacity, device=self.device)
-        self._ids = torch.zeros((1,), dtype=torch.long, device=self.device)
-        self._position = torch.zeros((1,), dtype=torch.long, device=self.device)
+        # Static graph inputs per step width: token IDs and their positions.
+        self._ids = {width: torch.zeros((width,), dtype=torch.long, device=self.device) for width in _WIDTHS}
+        self._positions = {width: torch.zeros((width,), dtype=torch.long, device=self.device)
+                           for width in _WIDTHS}
+        self._offsets = {width: torch.arange(width, device=self.device) for width in _WIDTHS}
 
     @staticmethod
     def _normalize(hidden, weight):
         norm = torch.linalg.vector_norm(hidden, dim=-1, keepdim=True, dtype=torch.float32)
         return (hidden / norm).half() * weight
 
-    def _step(self, chunks):
+    def _step(self, chunks, width):
         model = self._model()
         hq, hk, d = self.heads, self.kv_heads, self.head_dim
-        group, span = hq // hk, chunks * _CHUNK
-        hidden = model.model.embed_tokens.weight.index_select(0, self._ids)
-        cos = self._cos.index_select(0, self._position)
-        sin = self._sin.index_select(0, self._position)
-        chunk = torch.div(self._position, _CHUNK, rounding_mode="floor")
-        slot = self._position - chunk * _CHUNK
-        mask = torch.where(self._key_positions[:span] <= self._position, 0.0, float("-inf")).half()
-        mask = mask.view(chunks, 1, 1, _CHUNK).expand(chunks, hk, 1, _CHUNK).reshape(chunks * hk, 1, _CHUNK)
+        ids, position = self._ids[width], self._positions[width]
+        group, span, rows = hq // hk, chunks * _CHUNK, width * hq // hk
+        hidden = model.model.embed_tokens.weight.index_select(0, ids)
+        cos = self._cos.index_select(0, position)[:, None]
+        sin = self._sin.index_select(0, position)[:, None]
+        chunk = torch.div(position, _CHUNK, rounding_mode="floor")
+        slot = position - chunk * _CHUNK
+        # Attention rows are (token, query head in group) per chunk and KV head;
+        # each token sees keys up to its own position, including the pair's first.
+        mask = torch.where(self._key_positions[:span] <= position[:, None], 0.0, float("-inf")).half()
+        mask = (mask.view(width, chunks, 1, 1, _CHUNK).permute(1, 2, 0, 3, 4)
+                .expand(chunks, hk, width, group, _CHUNK).reshape(chunks * hk, rows, _CHUNK))
         for layer in self._layers:
             attention, mlp = layer["attention"], layer["mlp"]
             normalized = self._normalize(hidden, layer["input_norm"])
-            qkv = torch.empty((1, (hq + 2 * hk) * d), dtype=torch.float16, device=self.device)
+            qkv = torch.empty((width, (hq + 2 * hk) * d), dtype=torch.float16, device=self.device)
             for projection, start, end in ((attention.q_proj, 0, hq * d),
                                            (attention.k_proj, hq * d, (hq + hk) * d),
                                            (attention.v_proj, (hq + hk) * d, (hq + 2 * hk) * d)):
                 torch.addmm(projection.bias, normalized, projection.weight.t(), out=qkv[:, start:end])
-            qk = qkv[:, :(hq + hk) * d].view(hq + hk, d)
+            qk = qkv[:, :(hq + hk) * d].view(width, hq + hk, d)
             qk = torch.addcmul(qk * cos, qk.roll(d // 2, dims=-1), sin)
-            layer["keys"][chunk, :, slot] = qk[hq:][None]
-            layer["values"][chunk, :, slot] = qkv[:, (hq + hk) * d:].view(1, hk, d)
+            layer["keys"][chunk, :, slot] = qk[:, hq:]
+            layer["values"][chunk, :, slot] = qkv[:, (hq + hk) * d:].view(width, hk, d)
             keys = layer["keys"][:chunks].view(chunks * hk, _CHUNK, d)
             values = layer["values"][:chunks].view(chunks * hk, _CHUNK, d)
-            query = qk[:hq].view(1, hk, group, d).expand(chunks, hk, group, d).reshape(chunks * hk, group, d)
+            query = (qk[:, :hq].view(width, hk, group, d).transpose(0, 1).reshape(1, hk, rows, d)
+                     .expand(chunks, hk, rows, d).reshape(chunks * hk, rows, d))
             scores = torch.baddbmm(mask, query, keys.transpose(1, 2), alpha=attention.scaling)
             # Softmax spans every used chunk of each head, then chunks reduce in parallel.
-            scores = scores.view(chunks, hk, group, _CHUNK).permute(1, 2, 0, 3).reshape(hk, group, span)
+            scores = scores.view(chunks, hk, rows, _CHUNK).permute(1, 2, 0, 3).reshape(hk, rows, span)
             probabilities = torch.softmax(scores, dim=-1)
-            probabilities = probabilities.view(hk, group, chunks, _CHUNK).permute(2, 0, 1, 3)
-            attended = torch.bmm(probabilities.reshape(chunks * hk, group, _CHUNK), values)
-            attended = attended.view(chunks, hq * d).sum(0, keepdim=True)
+            probabilities = probabilities.view(hk, rows, chunks, _CHUNK).permute(2, 0, 1, 3)
+            attended = torch.bmm(probabilities.reshape(chunks * hk, rows, _CHUNK), values)
+            attended = attended.view(chunks, hk, width, group * d).sum(0).transpose(0, 1).reshape(width, hq * d)
             hidden = torch.addmm(hidden, attended, attention.o_proj.weight.t())
             normalized = self._normalize(hidden, layer["post_norm"])
             gate = normalized @ mlp.gate_proj.weight.t()
@@ -185,18 +196,20 @@ class GraphDraftBackend:
         stream = torch.cuda.Stream(device=self.device)
         stream.wait_stream(torch.cuda.current_stream(self.device))
         with torch.cuda.stream(stream):
-            for chunks in (1, self.capacity // _CHUNK):
-                for _ in range(2):
-                    self._step(chunks)
+            for width in _WIDTHS:
+                for chunks in (1, self.capacity // _CHUNK):
+                    for _ in range(2):
+                        self._step(chunks, width)
         torch.cuda.current_stream(self.device).wait_stream(stream)
         torch.cuda.synchronize(self.device)
         pool = None
-        for chunks in range(1, self.capacity // _CHUNK + 1):
-            graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph, pool=pool):
-                logits = self._step(chunks)
-            pool = graph.pool()
-            self._graphs[chunks] = graph, logits
+        for width in _WIDTHS:
+            for chunks in range(1, self.capacity // _CHUNK + 1):
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph, pool=pool):
+                    logits = self._step(chunks, width)
+                pool = graph.pool()
+                self._graphs[width, chunks] = graph, logits
 
     def _supports(self, past_key_values):
         return (type(past_key_values) is DynamicCache and not past_key_values.offloading
@@ -248,16 +261,20 @@ class GraphDraftBackend:
                 raise ValueError("draft graph cache capacity exceeded")
             self._fence()
             rows = []
-            for i in range(width):
-                position = cache.length + i
-                graph, logits = self._graphs[position // _CHUNK + 1]
-                self._ids.copy_(input_ids[0, i:i + 1])
-                self._position.fill_(position)
+            # Two-token steps cost about one step; an odd final token takes a single step.
+            offset = 0
+            while offset < width:
+                step = 2 if width - offset >= 2 else 1
+                position = cache.length + offset
+                graph, logits = self._graphs[step, (position + step - 1) // _CHUNK + 1]
+                self._ids[step].copy_(input_ids[0, offset:offset + step])
+                torch.add(self._offsets[step], position, out=self._positions[step])
                 graph.replay()
                 rows.append(logits.clone())
+                offset += step
             self._record()
             cache._length += width
-            return rows[0].unsqueeze(1) if width == 1 else torch.stack(rows, dim=1)
+            return torch.cat(rows).unsqueeze(0)
 
     def _release(self, cache):
         with self._lock:
@@ -274,7 +291,8 @@ class GraphDraftBackend:
                 self._event.synchronize()
             self._graphs.clear()
             self._layers = []
-            self._cos = self._sin = self._key_positions = self._ids = self._position = self._final_norm = None
+            self._cos = self._sin = self._key_positions = self._final_norm = None
+            self._ids = self._positions = self._offsets = None
             self._event = None
 
 

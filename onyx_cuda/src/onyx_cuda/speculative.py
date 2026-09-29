@@ -32,6 +32,8 @@ from onyx_cuda.vocabulary import TokenByteVocabulary
 
 class ProposalResult(NamedTuple):
     token_ids: list[int]
+    # Draft length with every token before the current one consumed; a
+    # rejection crops to this plus the accepted tokens and the current one.
     draft_cache_length_before: int
     draft_cache_length_after: int
     # Grammar state after the last proposed token, when it is not EOS.
@@ -135,17 +137,25 @@ def propose_tokens(
     live_grammar_states: set[int] | None = None,
     mask_times: list[float] | None = None,
     grammar_choices: list[int] | None = None,
+    unconsumed: int = 1,
 ) -> ProposalResult:
     """Greedily propose tokens after the target-selected current token.
 
     grammar_choices, when given, are the selectable tokens after grammar_state.
+    unconsumed counts the trailing generated tokens the draft cache has not
+    consumed: the current token, preceded by the last proposed token when the
+    previous verification accepted every proposal. The first draft step
+    consumes them together.
     """
     if not generated_token_ids:
         raise ValueError("draft proposal requires a target-selected token")
+    if not 1 <= unconsumed <= len(generated_token_ids):
+        raise ValueError("unconsumed must count from one to every generated token")
     if isinstance(eos_token_ids, int):
         eos_token_ids = [eos_token_ids]
     stop_sequences = stop_sequences or []
     start_length = draft_cache.length
+    before = start_length + unconsumed - 1
     if grammar_constraint is not None:
         if grammar_state is None or live_grammar_states is None:
             raise ValueError("grammar state tracking is required")
@@ -154,15 +164,15 @@ def propose_tokens(
                 grammar_constraint, grammar_state, eos_token_ids, mask_times
             )
         if not grammar_choices:
-            return ProposalResult([], start_length, start_length)
+            return ProposalResult([], before, start_length)
     if generated_token_ids[-1] in eos_token_ids or _matched_stop_length(
         generated_token_ids, stop_sequences
     ):
-        return ProposalResult([], start_length, start_length)
+        return ProposalResult([], before, start_length)
 
     proposed: list[int] = []
     input_ids = torch.tensor(
-        [[generated_token_ids[-1]]],
+        [generated_token_ids[-unconsumed:]],
         device=draft_cache.device,
     )
     draft_grammar_state = grammar_state
@@ -202,11 +212,10 @@ def propose_tokens(
 
     final_state = (draft_grammar_state if grammar_constraint is not None and proposed
                    and proposed[-1] not in eos_token_ids else None)
-    return ProposalResult(proposed, start_length, draft_cache.length, final_state)
+    return ProposalResult(proposed, before, draft_cache.length, final_state)
 
 
 def _verify_proposal(
-    draft_model: PreTrainedModel,
     draft_cache: CacheState,
     target_model: PreTrainedModel,
     target_cache: CacheState,
@@ -314,19 +323,13 @@ def _verify_proposal(
             continue
         break
 
-    if accepted == len(proposal.token_ids):
-        draft_token_id = proposal.token_ids[-1] if proposal.token_ids else current_token_id
-        with torch.inference_mode():
-            draft_cache.extend(
-                draft_model,
-                torch.tensor(
-                    [[draft_token_id]],
-                    device=draft_cache.device,
-                ),
-            )
-
     target_cache.crop(target_length_before + accepted + 1)
-    draft_cache.crop(proposal.draft_cache_length_before + accepted + 1)
+    # After a full acceptance the draft has not consumed the last proposed
+    # token (or, for an empty proposal, the current one). The next proposal
+    # feeds it with the new current token in one draft step instead of a
+    # separate catch-up step here, which the final round would also waste.
+    if accepted < len(proposal.token_ids):
+        draft_cache.crop(proposal.draft_cache_length_before + accepted + 1)
     if replayed:
         checkpoint.commit(target_cache, input_ids, accepted, target_logits)
     return (
@@ -336,7 +339,6 @@ def _verify_proposal(
 
 
 def verify_proposal(
-    draft_model: PreTrainedModel,
     draft_cache: CacheState,
     target_model: PreTrainedModel,
     target_cache: CacheState,
@@ -345,7 +347,6 @@ def verify_proposal(
 ) -> VerificationResult:
     """Verify every proposal position in one target forward."""
     return _verify_proposal(
-        draft_model,
         draft_cache,
         target_model,
         target_cache,
@@ -521,6 +522,8 @@ def generate_speculative_events(
             # The first token needs only the target, so the draft prefill runs
             # after that token's yield point and is skipped when generation ends there.
             draft_cache = _start_draft_cache(draft_model, prompt_token_ids, max_tokens)
+            # Generated tokens are consumed by the draft from this length on.
+            draft_start_length = draft_cache.length
         del target_prefill
         while not finished and len(generated) < max_tokens:
             ready_events = []
@@ -548,6 +551,7 @@ def generate_speculative_events(
                 live_grammar_states=(live_grammar_states if constraint is not None else None),
                 mask_times=mask_times,
                 grammar_choices=grammar_choices,
+                unconsumed=len(generated) - (draft_cache.length - draft_start_length),
             )
             proposed_token_count += len(proposal.token_ids)
             if measurement_device is not None:
@@ -564,7 +568,6 @@ def generate_speculative_events(
                 verify_started_at = time.perf_counter()
                 mask_seconds_before = sum(mask_times)
             verified, verified_grammar_states = _verify_proposal(
-                draft_model,
                 draft_cache,
                 target_model,
                 target_cache,

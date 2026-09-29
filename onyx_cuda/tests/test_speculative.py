@@ -34,12 +34,14 @@ class ScriptedCache:
     def __init__(self, token_ids):
         self.token_ids = iter(token_ids)
         self.inputs = []
+        self.widths = []
         self.length = 4
         self.attention_mask = torch.ones((1, 4), dtype=torch.long)
         self.past_key_values = self
 
     def extend(self, model, input_ids):
         self.inputs.extend(input_ids.flatten().tolist())
+        self.widths.append(input_ids.shape[1])
         self.length += input_ids.shape[1]
         logits = torch.full((1, input_ids.shape[1], 16), -1.0)
         for position in range(input_ids.shape[1]):
@@ -460,6 +462,24 @@ def test_speculative_metrics_count_proposals_and_stages(monkeypatch):
     assert result.timings.total_seconds >= (result.timings.time_to_first_token_seconds)
 
 
+def test_full_acceptance_folds_the_draft_catch_up_into_the_next_step(monkeypatch):
+    # Round 1 accepts [2, 3] and adds 4; round 2 starts by consuming 3 and 4 in
+    # one two-token draft step (row 9 unused). The final round adds no step.
+    result, draft_cache, _ = _run_scripted_speculation(
+        monkeypatch,
+        first_token=1,
+        draft_tokens=[2, 3, 9, 5, 6],
+        target_tokens=[2, 3, 4, 5, 6, 7],
+        max_tokens=7,
+        gamma=2,
+    )
+
+    assert (result.token_ids, result.finish_reason) == ([1, 2, 3, 4, 5, 6, 7], "length")
+    assert draft_cache.widths == [1, 1, 2, 1]
+    assert draft_cache.inputs == [1, 2, 3, 4, 5]
+    assert result.speculation[:3] == (4, 4, 2)
+
+
 def test_speculative_counters_do_not_require_measurement(monkeypatch):
     result, _, _ = _run_scripted_speculation(
         monkeypatch,
@@ -761,6 +781,16 @@ def test_scripted_draft_proposal_bounds_order_and_termination(
     assert cache.inputs == expected_inputs
 
 
+def test_draft_consumes_the_last_accepted_proposal_with_the_current_token():
+    # The first scripted row follows the pending proposal 1 and is not used.
+    cache = ScriptedCache([9, 3, 4])
+    result = propose_tokens(object(), cache, [1, 2], 2, 5, 15, unconsumed=2)
+    assert result == ProposalResult([3, 4], 5, 7)
+    assert cache.inputs == [1, 2, 3]
+    with pytest.raises(ValueError, match="unconsumed"):
+        propose_tokens(object(), ScriptedCache([]), [1], 2, 5, 15, unconsumed=2)
+
+
 @pytest.mark.gpu
 def test_real_draft_proposal_matches_direct_greedy_prefix():
     pair = load_model_pair()
@@ -818,13 +848,14 @@ def test_scripted_target_verification_acceptance_and_cache_lengths(
     target_cache = ScriptedCache(target_tokens)
     target_cache.length = 10
 
-    result = verify_proposal(object(), draft_cache, object(), target_cache, 1, proposal)
+    result = verify_proposal(draft_cache, object(), target_cache, 1, proposal)
 
     assert result == VerificationResult(expected_tokens, accepted)
     assert target_cache.inputs == [1, 2, 3, 4]
     assert target_cache.length == 10 + accepted + 1
-    assert draft_cache.length == 4 + accepted + 1
-    assert draft_cache.inputs == ([4] if accepted == 3 else [])
+    # A full acceptance leaves the last proposal for the next draft step to consume.
+    assert draft_cache.length == (4 + accepted + 1 if accepted < 3 else 7)
+    assert draft_cache.inputs == []
 
 
 @pytest.mark.gpu
@@ -855,7 +886,6 @@ def test_real_speculation_matches_target_oracle_and_rejects_cleanly():
         eos_token_ids=pair.draft.tokenizer.eos_token_id,
     )
     verified = verify_proposal(
-        pair.draft.model,
         draft_cache,
         pair.target.model,
         target_cache,

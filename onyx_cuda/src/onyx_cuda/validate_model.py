@@ -147,7 +147,7 @@ def rollback_check(pair):
         target_cache.crop(start)
         draft_cache.extend(pair.draft.model, torch.tensor([[current]], device=device))
     proposal = ProposalResult([wrong], start, start + 1)
-    verified = verify_proposal(pair.draft.model, draft_cache, pair.target.model, target_cache, current, proposal)
+    verified = verify_proposal(draft_cache, pair.target.model, target_cache, current, proposal)
     require(verified.accepted_proposal_count == 0, "Forced proposal was not rejected")
     require(target_cache.length == draft_cache.length == start + 1, "Rejected proposal left incorrect cache lengths")
     replay = verified.token_ids[-1]

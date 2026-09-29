@@ -91,9 +91,10 @@ a successful `stop` finish event; `[DONE]` alone is insufficient.
 
 No model overrides are needed for the default setup.
 
-Draft graphs replay each draft token as one CUDA graph over the draft's own
-weights. The target still verifies every proposed token, so they change speed,
-not output. Set `ONYX_DRAFT_BACKEND=eager` to use the ordinary draft forward.
+Draft graphs replay each draft step of one or two tokens as one CUDA graph over
+the draft's own weights; after a fully accepted round, one two-token step
+consumes the last proposal and the next token together. The target still
+verifies every proposed token, so they change speed, not output. Set `ONYX_DRAFT_BACKEND=eager` to use the ordinary draft forward.
 Graph recovery processes unconstrained emitted history in eight-token blocks,
 with two/three-token blocks and scalar steps for remainders. The default
 (`auto`) enables it only where it was qualified: Linux, an RTX 2080 Ti (compute
@@ -128,20 +129,22 @@ backends. Validate custom models or larger limits on the target GPU first with
 
 ## Measured performance
 
-On a Linux RTX 2080 Ti reporting 22 GiB, the September 28, 2026 comparison covered
-48 cases with one warmup and three measured runs per mode. Aggregates sum
+On a Linux RTX 2080 Ti reporting 22 GiB, the latest September 28, 2026 comparison
+covered 48 cases with one warmup and three measured runs per mode. Aggregates sum
 per-case median generation times, excluding model loading and graph setup:
 
 | Mode | Aggregate speedup over target-only |
 | --- | ---: |
-| Fixed gamma 3, draft graphs, scalar recovery (`ONYX_REPLAY_BACKEND=scalar`) | 1.346x |
-| Fixed gamma 3, draft graphs, graph recovery (default on this GPU) | **1.462x** |
-| Fixed gamma 2 (the previous default), scalar / graph recovery | 1.292x / 1.397x |
+| Fixed gamma 3, draft graphs, scalar recovery (`ONYX_REPLAY_BACKEND=scalar`) | 1.370x |
+| Fixed gamma 3, draft graphs, graph recovery (default on this GPU) | **1.492x** |
 
-Every output in every mode matched target-only tokens and finish reasons. Ten cases
-remain slower than target-only: seven very short requests (at most 24 ms slower)
-and three recovery-heavy prose requests. Gamma 3 improved or held every workload
-category over gamma 2 and needed no additional numerical recoveries. The
+Every output in every mode matched target-only tokens and finish reasons. Nine cases
+remain slower than target-only: six very short requests (at most 21 ms slower)
+and three recovery-heavy prose requests. Earlier the same day, before draft
+catch-up steps were folded into the next draft step (2.1% less time), gamma 3
+measured 1.346x / 1.462x and the previous default, gamma 2, 1.292x / 1.397x.
+Gamma 3 improved or held every workload category over gamma 2 and needed no
+additional numerical recoveries. The
 September 25 comparison, which also timed the ordinary draft forward, measured
 1.130x and 1.211x at gamma 2 without draft graphs; draft graphs reduced total
 generation time by 12.6% and 13.4%.
@@ -152,12 +155,12 @@ and not at all when generation ends there. Across the 48 cases, speculation adds
 0.3 ms in total to time to first token, down from 637 ms on September 27.
 
 Draft graphs cut draft cost from about 7.5-9.8 ms to 4.1-4.4 ms per token and
-add about 2 seconds of startup; graph recovery preparation adds about 42 seconds.
-Peak memory in the comparison was 17.29 GiB allocated. On September 27, forced
+add about 4 seconds of startup; graph recovery preparation adds about 45 seconds.
+Peak memory in the comparison was 17.31 GiB allocated. On September 27, forced
 recoveries with 5,000 to 8,000 prompt tokens and both graph sets loaded matched
 target-only output and peaked at 19.54 GiB allocated.
 
-On September 28 the full CUDA suite passed all 840 tests with gamma 3, draft
+On September 28 the full CUDA suite passed all 841 tests with gamma 3, draft
 graphs, and default graph recovery. September 22 checks
 matched full logits and KV caches bitwise through 8192 tokens with graph
 recovery, and the API completed a 4096-prompt/4096-output capacity test. If a
@@ -182,16 +185,16 @@ fails if any of its recoveries fell back to scalar steps.
 
 ### Speedup by workload
 
-Gamma 3 category results from the same September 28 comparison:
+Gamma 3 category results from the same latest September 28 comparison:
 
 | Workload | Scalar recovery | Graph recovery (default) |
 | --- | ---: | ---: |
-| Code generation | **2.31x** | **2.31x** |
-| JSON Schema output | **2.10x** | **2.10x** |
-| Regex-constrained output | **2.01x** | **2.01x** |
-| Information extraction | **1.79x** | **1.79x** |
-| Prose | 1.09x | 1.21x |
-| Short replies | 1.10x | 1.10x |
+| Code generation | **2.44x** | **2.44x** |
+| JSON Schema output | **2.11x** | **2.11x** |
+| Regex-constrained output | **2.07x** | **2.07x** |
+| Information extraction | **1.85x** | **1.85x** |
+| Prose | 1.10x | 1.22x |
+| Short replies | 1.13x | 1.13x |
 
 Each baseline uses the same target model, prompt, precision, and output budget.
 Regex and JSON baselines enforce the same constraints; these figures measure

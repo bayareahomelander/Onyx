@@ -69,16 +69,19 @@ def _cpu_backend(monkeypatch, capacity=512):
     chunks = capacity // 256
     backend._layers = [{"keys": torch.zeros((chunks, 2, 256, 4), dtype=torch.float16),
                         "values": torch.zeros((chunks, 2, 256, 4), dtype=torch.float16)}]
-    backend._ids = torch.zeros((1,), dtype=torch.long)
-    backend._position = torch.zeros((1,), dtype=torch.long)
+    backend._ids = {width: torch.zeros((width,), dtype=torch.long) for width in (1, 2)}
+    backend._positions = {width: torch.zeros((width,), dtype=torch.long) for width in (1, 2)}
+    backend._offsets = {width: torch.arange(width) for width in (1, 2)}
     replays = []
     class Graph:
-        def __init__(self, chunks):
-            self.chunks = chunks
+        def __init__(self, width, chunks):
+            self.width, self.chunks = width, chunks
         def replay(self):
-            replays.append((self.chunks, backend._ids.item(), backend._position.item()))
-            backend._graphs[self.chunks][1].fill_(backend._position.item())
-    backend._graphs = {c: (Graph(c), torch.zeros((1, 8))) for c in range(1, chunks + 1)}
+            positions = backend._positions[self.width]
+            replays.append((self.chunks, backend._ids[self.width].tolist(), positions.tolist()))
+            backend._graphs[self.width, self.chunks][1].copy_(positions[:, None].expand(-1, 8))
+    backend._graphs = {(width, c): (Graph(width, c), torch.zeros((width, 8)))
+                       for width in (1, 2) for c in range(1, chunks + 1)}
     return backend, replays
 
 
@@ -94,17 +97,20 @@ def test_static_cache_copy_positions_ownership_and_capacity(monkeypatch):
     assert backend.start(kv, 400) is None
     logits = cache.extend(None, torch.tensor([[7, 8]]))
     assert logits.shape == (1, 2, 8) and cache.length == 302
-    assert replays == [(2, 7, 300), (2, 8, 301)]
+    assert replays == [(2, [7, 8], [300, 301])]  # One two-token step.
     assert logits[0, :, 0].tolist() == [300, 301]
+    cache.crop(255)
+    cache.extend(None, torch.tensor([[3, 4]]))  # Spanning chunks uses the second token's graph.
     cache.crop(256)
     cache.extend(None, torch.tensor([[9]]))
     cache.crop(10)
-    cache.extend(None, torch.tensor([[5]]))
-    assert replays[-2:] == [(2, 9, 256), (1, 5, 10)]
+    logits = cache.extend(None, torch.tensor([[5, 6, 7]]))  # A pair, then one token.
+    assert replays[1:] == [(2, [3, 4], [255, 256]), (2, [9], [256]), (1, [5, 6], [10, 11]), (1, [7], [12])]
+    assert logits.shape == (1, 3, 8) and logits[0, :, 0].tolist() == [10, 11, 12]
     with pytest.raises(ValueError, match="between 0 and"):
-        cache.crop(12)
-    cache.extend(None, torch.zeros((1, 500), dtype=torch.long))
-    assert cache.length == 511 and replays[-1] == (2, 0, 510)
+        cache.crop(14)
+    cache.extend(None, torch.zeros((1, 498), dtype=torch.long))
+    assert cache.length == 511 and replays[-1] == (2, [0, 0], [509, 510])
     with pytest.raises(ValueError, match="capacity"):
         cache.extend(None, torch.tensor([[1, 2]]))
     cache.release()
@@ -193,19 +199,25 @@ def test_graph_draft_tracks_eager_draft_with_exact_rollback(record_model_revisio
             cache = backend.start(prefill(model, prompt).past_key_values, len(prompt) + 64)
             assert cache is not None and cache.length == len(prompt)
             assert backend.start(prefill(model, prompt).past_key_values, len(prompt) + 64) is None
+            # A multi-token extend runs two-token steps; compare single steps too.
+            singles = torch.cat([cache.extend(model, torch.tensor([[t]], device="cuda"))[0]
+                                 for t in tokens[:48]])
+            cache.crop(len(prompt))
             rows = cache.extend(model, torch.tensor([tokens[:48]], device="cuda"))[0]
-            assert rows.shape == reference.shape and cache.length == len(prompt) + 48
+            assert rows.shape == singles.shape == reference.shape and cache.length == len(prompt) + 48
             # Draft arithmetic differs slightly from the ordinary forward; it only proposes.
-            assert (rows.argmax(-1) == reference.argmax(-1)).float().mean().item() >= 0.95
-            assert (rows.float() - reference.float()).abs().max().item() < 1.0
+            for computed in (singles, rows):
+                assert (computed.argmax(-1) == reference.argmax(-1)).float().mean().item() >= 0.95
+                assert (computed.float() - reference.float()).abs().max().item() < 1.0
+            # Rollback reproduces rows exactly when re-decoded with the same pairing.
             cache.crop(len(prompt) + 8)
-            again = torch.cat([cache.extend(model, torch.tensor([[t]], device="cuda"))[0] for t in tokens[8:20]])
+            again = cache.extend(model, torch.tensor([tokens[8:20]], device="cuda"))[0]
             assert torch.equal(again, rows[8:20])
             cache.release()
             assert backend.start(prefill(model, prompt).past_key_values, 1025) is None
             replacement = backend.start(prefill(model, prompt).past_key_values, 1024)
             assert replacement is not None
-            del reference, rows, again
+            del reference, singles, rows, again
     finally:
         close_draft_backend(model)
     assert backend.closed and not hasattr(model, "_onyx_draft_backend")
