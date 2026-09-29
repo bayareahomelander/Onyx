@@ -652,6 +652,10 @@ def create_app(
                 replay_backend if gamma > 0 else "scalar")
             if gamma == 0 and replay_backend != "scalar":
                 app.state.replay_configuration.update(requested=replay_backend, reason="speculation is disabled")
+            elif replay_backend == "graph" and app.state.replay_configuration["active"] != "graph":
+                # auto falls back to scalar recovery; an explicit request does not.
+                reason = app.state.replay_configuration.get("reason", "graph recovery is unavailable")
+                raise RuntimeError(f"ONYX_REPLAY_BACKEND=graph cannot be satisfied: {reason}")
             app.state.draft_configuration = prepare_draft_backend(
                 getattr(getattr(app.state.engines[MODEL_ID], "draft", None), "model", None),
                 draft_backend if gamma > 0 else "eager", capacity=limits.context_tokens)

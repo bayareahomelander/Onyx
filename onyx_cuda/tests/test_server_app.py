@@ -90,6 +90,27 @@ def test_replay_setup_failure_releases_loaded_engine(monkeypatch):
     assert not app.state.engines
 
 
+def test_explicit_graph_recovery_fails_startup_when_unavailable(monkeypatch):
+    import onyx_cuda.replay_backend as replay
+    references = []
+    class Engine:
+        target = SimpleNamespace(model=None)
+    def load():
+        engine = Engine()
+        references.append(weakref.ref(engine))
+        return engine
+    monkeypatch.setattr(replay, "prepare_replay_backend", lambda target, mode: {
+        "requested": mode, "active": "scalar", "setup_seconds": 0.0,
+        "reason": "graph recovery is validated only on CUDA capability 7.5"})
+    app = create_app(load_engine=load, replay_backend="graph")
+    with pytest.raises(RuntimeError, match="ONYX_REPLAY_BACKEND=graph.*capability 7.5"):
+        with TestClient(app):
+            pass
+    gc.collect()
+    assert references[0]() is None
+    assert not app.state.engines
+
+
 def test_target_only_does_not_prepare_graphs():
     with TestClient(create_app(engine=object(), gamma=0, replay_backend="graph")) as client:
         configuration = client.get("/").json()["replay_backend"]
