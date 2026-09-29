@@ -38,12 +38,13 @@ def benchmark(monkeypatch):
     import torch
     import onyx_cuda.benchmark as module
     from onyx_cuda.benchmark_corpus import CORPUS
-    from onyx_cuda.generation import AcceptedTokenEvent, GenerationFinishedEvent, GenerationResult
+    from onyx_cuda.generation import (AcceptedTokenEvent, GenerationFinishedEvent, GenerationResult,
+                                      SpeculationStats)
 
     model = SimpleNamespace(config=SimpleNamespace(vocab_size=8))
     tokenizer = SimpleNamespace(eos_token_id=7)
     graphs = SimpleNamespace(closed=False, fallback_reason=None)
-    state = SimpleNamespace(graph=True, calls=[], closes=0, close_during_run=False)
+    state = SimpleNamespace(graph=True, calls=[], closes=0, close_during_run=False, fallback_during_run=False)
 
     def prepare(target, mode):
         assert target is model and mode == "graph"
@@ -62,8 +63,11 @@ def benchmark(monkeypatch):
         state.calls.append((gamma, attached is graphs))
         if attached is not None and state.close_during_run:
             graphs.closed, graphs.fallback_reason = True, "CUDA memory exhausted during graph recovery"
+        # Target-only generation has no speculative counters.
+        speculation = SpeculationStats(2, 1, 1, {"graph_replay_fallbacks": int(
+            attached is not None and state.fallback_during_run)}) if gamma else None
         yield AcceptedTokenEvent(1)
-        yield GenerationFinishedEvent(GenerationResult([1], None, "eos"))
+        yield GenerationFinishedEvent(GenerationResult([1], None, "eos", speculation=speculation))
 
     pair = SimpleNamespace(target=SimpleNamespace(model=model, tokenizer=tokenizer, model_id="t", revision="r"),
                            draft=SimpleNamespace(model=object(), model_id="d", revision="r"))
@@ -77,7 +81,7 @@ def benchmark(monkeypatch):
     for name, value in (("synchronize", None), ("reset_peak_memory_stats", None),
                         ("max_memory_allocated", 0), ("memory_allocated", 0), ("get_device_name", "fake")):
         monkeypatch.setattr(torch.cuda, name, lambda *_, value=value: value)
-    state.model, state.run = model, module.run
+    state.model, state.graphs, state.run = model, graphs, module.run
     return state
 
 
@@ -95,6 +99,19 @@ def test_one_run_interleaves_every_mode_and_attaches_graphs_only_to_graph_modes(
     assert report["settings"]["draft_backend"]["requested"] == "graph"
     assert report["complete"] and report["correctness_passed"]
     assert benchmark.closes == 1 and not hasattr(benchmark.model, "_onyx_replay_backend")
+    runs = report["cases"][0]["runs"]
+    assert runs["gamma0"][0]["speculation"] is None
+    assert runs["gamma2"][0]["speculation"]["accepted_proposal_count"] == 1
+
+
+def test_per_request_graph_fallback_fails_without_measurement(benchmark, tmp_path):
+    benchmark.fallback_during_run = True
+    output = tmp_path / "report.json"
+    with pytest.raises(RuntimeError, match="Graph recovery fell back"):
+        benchmark.run(output, repetitions=1)
+    assert not json.loads(output.read_text())["complete"]
+    # Graphs stay open after a per-request fallback; only the counters reveal it.
+    assert not benchmark.graphs.closed
 
 
 def test_graph_shutdown_during_the_run_fails_instead_of_timing_scalar_recovery(benchmark, tmp_path):

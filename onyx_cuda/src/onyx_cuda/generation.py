@@ -20,6 +20,7 @@ class GenerationResult(NamedTuple):
     past_key_values: Cache | None
     finish_reason: Literal["eos", "stop", "length"]
     timings: "GenerationTimings | None" = None
+    speculation: "SpeculationStats | None" = None
 
 
 class AcceptedTokenEvent(NamedTuple):
@@ -67,6 +68,15 @@ class GenerationTimings(NamedTuple):
     verification_replays: int | None = None
     canonical_replay_tokens: int | None = None
     replay_stats: dict | None = None
+
+
+class SpeculationStats(NamedTuple):
+    """Speculative counters; unlike timings, collecting them adds no synchronization."""
+
+    proposed_token_count: int
+    accepted_proposal_count: int
+    speculative_iteration_count: int
+    replay_stats: dict
 
 
 def _matched_stop_length(token_ids: list[int], stop_sequences: list[list[int]]) -> int:

@@ -265,7 +265,7 @@ def test_constrained_rejection_verifies_from_canonical_state_and_releases(
         target_tokens=[3, 0],
     )
 
-    assert result == GenerationResult([1, 3], result.past_key_values, "stop")
+    assert result._replace(speculation=None) == GenerationResult([1, 3], result.past_key_values, "stop")
     assert ((1,), 2) in grammar.advance_calls
     assert ((1,), 3) in grammar.advance_calls
     assert ((1, 2), 3) not in grammar.advance_calls
@@ -458,6 +458,24 @@ def test_speculative_metrics_count_proposals_and_stages(monkeypatch):
     assert result.timings.verify_seconds >= 0
     assert result.timings.mask_seconds == 0
     assert result.timings.total_seconds >= (result.timings.time_to_first_token_seconds)
+
+
+def test_speculative_counters_do_not_require_measurement(monkeypatch):
+    result, _, _ = _run_scripted_speculation(
+        monkeypatch,
+        first_token=1,
+        draft_tokens=[2, 3, 0],
+        target_tokens=[2, 4, 9, 5],
+        max_tokens=4,
+        gamma=2,
+    )
+
+    assert result.timings is None
+    assert result.speculation[:3] == (2, 1, 2)
+    assert result.speculation.replay_stats["verification_replays"] == 0
+    assert result.speculation.replay_stats["graph_replay_fallbacks"] == 0
+    assert result.speculation.replay_stats["stage_seconds"] is None
+
 
 
 @pytest.mark.parametrize(

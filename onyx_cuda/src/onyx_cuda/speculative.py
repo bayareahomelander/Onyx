@@ -15,6 +15,7 @@ from onyx_cuda.generation import (
     _take_ready_tokens,
     GenerationResult,
     GenerationTimings,
+    SpeculationStats,
     _grammar_choices,
     _initialize_grammar_constraint,
     _matched_stop_length,
@@ -664,6 +665,8 @@ def generate_speculative_events(
         if constraint is not None and live_grammar_states:
             constraint.release_states(list(live_grammar_states))
 
+    speculation = SpeculationStats(proposed_token_count, accepted_proposal_count,
+                                   speculative_iteration_count, checkpoint.report())
     timings = None
     if started_at is not None and time_to_first_token is not None:
         _synchronize_device(measurement_device)
@@ -690,10 +693,10 @@ def generate_speculative_events(
             mask_seconds=sum(mask_times or ()),
             verification_replays=checkpoint.replays,
             canonical_replay_tokens=checkpoint.replayed_tokens,
-            replay_stats=checkpoint.report(),
+            replay_stats=speculation.replay_stats,
         )
     yield GenerationFinishedEvent(
-        GenerationResult(generated, past_key_values, finish_reason, timings)
+        GenerationResult(generated, past_key_values, finish_reason, timings, speculation)
     )
 
 

@@ -133,8 +133,9 @@ def run(output, *, repetitions=3, split="all", measure=False):
                 seconds = time.perf_counter() - started
                 if graph and graphs.closed:
                     raise RuntimeError(f"Graph recovery closed during {case['name']}: {graphs.fallback_reason}")
-                fallbacks = (getattr(getattr(result, "timings", None), "replay_stats", None) or {}).get("graph_replay_fallbacks", 0)
-                if graph and fallbacks:
+                # Unlike timings, speculative counters are present without --measure.
+                speculation = getattr(result, "speculation", None)
+                if graph and speculation is not None and speculation.replay_stats["graph_replay_fallbacks"]:
                     # A scalar fallback (such as memory exhaustion) would mislabel graph timings.
                     raise RuntimeError(f"Graph recovery fell back during {case['name']}")
                 assert result is not None and ids == result.token_ids
@@ -147,7 +148,7 @@ def run(output, *, repetitions=3, split="all", measure=False):
                     raise RuntimeError(f"Incomplete output: {case['name']} / {mode}")
                 return {"seconds": seconds, "ttft_seconds": first, "token_ids": ids,
                         "finish_reason": result.finish_reason,
-                        "replay_stats": getattr(result.timings, "replay_stats", None),
+                        "speculation": speculation._asdict() if speculation is not None else None,
                         "peak_allocated_bytes": torch.cuda.max_memory_allocated(device)}
 
             for mode in modes:  # Warm all modes and establish the target oracle first.

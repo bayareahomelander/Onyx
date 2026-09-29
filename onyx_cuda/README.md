@@ -167,7 +167,9 @@ One interleaved run times target-only and fixed gamma 2 generation, and adds a
 graph-recovery mode when the GPU supports it (compute capability 7.5).
 Every mode uses the configured draft backend, draft graphs by default. Every
 speculative output must match target-only generation token for token. The report
-records which modes ran and why a graph backend was unavailable.
+records which modes ran and why a graph backend was unavailable. Each speculative
+run also records its proposal, acceptance, and recovery counts, and a graph mode
+fails if any of its recoveries fell back to scalar steps.
 
 ### Speedup by workload
 
