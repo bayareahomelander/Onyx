@@ -672,7 +672,8 @@ def generate_speculative_events(
                                    speculative_iteration_count, checkpoint.report())
     timings = None
     if time_to_first_token is not None:
-        # A final draft catch-up step may still be queued; wait so it is counted.
+        # Cache work after the last token read (such as a recovery snapshot)
+        # may still be queued; wait so it is counted.
         _synchronize_device(device)
         total_seconds = time.perf_counter() - started_at
         decode_seconds = total_seconds - time_to_first_token
