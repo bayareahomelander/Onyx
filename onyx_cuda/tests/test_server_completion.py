@@ -52,12 +52,13 @@ def _result(token_ids, finish_reason, timings=None):
     )
 
 
-def _timings(*, speed, acceptance, ttft, iterations):
+def _timings(*, speed, acceptance, ttft, iterations, total=0.5):
     return SimpleNamespace(
         decode_tokens_per_second=speed,
         acceptance_rate=acceptance,
         time_to_first_token_seconds=ttft,
         speculative_iteration_count=iterations,
+        total_seconds=total,
     )
 
 
@@ -123,6 +124,8 @@ def test_non_streaming_chat_completion_returns_usage_reason_and_metrics(monkeypa
         "ttft_ms": 10.0,
         "grammar_constrained": False,
         "speculative_iterations": 3,
+        "speculative": True,
+        "total_ms": 500.0,
     }
     assert len(calls) == 1
     assert "measure" not in calls[0]  # The API runs without stage synchronization.
@@ -195,9 +198,56 @@ def test_stop_length_and_multiple_choices_use_final_choice_metrics(monkeypatch):
         "ttft_ms": 20.0,
         "grammar_constrained": False,
         "speculative_iterations": 4,
+        "speculative": True,
+        "total_ms": 500.0,
     }
     assert len(calls) == 2
     assert all(call["stop_sequences"] == [[40]] for call in calls)
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_speculative_false_runs_the_target_alone_on_a_speculative_server(monkeypatch, stream):
+    timings = _timings(speed=30.0, acceptance=None, ttft=0.04, iterations=None, total=1.5)
+    calls = _fake_generation(monkeypatch, [_result([10, 99], "eos", timings)] * 3)
+    stream_calls = _fake_stream(
+        monkeypatch, [SimpleNamespace(text="Hello"), SimpleNamespace(result=_result([10, 99], "eos", timings))]
+    )
+
+    def metrics(response):
+        if not stream:
+            return response.json()["onyx_metrics"]
+        return json.loads(_parse_sse(response.text)[-2])["onyx_metrics"]
+
+    with TestClient(create_app(engine=_engine(FakeTokenizer({(10, 99): "Hello"})))) as client:
+        server_gamma = client.app.state.speculative_gamma
+        responses = [
+            client.post("/v1/chat/completions",
+                        json={"messages": [{"role": "user", "content": "Hi"}], "stream": stream, **extra})
+            for extra in ({}, {"speculative": False}, {"temperature": 0.7})
+        ]
+
+    assert server_gamma > 0
+    assert [response.status_code for response in responses] == [200, 200, 200]
+    gammas = ([call["arguments"]["gamma"] for call in stream_calls] if stream
+              else [call["gamma"] for call in calls])
+    assert gammas == [server_gamma, 0, server_gamma]
+    # Sampling runs the target alone even on a speculative server.
+    assert [metrics(response)["speculative"] for response in responses] == [True, False, False]
+    assert metrics(responses[1])["total_ms"] == 1500.0
+
+
+def test_speculative_true_needs_server_speculation_and_greedy_decoding(monkeypatch):
+    calls = _fake_generation(monkeypatch, [])
+    body = {"messages": [{"role": "user", "content": "Hi"}], "speculative": True}
+    with TestClient(create_app(engine=_engine(FakeTokenizer({})), gamma=0)) as client:
+        disabled = client.post("/v1/chat/completions", json=body)
+    with TestClient(create_app(engine=_engine(FakeTokenizer({})))) as client:
+        sampled = client.post("/v1/chat/completions", json={**body, "temperature": 0.7})
+
+    assert disabled.status_code == sampled.status_code == 422
+    assert "runs the target alone" in disabled.text
+    assert "temperature 0" in sampled.text
+    assert calls == []
 
 
 @pytest.mark.parametrize("seed", [42, -(2**63), 2**64 - 1, None])
@@ -517,7 +567,8 @@ def test_streaming_chunks_preserve_id_and_real_finish_reason(monkeypatch):
         [
             SimpleNamespace(text="Hel"),
             SimpleNamespace(text="lo"),
-            SimpleNamespace(result=_result([10, 11], "eos")),
+            SimpleNamespace(result=_result(
+                [10, 11], "eos", _timings(speed=12.5, acceptance=0.5, ttft=0.01, iterations=3))),
         ],
     )
 
@@ -546,6 +597,18 @@ def test_streaming_chunks_preserve_id_and_real_finish_reason(monkeypatch):
     finished = [chunk for chunk in chunks if chunk["choices"][0]["finish_reason"] is not None]
     assert len(finished) == 1
     assert finished[0]["choices"][0]["finish_reason"] == "stop"
+    # Only the finishing chunk carries usage and metrics, as non-streaming responses report them.
+    assert finished[0]["usage"] == {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5}
+    assert finished[0]["onyx_metrics"] == {
+        "tokens_per_second": 12.5,
+        "acceptance_rate": 0.5,
+        "ttft_ms": 10.0,
+        "grammar_constrained": False,
+        "speculative_iterations": 3,
+        "speculative": True,
+        "total_ms": 500.0,
+    }
+    assert not any("usage" in chunk or "onyx_metrics" in chunk for chunk in chunks if chunk is not finished[0])
     assert {chunk["id"] for chunk in chunks} == {chunks[0]["id"]}
     assert {chunk["created"] for chunk in chunks} == {chunks[0]["created"]}
     assert {chunk["model"] for chunk in chunks} == {MODEL_ID}

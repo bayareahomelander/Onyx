@@ -103,6 +103,9 @@ class ChatCompletionRequest(BaseModel):
     temperature: float = Field(default=0.0, ge=0, allow_inf_nan=False)
     stream: bool = False
     enable_thinking: bool = False
+    # None follows the server's speculation setting; false runs the target alone,
+    # so one server can compare both modes on the same prompt.
+    speculative: bool | None = None
     regex: str | None = None
     json_schema: dict[str, Any] | None = None
     response_format: (
@@ -153,6 +156,8 @@ class ChatCompletionRequest(BaseModel):
             )
         if "compact_json" in self.model_fields_set and self.compact_json and self.stream:
             raise ValueError("compact_json=true is unsupported with streaming")
+        if self.speculative and self.temperature > 0:
+            raise ValueError("speculative=true requires temperature 0; sampling runs the target alone")
         return self
 
 
@@ -174,6 +179,8 @@ class OnyxMetrics(BaseModel):
     ttft_ms: float | None = None
     grammar_constrained: bool | None = None
     speculative_iterations: int | None = None
+    speculative: bool | None = None
+    total_ms: float | None = None
 
 
 class ChatCompletionResponse(BaseModel):
@@ -203,6 +210,9 @@ class ChatCompletionChunk(BaseModel):
     created: int
     model: str
     choices: list[ChatCompletionChunkChoice]
+    # Sent only on the finishing chunk.
+    usage: UsageInfo | None = None
+    onyx_metrics: OnyxMetrics | None = None
 
 
 def _load_configured_engine(gamma: int = GAMMA, selection=None) -> Any:
@@ -337,15 +347,24 @@ def truncate_at_stop(text: str, stop: list[str] | None) -> str:
     return text[: min(positions)] if positions else text
 
 
-def _build_metrics(timings, grammar_constrained: bool) -> OnyxMetrics:
+def _request_gamma(request: ChatCompletionRequest, server_gamma: int) -> int:
+    return 0 if request.speculative is False else server_gamma
+
+
+def _build_metrics(timings, request: ChatCompletionRequest, gamma: int) -> OnyxMetrics:
+    grammar_constrained = request.regex is not None or request.effective_json_schema is not None
+    # Positive temperature samples from the target alone whatever the gamma.
+    speculative = gamma > 0 and request.temperature == 0
     if timings is None:
-        return OnyxMetrics(grammar_constrained=grammar_constrained)
+        return OnyxMetrics(grammar_constrained=grammar_constrained, speculative=speculative)
     return OnyxMetrics(
         tokens_per_second=timings.decode_tokens_per_second,
         acceptance_rate=timings.acceptance_rate,
         ttft_ms=timings.time_to_first_token_seconds * 1000,
         grammar_constrained=grammar_constrained,
         speculative_iterations=timings.speculative_iteration_count,
+        speculative=speculative,
+        total_ms=timings.total_seconds * 1000,
     )
 
 
@@ -447,6 +466,8 @@ def _chunk_json(
     role: str | None = None,
     content: str | None = None,
     finish_reason: str | None = None,
+    usage: UsageInfo | None = None,
+    metrics: OnyxMetrics | None = None,
 ) -> str:
     return ChatCompletionChunk(
         id=completion_id,
@@ -459,7 +480,10 @@ def _chunk_json(
                 finish_reason=finish_reason,
             )
         ],
-    ).model_dump_json()
+        usage=usage,
+        onyx_metrics=metrics,
+    ).model_dump_json(exclude={name for name, value in (("usage", usage), ("onyx_metrics", metrics))
+                               if value is None})
 
 
 def _stream_error_payload(error: BaseException) -> str:
@@ -488,10 +512,12 @@ def _sse_events(request: ChatCompletionRequest, engine, *, gamma: int = GAMMA,
         arguments = prepare_generation(request, engine, gamma=gamma, prompt_token_ids=prompt_token_ids)
         events = _completion_event_iter(arguments, engine.target.tokenizer, request.stop)
         finish_reason = None
+        final = None
         json_parts = []
         for event in events:
             result = getattr(event, "result", None)
             if result is not None:
+                final = result
                 finish_reason = "stop" if result.finish_reason == "eos" else result.finish_reason
                 continue
             text = getattr(event, "text", None)
@@ -503,7 +529,11 @@ def _sse_events(request: ChatCompletionRequest, engine, *, gamma: int = GAMMA,
             raise Exception("Generation ended without a terminal event")
         if request.effective_json_schema is not None and finish_reason != "length":
             _validate_json_response(request.effective_json_schema, "".join(json_parts))
-        yield _sse(_chunk_json(completion_id, created, model, finish_reason=finish_reason))
+        prompt_tokens = len(arguments["prompt_token_ids"])
+        usage = UsageInfo(prompt_tokens=prompt_tokens, completion_tokens=len(final.token_ids),
+                          total_tokens=prompt_tokens + len(final.token_ids))
+        yield _sse(_chunk_json(completion_id, created, model, finish_reason=finish_reason, usage=usage,
+                               metrics=_build_metrics(final.timings, request, gamma)))
         yield _sse("[DONE]")
     except Exception as error:
         yield _sse(_stream_error_payload(error))
@@ -515,7 +545,7 @@ def _sse_events(request: ChatCompletionRequest, engine, *, gamma: int = GAMMA,
 
 
 async def _stream_chat_completion(app: FastAPI, request: ChatCompletionRequest, engine,
-                                  prompt_token_ids: list[int] | None = None):
+                                  prompt_token_ids: list[int] | None = None, *, gamma: int):
     lock = app.state.engine_locks[request.model]
     await lock.acquire()
     cancelled = threading.Event()
@@ -531,10 +561,7 @@ async def _stream_chat_completion(app: FastAPI, request: ChatCompletionRequest, 
         return False
 
     def worker() -> None:
-        stream = _sse_events(
-            request, engine, gamma=app.state.speculative_gamma,
-            prompt_token_ids=prompt_token_ids,
-        )
+        stream = _sse_events(request, engine, gamma=gamma, prompt_token_ids=prompt_token_ids)
         try:
             for chunk in stream:
                 if not put(chunk):
@@ -753,6 +780,10 @@ def create_app(
             request.max_tokens = min(request.max_tokens, limits.output_tokens)
         if request.max_tokens > limits.output_tokens:
             raise HTTPException(status_code=422, detail=f"max_tokens exceeds output limit {limits.output_tokens}")
+        if request.speculative and app.state.speculative_gamma == 0:
+            raise HTTPException(status_code=422,
+                                detail="speculative=true is unavailable: this server runs the target alone")
+        gamma = _request_gamma(request, app.state.speculative_gamma)
         prompt_token_ids = _request_prompt_token_ids(request, engine, context_limit=limits.context_tokens)
         if request.regex is not None:
             from onyx_cuda import _rust
@@ -771,7 +802,7 @@ def create_app(
             _rust.validate_json_schema(json.dumps(request.effective_json_schema))
         if request.stream:
             return StreamingResponse(
-                _stream_chat_completion(app, request, engine, prompt_token_ids),
+                _stream_chat_completion(app, request, engine, prompt_token_ids, gamma=gamma),
                 media_type="text/event-stream",
                 headers={
                     "Cache-Control": "no-cache",
@@ -782,8 +813,7 @@ def create_app(
 
         async with app.state.engine_locks[request.model]:
             tokenizer = engine.target.tokenizer
-            arguments = prepare_generation(request, engine, gamma=app.state.speculative_gamma,
-                                           prompt_token_ids=prompt_token_ids)
+            arguments = prepare_generation(request, engine, gamma=gamma, prompt_token_ids=prompt_token_ids)
             prompt_tokens = len(arguments["prompt_token_ids"])
             completion_tokens = 0
             choices = []
@@ -829,10 +859,7 @@ def create_app(
                     completion_tokens=completion_tokens,
                     total_tokens=prompt_tokens + completion_tokens,
                 ),
-                onyx_metrics=_build_metrics(
-                    last_timings,
-                    request.regex is not None or request.effective_json_schema is not None,
-                ),
+                onyx_metrics=_build_metrics(last_timings, request, gamma),
             )
 
     return app

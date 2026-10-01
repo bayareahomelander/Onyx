@@ -182,6 +182,7 @@ def test_disconnecting_full_stream_buffer_closes_producer_and_releases_lock(monk
         async with app.router.lifespan_context(app):
             stream = server._stream_chat_completion(
                 app, server.ChatCompletionRequest(**PAYLOAD, stream=True), app.state.engines[server.MODEL_ID],
+                gamma=app.state.speculative_gamma,
             )
             try:
                 assert await anext(stream) == "0"

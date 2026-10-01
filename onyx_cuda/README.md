@@ -76,7 +76,15 @@ $body | curl.exe --no-buffer http://127.0.0.1:8000/v1/chat/completions -H "Conte
 ```
 
 Generated text is in `choices[0].delta.content`. For constrained JSON, wait for
-a successful `stop` finish event; `[DONE]` alone is insufficient.
+a successful `stop` finish event; `[DONE]` alone is insufficient. The finishing
+chunk also carries `usage` and `onyx_metrics`, as non-streaming responses do:
+time to first token, total generation time, decode rate, whether speculation ran,
+and for speculative requests the acceptance rate and verification rounds.
+
+To compare both modes on one server, send `"speculative": false` to run the
+target alone for that request; omitting the field follows the server setting.
+`"speculative": true` returns HTTP 422 when the server runs the target alone
+(`ONYX_SPECULATIVE_GAMMA=0`) or the request samples with a positive temperature.
 
 ## Defaults
 

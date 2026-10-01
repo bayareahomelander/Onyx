@@ -56,7 +56,7 @@ def test_valid_request_and_response_round_trip():
         "stop": None,
     }
     request = ChatCompletionRequest.model_validate(request_payload)
-    assert request.model_dump() == {**request_payload, "enable_thinking": False}
+    assert request.model_dump() == {**request_payload, "enable_thinking": False, "speculative": None}
     assert ChatCompletionRequest.model_validate(request.model_dump()) == request
 
     defaults = ChatCompletionRequest.model_validate(
@@ -97,6 +97,8 @@ def test_valid_request_and_response_round_trip():
             "ttft_ms": 12.0,
             "grammar_constrained": True,
             "speculative_iterations": 3,
+            "speculative": True,
+            "total_ms": 40.0,
         },
     }
     response = ChatCompletionResponse.model_validate(response_payload)
@@ -117,7 +119,8 @@ def test_valid_request_and_response_round_trip():
         ],
     }
     chunk = ChatCompletionChunk.model_validate(chunk_payload)
-    assert chunk.model_dump() == chunk_payload
+    # The server omits these two on every chunk but the finishing one.
+    assert chunk.model_dump() == {**chunk_payload, "usage": None, "onyx_metrics": None}
     assert ChatCompletionChunk.model_validate(chunk.model_dump()) == chunk
 
 
