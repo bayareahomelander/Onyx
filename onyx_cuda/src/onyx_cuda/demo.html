@@ -30,7 +30,7 @@ body { margin: 0; background: var(--milk); color: var(--ink); font-family: var(-
 button { font: inherit; color: inherit; }
 button:focus-visible { outline: 2px solid var(--onyx); outline-offset: 2px; }
 
-.page { max-width: 1120px; margin: 0 auto; padding: 28px 32px 40px; }
+.page { max-width: 1120px; margin: 0 auto; padding: 18px 32px 16px; }
 
 .masthead { display: flex; justify-content: space-between; align-items: baseline; gap: 8px 24px; flex-wrap: wrap; }
 .wordmark { margin: 0; font-size: 21px; font-weight: 800; font-stretch: 125%; letter-spacing: 0.04em; }
@@ -38,11 +38,10 @@ button:focus-visible { outline: 2px solid var(--onyx); outline-offset: 2px; }
 .source::before { content: ""; width: 8px; height: 8px; border-radius: 50%; background: var(--target); }
 .source.live::before { background: var(--verified); }
 
-.headline { margin: 28px 0 8px; font-size: 36px; line-height: 1.12; text-wrap: balance;
+.headline { margin: 14px 0 0; font-size: 36px; line-height: 1.12; text-wrap: balance;
   font-weight: 700; font-stretch: 108%; letter-spacing: -0.01em; }
-.lede { margin: 0; max-width: 68ch; color: var(--stone); }
 
-.controls { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px 24px; margin-top: 22px; }
+.controls { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px 24px; margin-top: 16px; }
 .segmented { display: inline-flex; border: 1px solid var(--rule); border-radius: 6px; background: var(--well); overflow: hidden; }
 .segmented button { border: 0; background: transparent; padding: 8px 14px; font-size: 14px; font-weight: 500; cursor: pointer; }
 .segmented button + button { border-left: 1px solid var(--rule); }
@@ -58,14 +57,14 @@ button:focus-visible { outline: 2px solid var(--onyx); outline-offset: 2px; }
 button:disabled { opacity: 0.45; cursor: default; }
 [hidden] { display: none !important; }
 
-.brief { display: grid; grid-template-columns: 96px 1fr; gap: 4px 16px; margin: 14px 0 0; font-size: 15px; }
+.brief { display: grid; grid-template-columns: 96px 1fr; gap: 2px 16px; margin: 10px 0 0; font-size: 15px; }
 .brief dt { color: var(--stone); }
 .brief dd { margin: 0; overflow-wrap: anywhere; }
 .brief code { font-family: var(--mono); font-size: 13.5px; }
 .brief .kind { color: var(--stone); margin-right: 10px; }
 
 /* The photo finish: every token is a mark at the moment it arrived. */
-.finish { margin-top: 24px; display: grid; grid-template-columns: 132px 1fr 104px; column-gap: 16px; row-gap: 6px; align-items: center; }
+.finish { margin-top: 14px; display: grid; grid-template-columns: 132px 1fr 104px; column-gap: 16px; row-gap: 6px; align-items: center; }
 .axis { grid-column: 2; position: relative; height: 22px; }
 .axis span { position: absolute; bottom: 0; transform: translateX(-50%); font-size: 12px; color: var(--stone);
   font-variant-numeric: tabular-nums; white-space: nowrap; }
@@ -73,7 +72,7 @@ button:disabled { opacity: 0.45; cursor: default; }
 .axis span:first-child { transform: none; }
 .axis span:first-child::after { left: 0; }
 .lane-name { grid-column: 1; font-size: 15px; font-weight: 600; line-height: 1.25; }
-.track { grid-column: 2; position: relative; height: 58px; border-radius: 3px; background: var(--band); overflow: hidden; }
+.track { grid-column: 2; position: relative; height: 52px; border-radius: 3px; background: var(--band); overflow: hidden; }
 .track.onyx { background: var(--onyx); }
 .mark { position: absolute; background: var(--target); visibility: hidden; }
 .track.onyx .mark { background: var(--milk); }
@@ -87,12 +86,12 @@ button:disabled { opacity: 0.45; cursor: default; }
 .split.onyx { color: var(--onyx); }
 .caption { grid-column: 2 / -1; margin: 6px 0 0; font-size: 13px; color: var(--stone); }
 
-.outputs { margin-top: 26px; display: grid; grid-template-columns: 1fr 1fr; gap: 24px; }
+.outputs { margin-top: 18px; display: grid; grid-template-columns: 1fr 1fr; gap: 24px; }
 .run { min-width: 0; }
-.run h2 { margin: 0; font-size: 21px; font-weight: 700; font-stretch: 108%; }
-.run .how { margin: 2px 0 10px; font-size: 14px; color: var(--stone); }
-.output { margin: 0; height: 320px; overflow: auto; padding: 14px 16px; border: 1px solid var(--rule); border-radius: 4px;
-  background: var(--well); font-family: var(--mono); font-size: 14.5px; line-height: 1.6; white-space: pre-wrap;
+.run h2 { margin: 0 0 8px; font-size: 21px; font-weight: 700; font-stretch: 108%; }
+.run h2 small { margin-left: 8px; font-size: 14px; font-weight: 400; font-stretch: 100%; color: var(--stone); }
+.output { margin: 0; height: 236px; overflow: auto; padding: 14px 16px; border: 1px solid var(--rule); border-radius: 4px;
+  background: var(--well); font-family: var(--mono); font-size: 14px; line-height: 1.55; white-space: pre-wrap;
   overflow-wrap: anywhere; font-variant-ligatures: none; scrollbar-width: thin; scrollbar-color: var(--rule) transparent; }
 .run.onyx .output { border-color: var(--onyx); }
 .output .empty { font-family: var(--sans); font-size: 14px; color: var(--stone); }
@@ -100,12 +99,8 @@ button:disabled { opacity: 0.45; cursor: default; }
 @keyframes flash { from { background: var(--flash); } to { background: transparent; } }
 .caret { display: inline-block; width: 0.5em; height: 1.05em; vertical-align: -0.15em; background: var(--target); }
 .run.onyx .caret { background: var(--onyx); }
-.summary { margin: 8px 0 0; min-height: 6em; /* Four lines, so the finish does not shift the page. */ font-size: 14px; color: var(--stone); }
-.summary strong { color: var(--ink); font-weight: 600; }
-.summary .verified { color: var(--verified); font-weight: 600; }
 
-.note { margin: 18px 0 0; max-width: 80ch; font-size: 13px; color: var(--stone); }
-.note kbd { font-family: var(--mono); font-size: 12px; border: 1px solid var(--rule); border-radius: 3px; padding: 0 4px; background: var(--well); }
+.note { margin: 14px 0 0; max-width: 80ch; font-size: 13px; color: var(--stone); }
 
 @media (max-width: 760px) {
   .page { padding: 20px 16px 32px; }
@@ -138,8 +133,6 @@ button:disabled { opacity: 0.45; cursor: default; }
   </header>
 
   <h1 class="headline" id="headline" aria-live="polite">One prompt, decoded twice on the same GPU.</h1>
-  <p class="lede" id="lede">First Qwen3-8B generates alone. Then Onyx runs the same prompt: a small draft model proposes
-    tokens and Qwen3-8B verifies them, under the same regex or JSON Schema.</p>
 
   <div class="controls">
     <div class="segmented" id="presets" role="group" aria-label="Prompt"></div>
@@ -168,21 +161,16 @@ button:disabled { opacity: 0.45; cursor: default; }
   <section class="outputs">
     <article class="run" id="run-base">
       <h2 id="title-base">Qwen3-8B alone</h2>
-      <p class="how">Every token waits for its own forward pass.</p>
       <pre class="output" id="out-base"></pre>
-      <p class="summary" id="sum-base"></p>
     </article>
     <article class="run onyx" id="run-onyx">
-      <h2>Onyx</h2>
-      <p class="how" id="how-onyx">Qwen2.5-0.5B drafts three tokens; Qwen3-8B checks them in one pass.</p>
+      <h2>Onyx <small id="how-onyx">Qwen2.5-0.5B drafts, Qwen3-8B verifies</small></h2>
       <pre class="output" id="out-onyx"></pre>
-      <p class="summary" id="sum-onyx"></p>
     </article>
   </section>
 
-  <p class="note" id="note">These are sample runs. The output text and end-to-end times come from two real runs recorded
-    on October 1, 2026 on an RTX 2080 Ti; within each run, token arrival is reconstructed from the recorded number
-    of verification rounds. Press <kbd>Space</kbd> to play the race.</p>
+  <p class="note" id="note">Sample runs: real outputs and times recorded October 1, 2026 on an RTX 2080 Ti.
+    Token arrival within each run is reconstructed from its recorded verification rounds.</p>
 </main>
 
 <script>
@@ -199,14 +187,13 @@ const SAMPLES = [
 
 const SPEEDS = [[1, "1×", "Real time"], [0.5, "½×", "Half speed"], [0.25, "¼×", "Quarter speed"]];
 const LANES = ["base", "onyx"];
-const NUMBER_WORDS = ["zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine"];
 // Streamed chunks this close together arrived from the same verification round. Rounds
 // land 45-60 ms apart on the RTX 2080 Ti; a round's last tokens can trail by about 4 ms.
 const ROUND_GAP_MS = 12;
 const $ = (id) => document.getElementById(id);
 const state = {
   sample: SAMPLES[0], speed: 1, recording: null, finished: false, frame: null, marks: null, busy: false,
-  live: false, models: { target: "Qwen3-8B", draft: "Qwen2.5-0.5B", gamma: 3 },
+  live: false, models: { target: "Qwen3-8B", draft: "Qwen2.5-0.5B" },
 };
 
 function seededRandom(seed) {
@@ -330,7 +317,6 @@ function toRun(recorded) {
 }
 
 const seconds = (ms) => (ms / 1000).toFixed(2) + " s";
-const shortTime = (ms) => (ms < 1000 ? `${Math.round(ms)} ms` : seconds(ms));
 const shortName = (id) => String(id || "").split("/").pop().replace(/-Instruct$/, "");
 
 function buildChoices() {
@@ -382,26 +368,21 @@ function renderBrief() {
 }
 
 function renderMode() {
-  const { target, draft, gamma } = state.models;
+  const { target, draft } = state.models;
   const source = $("source");
   source.classList.toggle("live", state.live);
   source.textContent = state.live ? `Live on this server: ${target} with a ${draft} draft` : source.dataset.sample;
-  $("lede").textContent = `First ${target} generates alone. Then Onyx runs the same prompt: a small draft model ` +
-    `proposes tokens and ${target} verifies them, under the same regex or JSON Schema.`;
   $("name-base").textContent = $("title-base").textContent = `${target} alone`;
-  $("how-onyx").textContent = `${draft} drafts ${NUMBER_WORDS[gamma] || gamma} tokens; ${target} checks them in one pass.`;
+  $("how-onyx").textContent = `${draft} drafts, ${target} verifies`;
   $("play").textContent = state.live ? "Run race" : "Play race";
-  $("note").innerHTML = state.live
-    ? "Each race runs the prompt twice on this server, first with the target model alone and then with Onyx, " +
-      "and plays both runs together from 0 s. Times are the server's own generation times. " +
-      "Press <kbd>Space</kbd> to run a race."
-    : $("note").dataset.sample;
+  // Live races need no footnote; sample runs must say their timing is reconstructed.
+  $("note").hidden = state.live;
 }
 
 function renderCaption() {
   const speed = SPEEDS.find(([value]) => value === state.speed);
-  $("caption").textContent = "Both runs were recorded back to back on one GPU and start together here at 0 s." +
-    (state.speed === 1 ? "" : ` Playing at ${speed[2].toLowerCase()}; times stay real.`);
+  $("caption").textContent = "Recorded back to back on one GPU, played together from 0 s." +
+    (state.speed === 1 ? "" : ` Playing at ${speed[2].toLowerCase()}; times are real.`);
 }
 
 function niceStep(span) {
@@ -479,7 +460,6 @@ function prepare(recording) {
     $(`out-${lane}`).innerHTML = '<span class="empty"></span>';
     $(`out-${lane}`).firstChild.textContent = empty;
     $(`split-${lane}`).textContent = seconds(0);
-    $(`sum-${lane}`).textContent = "";
   }
   $("headline").textContent = "One prompt, decoded twice on the same GPU.";
   $("replay").hidden = !(state.live && recording);
@@ -489,30 +469,12 @@ function reset() {
   prepare(state.live ? null : synthesize(state.sample));
 }
 
-function summarize(lane, run) {
-  const m = run.metrics;
-  const rate = (run.tokens / (m.total_ms / 1000)).toFixed(1);
-  const summary = $(`sum-${lane}`);
-  summary.innerHTML = "<strong></strong> <span></span>";
-  summary.children[0].textContent = `${run.tokens} tokens in ${seconds(m.total_ms)}, ${rate} per second.`;
-  summary.children[1].textContent = lane === "onyx"
-    ? `First token after ${shortTime(m.ttft_ms)}. ${m.speculative_iterations} verification rounds; ` +
-      `${Math.round(m.acceptance_rate * 100)}% of drafted tokens accepted.`
-    : `First token after ${shortTime(m.ttft_ms)}.`;
-}
-
 function announce(recording) {
   const speedup = recording.base.metrics.total_ms / recording.onyx.metrics.total_ms;
   const identical = recording.base.text === recording.onyx.text;
   $("headline").textContent = identical
     ? `Onyx matched all ${recording.onyx.tokens} tokens and finished ${speedup.toFixed(2)}× sooner.`
     : "The two outputs differ; this run does not show an exact match.";
-  if (identical) {
-    const check = document.createElement("span");
-    check.className = "verified";
-    check.textContent = ` Identical to ${state.models.target} alone, character for character.`;
-    $("sum-onyx").append(check);
-  }
 }
 
 // Shows a finished race at once, as after a resize.
@@ -527,7 +489,6 @@ function showFinished() {
       return span;
     }));
     $(`split-${lane}`).textContent = seconds(run.metrics.total_ms);
-    summarize(lane, run);
   }
   announce(state.recording);
   state.finished = true;
@@ -575,7 +536,6 @@ function play() {
         lane.caret.remove();
         marks[`${lane.name}Now`].classList.remove("on");
         marks[`${lane.name}Finish`].classList.add("on");
-        summarize(lane.name, run);
       }
     }
     if (running) {
@@ -633,8 +593,7 @@ async function detectServer() {
     const info = response.ok ? await response.json() : null;
     if (!info || info.service !== "Onyx CUDA API" || !(info.speculative_gamma > 0) || !info.models.draft) return;
     state.live = true;
-    state.models = { target: shortName(info.models.target.id), draft: shortName(info.models.draft.id),
-      gamma: info.speculative_gamma };
+    state.models = { target: shortName(info.models.target.id), draft: shortName(info.models.draft.id) };
   } catch {
     // No reachable API: stay on the sample runs.
   }
@@ -661,7 +620,6 @@ window.addEventListener("resize", () => {
 });
 
 $("source").dataset.sample = $("source").textContent;
-$("note").dataset.sample = $("note").innerHTML;
 buildChoices();
 renderChoices();
 renderBrief();
