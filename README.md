@@ -4,6 +4,9 @@ Onyx generates structured LLM output by enforcing regex and supported JSON
 Schema constraints during token generation. It provides an OpenAI-compatible
 chat-completions API, streaming, and grammar-aware speculative decoding.
 
+See the [CUDA demo videos](onyx_cuda/README.md#demo) of Qwen3-8B alone racing
+Onyx on the same prompts, with identical output.
+
 There are two independent implementations:
 
 | Platform | Runtime | Setup |
@@ -36,12 +39,12 @@ python -m uvicorn onyx.server:app --host 127.0.0.1 --port 8000
 For NVIDIA CUDA setup, model selection, and benchmarks, see the
 [Onyx CUDA README](onyx_cuda/README.md).
 
-The CUDA implementation defaults to fixed gamma 2 with a Qwen3-8B FP16 target
+The CUDA implementation defaults to fixed gamma 3 with a Qwen3-8B FP16 target
 and Qwen2.5-0.5B draft on a 22 GiB GPU, decoding draft tokens with CUDA graphs.
-On the validated RTX 2080 Ti, the default achieved **1.292x aggregate
-target-only speed** across 48 cases and opt-in graph recovery **1.398x**, with
-outputs identical to target-only generation. Draft graphs add about 2 seconds of
-startup and graph recovery about 45 seconds; see
+On the validated RTX 2080 Ti, where graph recovery is the default, it achieved
+**1.492x aggregate target-only speed** across 48 cases (**1.370x** with scalar
+recovery), with outputs identical to target-only generation. Draft graphs add
+about 4 seconds of startup and graph recovery about 45 seconds; see
 [CUDA performance and limitations](onyx_cuda/README.md#measured-performance).
 
 ## Example

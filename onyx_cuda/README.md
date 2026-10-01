@@ -4,6 +4,25 @@ The NVIDIA CUDA implementation of [Onyx](../README.md) generates structured LLM
 output with regex and JSON Schema constraints. It provides an OpenAI-compatible
 chat-completions API and streaming on Windows and Linux.
 
+## Demo
+
+Each clip is the [`/demo` race page](#example) on an RTX 2080 Ti: one prompt, run
+with Qwen3-8B alone and then with Onyx, played side by side from 0 s. Every token
+is a mark at its arrival time. Onyx's tokens arrive a verification round at a
+time, and both outputs match exactly.
+
+**Python function**, free-form text:
+
+https://github.com/user-attachments/assets/615559ff-cbeb-4468-b74b-c8e33a00f2bd
+
+**JSON array**, constrained by a JSON Schema:
+
+https://github.com/user-attachments/assets/4b654cb7-8bca-466b-9ed9-e7fc9de7a8c2
+
+**32 digits**, constrained by the regex `[0-9]{32}`:
+
+https://github.com/user-attachments/assets/e0e805ad-8085-4640-b515-620c59d7c744
+
 ## Requirements
 
 - Windows or Linux x64 and Python 3.12
