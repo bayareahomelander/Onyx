@@ -86,6 +86,11 @@ target alone for that request; omitting the field follows the server setting.
 `"speculative": true` returns HTTP 422 when the server runs the target alone
 (`ONYX_SPECULATIVE_GAMMA=0`) or the request samples with a positive temperature.
 
+Open `http://127.0.0.1:8000/demo` while the server runs to race both modes on a
+preset prompt: the page runs the target alone, then speculation, and plays the two
+runs side by side with each token placed at its arrival time. Opened as a local
+file, the page plays recorded sample runs instead.
+
 ## Defaults
 
 | Setting | Default |

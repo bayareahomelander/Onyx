@@ -12,12 +12,13 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from decimal import Decimal
+from importlib.resources import files
 from time import time
 from typing import Annotated, Any, Callable, Literal
 from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from onyx_cuda.config import (reject_removed_settings, resolve_model_selection,
@@ -755,8 +756,14 @@ def create_app(
                 "max_active_requests": limits.active_requests,
                 "stream_buffer_chunks": limits.stream_buffer_chunks,
             },
-            "endpoints": ["/", "/v1/models", "/v1/chat/completions"],
+            "endpoints": ["/", "/v1/models", "/v1/chat/completions", "/demo"],
         }
+
+    @app.get("/demo", response_class=HTMLResponse, include_in_schema=False)
+    async def demo():
+        # A side-by-side race of target-only and speculative runs, built on this API.
+        # Read per request, so the page can change without reloading the models.
+        return HTMLResponse(files("onyx_cuda").joinpath("demo.html").read_text(encoding="utf-8"))
 
     @app.get("/v1/models")
     async def list_models():

@@ -1,0 +1,678 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Onyx Race</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@62..125,100..900&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+/* Onyx is a banded black and milk-white stone; the page is built from those two bands. */
+:root {
+  --milk: #f3f4f1;
+  --band: #e3e5e1;
+  --rule: #cfd3ce;
+  --onyx: #000000;
+  --ink: #171816;
+  --stone: #6a6f6b;
+  --target: #7b807c;
+  --verified: #1d7a52;
+  --flash: #d3d7d1;
+  --well: #fbfbfa;
+  --sans: "Archivo", "Segoe UI", system-ui, sans-serif;
+  --mono: "IBM Plex Mono", "Cascadia Mono", Consolas, monospace;
+}
+* { box-sizing: border-box; }
+html { background: var(--milk); }
+body { margin: 0; background: var(--milk); color: var(--ink); font-family: var(--sans);
+  font-size: 16px; line-height: 1.5; -webkit-font-smoothing: antialiased; }
+button { font: inherit; color: inherit; }
+button:focus-visible { outline: 2px solid var(--onyx); outline-offset: 2px; }
+
+.page { max-width: 1120px; margin: 0 auto; padding: 28px 32px 40px; }
+
+.masthead { display: flex; justify-content: space-between; align-items: baseline; gap: 8px 24px; flex-wrap: wrap; }
+.wordmark { margin: 0; font-size: 21px; font-weight: 800; font-stretch: 125%; letter-spacing: 0.04em; }
+.source { display: flex; align-items: center; gap: 8px; margin: 0; font-size: 14px; color: var(--stone); }
+.source::before { content: ""; width: 8px; height: 8px; border-radius: 50%; background: var(--target); }
+.source.live::before { background: var(--verified); }
+
+.headline { margin: 28px 0 8px; font-size: 36px; line-height: 1.12; text-wrap: balance;
+  font-weight: 700; font-stretch: 108%; letter-spacing: -0.01em; }
+.lede { margin: 0; max-width: 68ch; color: var(--stone); }
+
+.controls { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px 24px; margin-top: 22px; }
+.segmented { display: inline-flex; border: 1px solid var(--rule); border-radius: 6px; background: var(--well); overflow: hidden; }
+.segmented button { border: 0; background: transparent; padding: 8px 14px; font-size: 14px; font-weight: 500; cursor: pointer; }
+.segmented button + button { border-left: 1px solid var(--rule); }
+.segmented button[aria-pressed="true"] { background: var(--onyx); color: var(--milk); }
+.segmented button:focus-visible { outline-offset: -4px; outline-color: var(--verified); }
+.play-group { display: flex; align-items: center; gap: 16px; flex-wrap: wrap; }
+.speed { display: flex; align-items: center; gap: 8px; font-size: 14px; color: var(--stone); }
+.speed .segmented button { padding: 8px 11px; font-variant-numeric: tabular-nums; }
+.play { border: 0; border-radius: 6px; background: var(--onyx); color: var(--milk); padding: 9px 20px;
+  font-size: 15px; font-weight: 600; cursor: pointer; }
+.secondary { border: 1px solid var(--rule); border-radius: 6px; background: var(--well); padding: 8px 18px;
+  font-size: 15px; font-weight: 600; cursor: pointer; }
+button:disabled { opacity: 0.45; cursor: default; }
+[hidden] { display: none !important; }
+
+.brief { display: grid; grid-template-columns: 96px 1fr; gap: 4px 16px; margin: 14px 0 0; font-size: 15px; }
+.brief dt { color: var(--stone); }
+.brief dd { margin: 0; overflow-wrap: anywhere; }
+.brief code { font-family: var(--mono); font-size: 13.5px; }
+.brief .kind { color: var(--stone); margin-right: 10px; }
+
+/* The photo finish: every token is a mark at the moment it arrived. */
+.finish { margin-top: 24px; display: grid; grid-template-columns: 132px 1fr 104px; column-gap: 16px; row-gap: 6px; align-items: center; }
+.axis { grid-column: 2; position: relative; height: 22px; }
+.axis span { position: absolute; bottom: 0; transform: translateX(-50%); font-size: 12px; color: var(--stone);
+  font-variant-numeric: tabular-nums; white-space: nowrap; }
+.axis span::after { content: ""; position: absolute; left: 50%; bottom: -6px; width: 1px; height: 5px; background: var(--rule); }
+.axis span:first-child { transform: none; }
+.axis span:first-child::after { left: 0; }
+.lane-name { grid-column: 1; font-size: 15px; font-weight: 600; line-height: 1.25; }
+.track { grid-column: 2; position: relative; height: 58px; border-radius: 3px; background: var(--band); overflow: hidden; }
+.track.onyx { background: var(--onyx); }
+.mark { position: absolute; background: var(--target); visibility: hidden; }
+.track.onyx .mark { background: var(--milk); }
+.mark.on { visibility: visible; }
+.now, .finish-line { position: absolute; top: 0; bottom: 0; width: 1px; background: var(--onyx); visibility: hidden; }
+.track.onyx .now, .track.onyx .finish-line { background: var(--milk); }
+.finish-line { width: 2px; }
+.now.on, .finish-line.on { visibility: visible; }
+.split { grid-column: 3; font-size: 34px; line-height: 1; font-weight: 700; font-stretch: 70%; text-align: right;
+  font-variant-numeric: tabular-nums; color: var(--target); }
+.split.onyx { color: var(--onyx); }
+.caption { grid-column: 2 / -1; margin: 6px 0 0; font-size: 13px; color: var(--stone); }
+
+.outputs { margin-top: 26px; display: grid; grid-template-columns: 1fr 1fr; gap: 24px; }
+.run { min-width: 0; }
+.run h2 { margin: 0; font-size: 21px; font-weight: 700; font-stretch: 108%; }
+.run .how { margin: 2px 0 10px; font-size: 14px; color: var(--stone); }
+.output { margin: 0; height: 320px; overflow: auto; padding: 14px 16px; border: 1px solid var(--rule); border-radius: 4px;
+  background: var(--well); font-family: var(--mono); font-size: 14.5px; line-height: 1.6; white-space: pre-wrap;
+  overflow-wrap: anywhere; font-variant-ligatures: none; scrollbar-width: thin; scrollbar-color: var(--rule) transparent; }
+.run.onyx .output { border-color: var(--onyx); }
+.output .empty { font-family: var(--sans); font-size: 14px; color: var(--stone); }
+.tok.burst { animation: flash 800ms ease-out; }
+@keyframes flash { from { background: var(--flash); } to { background: transparent; } }
+.caret { display: inline-block; width: 0.5em; height: 1.05em; vertical-align: -0.15em; background: var(--target); }
+.run.onyx .caret { background: var(--onyx); }
+.summary { margin: 8px 0 0; min-height: 6em; /* Four lines, so the finish does not shift the page. */ font-size: 14px; color: var(--stone); }
+.summary strong { color: var(--ink); font-weight: 600; }
+.summary .verified { color: var(--verified); font-weight: 600; }
+
+.note { margin: 18px 0 0; max-width: 80ch; font-size: 13px; color: var(--stone); }
+.note kbd { font-family: var(--mono); font-size: 12px; border: 1px solid var(--rule); border-radius: 3px; padding: 0 4px; background: var(--well); }
+
+@media (max-width: 760px) {
+  .page { padding: 20px 16px 32px; }
+  .headline { font-size: 28px; margin-top: 24px; }
+  .finish { grid-template-columns: 1fr auto; }
+  .axis { grid-column: 1 / -1; }
+  .lane-name { grid-column: 1; margin-top: 8px; }
+  .split { grid-column: 2; font-size: 28px; }
+  .track { grid-column: 1 / -1; }
+  /* Each lane's name and time share a row above its track. */
+  #name-base, #split-base { grid-row: 2; }
+  #track-base { grid-row: 3; }
+  #name-onyx, #split-onyx { grid-row: 4; }
+  #track-onyx { grid-row: 5; }
+  .caption { grid-column: 1 / -1; grid-row: 6; }
+  .outputs { grid-template-columns: 1fr; }
+  .output { height: 240px; }
+  .brief { grid-template-columns: 1fr; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .tok.burst { animation: none; }
+}
+</style>
+</head>
+<body>
+<main class="page">
+  <header class="masthead">
+    <p class="wordmark">Onyx</p>
+    <p class="source" id="source">Sample runs recorded October 1, 2026 on an RTX 2080 Ti</p>
+  </header>
+
+  <h1 class="headline" id="headline" aria-live="polite">One prompt, decoded twice on the same GPU.</h1>
+  <p class="lede" id="lede">First Qwen3-8B generates alone. Then Onyx runs the same prompt: a small draft model proposes
+    tokens and Qwen3-8B verifies them, under the same regex or JSON Schema.</p>
+
+  <div class="controls">
+    <div class="segmented" id="presets" role="group" aria-label="Prompt"></div>
+    <div class="play-group">
+      <div class="speed"><span id="speed-label">Speed</span><div class="segmented" id="speed" role="group" aria-labelledby="speed-label"></div></div>
+      <button class="play" id="play">Play race</button>
+      <button class="secondary" id="replay" hidden>Replay</button>
+    </div>
+  </div>
+  <dl class="brief">
+    <dt>Prompt</dt><dd id="prompt"></dd>
+    <dt>Constraint</dt><dd id="constraint"></dd>
+  </dl>
+
+  <section class="finish" aria-label="When each token arrived">
+    <div class="axis" id="axis"></div>
+    <div class="lane-name" id="name-base">Qwen3-8B alone</div>
+    <div class="track" id="track-base"></div>
+    <div class="split" id="split-base">0.00 s</div>
+    <div class="lane-name" id="name-onyx">Onyx</div>
+    <div class="track onyx" id="track-onyx"></div>
+    <div class="split onyx" id="split-onyx">0.00 s</div>
+    <p class="caption" id="caption"></p>
+  </section>
+
+  <section class="outputs">
+    <article class="run" id="run-base">
+      <h2 id="title-base">Qwen3-8B alone</h2>
+      <p class="how">Every token waits for its own forward pass.</p>
+      <pre class="output" id="out-base"></pre>
+      <p class="summary" id="sum-base"></p>
+    </article>
+    <article class="run onyx" id="run-onyx">
+      <h2>Onyx</h2>
+      <p class="how" id="how-onyx">Qwen2.5-0.5B drafts three tokens; Qwen3-8B checks them in one pass.</p>
+      <pre class="output" id="out-onyx"></pre>
+      <p class="summary" id="sum-onyx"></p>
+    </article>
+  </section>
+
+  <p class="note" id="note">These are sample runs. The output text and end-to-end times come from two real runs recorded
+    on October 1, 2026 on an RTX 2080 Ti; within each run, token arrival is reconstructed from the recorded number
+    of verification rounds. Press <kbd>Space</kbd> to play the race.</p>
+</main>
+
+<script>
+"use strict";
+
+// Recorded October 1, 2026 on an RTX 2080 Ti: Qwen3-8B FP16 target, Qwen2.5-0.5B
+// draft, gamma 3, draft and recovery CUDA graphs. Token pieces come from the target
+// tokenizer; times and round counts are the server's streamed metrics.
+const SAMPLES = [
+  {"id": "array_json", "label": "JSON array", "messages": [{"role": "system", "content": "You are a concise assistant."}, {"role": "user", "content": "Return a JSON array containing the integers 1 through 12."}], "regex": null, "json_schema": {"type": "array", "items": {"type": "integer"}, "minItems": 12, "maxItems": 12}, "max_tokens": 512, "completion_tokens": 39, "pieces": ["[", "1", ",", " ", "2", ",", " ", "3", ",", " ", "4", ",", " ", "5", ",", " ", "6", ",", " ", "7", ",", " ", "8", ",", " ", "9", ",", " ", "1", "0", ",", " ", "1", "1", ",", " ", "1", "2", "]"], "target": {"ttft_ms": 46.4, "total_ms": 1365.68, "tokens_per_second": 28.8}, "speculative": {"ttft_ms": 48.15, "total_ms": 569.17, "tokens_per_second": 72.93, "acceptance_rate": 1.0, "speculative_iterations": 10}},
+  {"id": "digits", "label": "32 digits", "messages": [{"role": "system", "content": "You are a concise assistant."}, {"role": "user", "content": "Return 32 digits, using the repeating pattern 1234567890."}], "regex": "[0-9]{32}", "json_schema": null, "max_tokens": 512, "completion_tokens": 32, "pieces": ["1", "2", "3", "4", "5", "6", "7", "8", "9", "0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "0", "1", "2"], "target": {"ttft_ms": 46.09, "total_ms": 1126.64, "tokens_per_second": 28.69}, "speculative": {"ttft_ms": 46.24, "total_ms": 451.7, "tokens_per_second": 76.46, "acceptance_rate": 1.0, "speculative_iterations": 8}},
+  {"id": "binary_search", "label": "Python function", "messages": [{"role": "system", "content": "You are a concise assistant."}, {"role": "user", "content": "Write only an iterative Python binary search function returning an index or -1."}], "regex": null, "json_schema": null, "max_tokens": 512, "completion_tokens": 89, "pieces": ["```", "python", "\n", "def", " binary", "_search", "(arr", ",", " target", "):\n", "   ", " left", ",", " right", " =", " ", "0", ",", " len", "(arr", ")", " -", " ", "1", "\n", "   ", " while", " left", " <=", " right", ":\n", "       ", " mid", " =", " (", "left", " +", " right", ")", " //", " ", "2", "\n", "       ", " if", " arr", "[mid", "]", " ==", " target", ":\n", "           ", " return", " mid", "\n", "       ", " elif", " arr", "[mid", "]", " <", " target", ":\n", "           ", " left", " =", " mid", " +", " ", "1", "\n", "       ", " else", ":\n", "           ", " right", " =", " mid", " -", " ", "1", "\n", "   ", " return", " -", "1", "\n", "```"], "target": {"ttft_ms": 43.78, "total_ms": 3088.62, "tokens_per_second": 28.9}, "speculative": {"ttft_ms": 43.84, "total_ms": 1164.12, "tokens_per_second": 78.55, "acceptance_rate": 0.94, "speculative_iterations": 23}}
+];
+
+const SPEEDS = [[1, "1×", "Real time"], [0.5, "½×", "Half speed"], [0.25, "¼×", "Quarter speed"]];
+const LANES = ["base", "onyx"];
+const NUMBER_WORDS = ["zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine"];
+// Streamed chunks this close together arrived from the same verification round. Rounds
+// land 45-60 ms apart on the RTX 2080 Ti; a round's last tokens can trail by about 4 ms.
+const ROUND_GAP_MS = 12;
+const $ = (id) => document.getElementById(id);
+const state = {
+  sample: SAMPLES[0], speed: 1, recording: null, finished: false, frame: null, marks: null, busy: false,
+  live: false, models: { target: "Qwen3-8B", draft: "Qwen2.5-0.5B", gamma: 3 },
+};
+
+function seededRandom(seed) {
+  let a = seed >>> 0;
+  return () => {
+    a = (a + 0x6d2b79f5) >>> 0;
+    let t = a;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+function hash(text) {
+  let h = 2166136261;
+  for (const ch of text) h = Math.imul(h ^ ch.codePointAt(0), 16777619);
+  return h >>> 0;
+}
+
+// Sample runs rebuild token arrival from recorded totals: the target emits one token
+// per step; Onyx emits each verification round's tokens together.
+function synthesize(sample) {
+  const random = seededRandom(hash(sample.id));
+  const pieces = sample.pieces;
+  const count = sample.completion_tokens;
+  const base = sample.target;
+  const step = (base.total_ms - base.ttft_ms) / Math.max(count - 1, 1);
+  const baseEvents = pieces.map((text, i) => ({
+    t: Math.min(base.ttft_ms + i * step + (i && i < count - 1 ? (random() - 0.5) * 0.16 * step : 0), base.total_ms),
+    text, round: 0,
+  }));
+
+  const onyx = sample.speculative;
+  const rounds = Math.max(onyx.speculative_iterations, 1);
+  const rest = count - 1;
+  const floor = Math.floor(rest / rounds);
+  const sizes = Array(rounds).fill(floor);
+  for (let extra = rest - floor * rounds; extra > 0; extra--) {
+    const candidates = sizes.map((size, i) => i).filter((i) => sizes[i] === floor);
+    sizes[candidates[Math.floor(random() * candidates.length)]] += 1;
+  }
+  const roundStep = (onyx.total_ms - onyx.ttft_ms) / rounds;
+  const onyxEvents = [{ t: onyx.ttft_ms, text: pieces[0], round: 0 }];
+  let next = 1;
+  sizes.forEach((size, r) => {
+    const t = onyx.ttft_ms + (r + 1) * roundStep + (r < rounds - 1 ? (random() - 0.5) * 0.12 * roundStep : 0);
+    for (let j = 0; j < size && next < pieces.length; j++, next++) onyxEvents.push({ t, text: pieces[next], round: r + 1 });
+  });
+
+  const text = pieces.join("");
+  return {
+    base: { events: baseEvents, text, tokens: count, metrics: base },
+    onyx: { events: onyxEvents, text, tokens: count, metrics: onyx },
+  };
+}
+
+// Streams one completion and notes when each text chunk arrived.
+async function record(sample, speculative) {
+  const body = { messages: sample.messages, max_tokens: sample.max_tokens, stream: true, speculative };
+  if (sample.regex) body.regex = sample.regex;
+  if (sample.json_schema) body.json_schema = sample.json_schema;
+  const started = performance.now();
+  const response = await fetch("/v1/chat/completions", {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+  });
+  if (!response.ok) {
+    const error = await response.json().catch(() => ({}));
+    const detail = Array.isArray(error.detail) ? error.detail.map((item) => item.msg).join("; ") : error.detail;
+    throw new Error(detail || `the server answered HTTP ${response.status}`);
+  }
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  const events = [];
+  let buffer = "";
+  let final = null;
+  for (;;) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    const arrived = performance.now() - started;
+    buffer += decoder.decode(value, { stream: true });
+    for (let end = buffer.indexOf("\n\n"); end >= 0; end = buffer.indexOf("\n\n")) {
+      const data = buffer.slice(0, end).split("\n").filter((line) => line.startsWith("data:"))
+        .map((line) => line.slice(5).trimStart()).join("\n");
+      buffer = buffer.slice(end + 2);
+      if (!data || data === "[DONE]") continue;
+      const chunk = JSON.parse(data);
+      if (chunk.error) throw new Error(chunk.error.message);
+      const choice = chunk.choices[0];
+      if (choice.delta && choice.delta.content) events.push({ t: arrived, text: choice.delta.content });
+      if (choice.finish_reason) final = chunk;
+    }
+  }
+  if (!final) throw new Error("the stream ended without a finish event");
+  if (final.choices[0].finish_reason !== "stop") {
+    throw new Error("the output reached its token limit before the constraint was complete");
+  }
+  if (!events.length) throw new Error("the model returned no text");
+  return { events, final, speculative };
+}
+
+// Pins arrival times to the server's clock: the first chunk lands at its time to first
+// token and the last at its total time, so network delay does not decide the race.
+function toRun(recorded) {
+  const metrics = recorded.final.onyx_metrics;
+  const { events } = recorded;
+  const first = events[0].t;
+  const last = events[events.length - 1].t;
+  const scale = last > first ? (metrics.total_ms - metrics.ttft_ms) / (last - first) : 0;
+  let round = 0;
+  let roundStart = metrics.ttft_ms;
+  const mapped = events.map((event, i) => {
+    const t = metrics.ttft_ms + (event.t - first) * scale;
+    if (i && (!recorded.speculative || event.t - events[i - 1].t > ROUND_GAP_MS)) {
+      round += 1;
+      roundStart = t;
+    }
+    return { t: recorded.speculative ? roundStart : t, text: event.text, round };
+  });
+  return { events: mapped, text: events.map((event) => event.text).join(""),
+    tokens: recorded.final.usage.completion_tokens, metrics };
+}
+
+const seconds = (ms) => (ms / 1000).toFixed(2) + " s";
+const shortTime = (ms) => (ms < 1000 ? `${Math.round(ms)} ms` : seconds(ms));
+const shortName = (id) => String(id || "").split("/").pop().replace(/-Instruct$/, "");
+
+function buildChoices() {
+  $("presets").replaceChildren(...SAMPLES.map((sample) => {
+    const button = document.createElement("button");
+    button.textContent = sample.label;
+    button.addEventListener("click", () => {
+      if (state.busy) return;
+      state.sample = sample;
+      renderChoices();
+      renderBrief();
+      reset();
+    });
+    return button;
+  }));
+  $("speed").replaceChildren(...SPEEDS.map(([value, label, title]) => {
+    const button = document.createElement("button");
+    button.textContent = label;
+    button.title = title;
+    button.setAttribute("aria-label", title);
+    button.addEventListener("click", () => { state.speed = value; renderChoices(); renderCaption(); });
+    return button;
+  }));
+}
+
+function renderChoices() {
+  [...$("presets").children].forEach((button, i) => button.setAttribute("aria-pressed", String(SAMPLES[i] === state.sample)));
+  [...$("speed").children].forEach((button, i) => button.setAttribute("aria-pressed", String(SPEEDS[i][0] === state.speed)));
+}
+
+function renderBrief() {
+  const sample = state.sample;
+  $("prompt").textContent = sample.messages.filter((m) => m.role === "user").map((m) => m.content).join("\n");
+  const constraint = $("constraint");
+  const kind = document.createElement("span");
+  kind.className = "kind";
+  const code = document.createElement("code");
+  if (sample.regex) {
+    kind.textContent = "Regex";
+    code.textContent = sample.regex;
+    constraint.replaceChildren(kind, code);
+  } else if (sample.json_schema) {
+    kind.textContent = "JSON Schema";
+    code.textContent = JSON.stringify(sample.json_schema);
+    constraint.replaceChildren(kind, code);
+  } else {
+    constraint.textContent = "None, free-form text";
+  }
+}
+
+function renderMode() {
+  const { target, draft, gamma } = state.models;
+  const source = $("source");
+  source.classList.toggle("live", state.live);
+  source.textContent = state.live ? `Live on this server: ${target} with a ${draft} draft` : source.dataset.sample;
+  $("lede").textContent = `First ${target} generates alone. Then Onyx runs the same prompt: a small draft model ` +
+    `proposes tokens and ${target} verifies them, under the same regex or JSON Schema.`;
+  $("name-base").textContent = $("title-base").textContent = `${target} alone`;
+  $("how-onyx").textContent = `${draft} drafts ${NUMBER_WORDS[gamma] || gamma} tokens; ${target} checks them in one pass.`;
+  $("play").textContent = state.live ? "Run race" : "Play race";
+  $("note").innerHTML = state.live
+    ? "Each race runs the prompt twice on this server, first with the target model alone and then with Onyx, " +
+      "and plays both runs together from 0 s. Times are the server's own generation times. " +
+      "Press <kbd>Space</kbd> to run a race."
+    : $("note").dataset.sample;
+}
+
+function renderCaption() {
+  const speed = SPEEDS.find(([value]) => value === state.speed);
+  $("caption").textContent = "Both runs were recorded back to back on one GPU and start together here at 0 s." +
+    (state.speed === 1 ? "" : ` Playing at ${speed[2].toLowerCase()}; times stay real.`);
+}
+
+function niceStep(span) {
+  return [100, 200, 250, 500, 1000, 2000, 5000].find((step) => span / step <= 7) || 10000;
+}
+
+// Lays out the time axis and every token mark; marks stay hidden until their time.
+function buildTimeline(recording) {
+  const axis = $("axis");
+  axis.replaceChildren();
+  for (const lane of LANES) $(`track-${lane}`).replaceChildren();
+  if (!recording) return null;
+  const span = Math.max(recording.base.metrics.total_ms, recording.onyx.metrics.total_ms) * 1.03;
+  const step = niceStep(span);
+  for (let t = 0; t <= span; t += step) {
+    const label = document.createElement("span");
+    label.style.left = `${(t / span) * 100}%`;
+    label.textContent = t === 0 ? "0 s" : `${+(t / 1000).toFixed(2)} s`;
+    axis.append(label);
+  }
+
+  const width = $("track-base").clientWidth || 800;
+  const gap = (events) => {
+    const times = [...new Set(events.map((e) => e.t))];
+    let smallest = Infinity;
+    for (let i = 1; i < times.length; i++) smallest = Math.min(smallest, times[i] - times[i - 1]);
+    return smallest === Infinity ? span : smallest;
+  };
+  // One mark size for both lanes, so a token looks the same in each.
+  const pitch = (width * Math.min(gap(recording.base.events), gap(recording.onyx.events))) / span;
+  const size = Math.max(2, Math.min(8, Math.floor(pitch - 2)));
+
+  const marks = { span };
+  for (const lane of LANES) {
+    const track = $(`track-${lane}`);
+    const levels = new Map();
+    marks[lane] = recording[lane].events.map((event) => {
+      // Only Onyx stacks: its round's tokens share one arrival time.
+      const level = lane === "onyx" ? levels.get(event.t) || 0 : 0;
+      levels.set(event.t, level + 1);
+      const mark = document.createElement("i");
+      mark.className = "mark";
+      mark.style.left = `calc(${(event.t / span) * 100}% - ${size / 2}px)`;
+      mark.style.bottom = `${8 + level * (size + 3)}px`;
+      mark.style.width = mark.style.height = `${size}px`;
+      track.append(mark);
+      return mark;
+    });
+    const now = document.createElement("i");
+    now.className = "now";
+    const line = document.createElement("i");
+    line.className = "finish-line";
+    line.style.left = `${(recording[lane].metrics.total_ms / span) * 100}%`;
+    track.append(now, line);
+    marks[`${lane}Now`] = now;
+    marks[`${lane}Finish`] = line;
+  }
+  return marks;
+}
+
+function stop() {
+  if (state.frame) cancelAnimationFrame(state.frame);
+  state.frame = null;
+}
+
+// Clears the race area for a recording (or for none yet, in live mode).
+function prepare(recording) {
+  stop();
+  state.recording = recording;
+  state.finished = false;
+  state.marks = buildTimeline(recording);
+  const empty = state.live ? "Press Run race to run both models and watch the output arrive."
+    : "Press Play race to watch the output arrive.";
+  for (const lane of LANES) {
+    $(`out-${lane}`).innerHTML = '<span class="empty"></span>';
+    $(`out-${lane}`).firstChild.textContent = empty;
+    $(`split-${lane}`).textContent = seconds(0);
+    $(`sum-${lane}`).textContent = "";
+  }
+  $("headline").textContent = "One prompt, decoded twice on the same GPU.";
+  $("replay").hidden = !(state.live && recording);
+}
+
+function reset() {
+  prepare(state.live ? null : synthesize(state.sample));
+}
+
+function summarize(lane, run) {
+  const m = run.metrics;
+  const rate = (run.tokens / (m.total_ms / 1000)).toFixed(1);
+  const summary = $(`sum-${lane}`);
+  summary.innerHTML = "<strong></strong> <span></span>";
+  summary.children[0].textContent = `${run.tokens} tokens in ${seconds(m.total_ms)}, ${rate} per second.`;
+  summary.children[1].textContent = lane === "onyx"
+    ? `First token after ${shortTime(m.ttft_ms)}. ${m.speculative_iterations} verification rounds; ` +
+      `${Math.round(m.acceptance_rate * 100)}% of drafted tokens accepted.`
+    : `First token after ${shortTime(m.ttft_ms)}.`;
+}
+
+function announce(recording) {
+  const speedup = recording.base.metrics.total_ms / recording.onyx.metrics.total_ms;
+  const identical = recording.base.text === recording.onyx.text;
+  $("headline").textContent = identical
+    ? `Onyx matched all ${recording.onyx.tokens} tokens and finished ${speedup.toFixed(2)}× sooner.`
+    : "The two outputs differ; this run does not show an exact match.";
+  if (identical) {
+    const check = document.createElement("span");
+    check.className = "verified";
+    check.textContent = ` Identical to ${state.models.target} alone, character for character.`;
+    $("sum-onyx").append(check);
+  }
+}
+
+// Shows a finished race at once, as after a resize.
+function showFinished() {
+  for (const lane of LANES) {
+    const run = state.recording[lane];
+    state.marks[lane].forEach((mark) => mark.classList.add("on"));
+    state.marks[`${lane}Finish`].classList.add("on");
+    $(`out-${lane}`).replaceChildren(...run.events.map((event) => {
+      const span = document.createElement("span");
+      span.textContent = event.text;
+      return span;
+    }));
+    $(`split-${lane}`).textContent = seconds(run.metrics.total_ms);
+    summarize(lane, run);
+  }
+  announce(state.recording);
+  state.finished = true;
+}
+
+function play() {
+  const recording = state.recording;
+  prepare(recording);
+  const marks = state.marks;
+  const speed = state.speed;
+  const lanes = LANES.map((name) => {
+    const output = $(`out-${name}`);
+    const caret = document.createElement("span");
+    caret.className = "caret";
+    output.replaceChildren(caret);
+    marks[`${name}Now`].classList.add("on");
+    return { name, run: recording[name], shown: 0, done: false, output, caret };
+  });
+  const began = performance.now();
+
+  const frame = (now) => {
+    const t = (now - began) * speed;
+    let running = false;
+    for (const lane of lanes) {
+      const { run } = lane;
+      let appended = false;
+      while (lane.shown < run.events.length && run.events[lane.shown].t <= t) {
+        const event = run.events[lane.shown];
+        marks[lane.name][lane.shown].classList.add("on");
+        const span = document.createElement("span");
+        span.className = lane.name === "onyx" && event.round ? "tok burst" : "tok";
+        span.textContent = event.text;
+        lane.output.insertBefore(span, lane.caret);
+        lane.shown++;
+        appended = true;
+      }
+      if (appended) lane.output.scrollTop = lane.output.scrollHeight;
+      const total = run.metrics.total_ms;
+      $(`split-${lane.name}`).textContent = seconds(Math.min(t, total));
+      marks[`${lane.name}Now`].style.left = `${(Math.min(t, total) / marks.span) * 100}%`;
+      if (t < total) {
+        running = true;
+      } else if (!lane.done) {
+        lane.done = true;
+        lane.caret.remove();
+        marks[`${lane.name}Now`].classList.remove("on");
+        marks[`${lane.name}Finish`].classList.add("on");
+        summarize(lane.name, run);
+      }
+    }
+    if (running) {
+      state.frame = requestAnimationFrame(frame);
+    } else {
+      state.frame = null;
+      state.finished = true;
+      announce(recording);
+    }
+  };
+  state.frame = requestAnimationFrame(frame);
+}
+
+function setBusy(busy) {
+  state.busy = busy;
+  for (const button of document.querySelectorAll("#presets button, #play, #replay")) button.disabled = busy;
+}
+
+async function runLive() {
+  setBusy(true);
+  prepare(null);
+  const { target } = state.models;
+  let stage = `${target} alone`;
+  try {
+    $("headline").textContent = `Running ${target} alone…`;
+    const base = await record(state.sample, false);
+    stage = "Onyx";
+    $("headline").textContent = "Running Onyx…";
+    const onyx = await record(state.sample, true);
+    prepare({ base: toRun(base), onyx: toRun(onyx) });
+    play();
+  } catch (error) {
+    $("headline").textContent = `The ${stage} run failed: ${error.message}. Check the server, then run the race again.`;
+  } finally {
+    setBusy(false);
+  }
+}
+
+function primaryAction() {
+  if (state.busy) return;
+  if (state.live) {
+    runLive();
+  } else {
+    prepare(synthesize(state.sample));
+    play();
+  }
+}
+
+// Served by the API, the page races live; opened as a file or without a speculative
+// server, it plays the recorded sample runs.
+async function detectServer() {
+  if (location.protocol === "file:") return;
+  try {
+    const response = await fetch("/", { cache: "no-store" });
+    const info = response.ok ? await response.json() : null;
+    if (!info || info.service !== "Onyx CUDA API" || !(info.speculative_gamma > 0) || !info.models.draft) return;
+    state.live = true;
+    state.models = { target: shortName(info.models.target.id), draft: shortName(info.models.draft.id),
+      gamma: info.speculative_gamma };
+  } catch {
+    // No reachable API: stay on the sample runs.
+  }
+}
+
+$("play").addEventListener("click", primaryAction);
+$("replay").addEventListener("click", () => { if (!state.busy && state.recording) play(); });
+document.addEventListener("keydown", (event) => {
+  if (event.code === "Space" && !(event.target instanceof HTMLButtonElement)) {
+    event.preventDefault();
+    primaryAction();
+  }
+});
+// Mark sizes depend on the track width; lay the timeline out again after a resize.
+let resizeTimer = null;
+window.addEventListener("resize", () => {
+  clearTimeout(resizeTimer);
+  resizeTimer = setTimeout(() => {
+    if (state.frame || state.busy || !state.recording) return;
+    const finished = state.finished;
+    prepare(state.recording);
+    if (finished) showFinished();
+  }, 150);
+});
+
+$("source").dataset.sample = $("source").textContent;
+$("note").dataset.sample = $("note").innerHTML;
+buildChoices();
+renderChoices();
+renderBrief();
+renderCaption();
+renderMode();
+reset();
+detectServer().then(() => {
+  if (!state.live) return;
+  renderMode();
+  reset();
+});
+</script>
+</body>
+</html>

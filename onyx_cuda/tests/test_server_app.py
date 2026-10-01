@@ -119,6 +119,18 @@ def test_target_only_does_not_prepare_graphs():
         assert configuration["reason"] == "speculation is disabled"
 
 
+def test_demo_page_is_served_and_races_through_this_api():
+    with TestClient(create_app(engine=object(), gamma=0)) as client:
+        page = client.get("/demo")
+        schema = client.get("/openapi.json").json()
+    assert page.status_code == 200
+    assert page.headers["content-type"].startswith("text/html")
+    # The page detects the server and races both modes through these fields.
+    for field in ('"/v1/chat/completions"', "speculative_gamma", "speculative", "onyx_metrics", "ttft_ms", "total_ms"):
+        assert field in page.text
+    assert "/demo" not in schema["paths"]
+
+
 def test_replay_backend_defaults_to_auto(monkeypatch):
     import onyx_cuda.replay_backend as replay
     modes = []
@@ -195,6 +207,7 @@ def test_create_app_does_not_load_until_lifespan():
             "/",
             "/v1/models",
             "/v1/chat/completions",
+            "/demo",
         ]
         models = client.get("/v1/models")
         assert models.status_code == 200
