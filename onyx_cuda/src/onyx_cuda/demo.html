@@ -30,7 +30,8 @@ body { margin: 0; background: var(--milk); color: var(--ink); font-family: var(-
 button { font: inherit; color: inherit; }
 button:focus-visible { outline: 2px solid var(--onyx); outline-offset: 2px; }
 
-.page { max-width: 1120px; margin: 0 auto; padding: 18px 32px 16px; }
+/* The page fills the window; the outputs take whatever height the race area leaves. */
+.page { max-width: 1120px; min-height: 100vh; margin: 0 auto; padding: 18px 32px 16px; display: flex; flex-direction: column; }
 
 .masthead { display: flex; justify-content: space-between; align-items: baseline; gap: 8px 24px; flex-wrap: wrap; }
 .wordmark { margin: 0; font-size: 21px; font-weight: 800; font-stretch: 125%; letter-spacing: 0.04em; }
@@ -86,11 +87,11 @@ button:disabled { opacity: 0.45; cursor: default; }
 .split.onyx { color: var(--onyx); }
 .caption { grid-column: 2 / -1; margin: 6px 0 0; font-size: 13px; color: var(--stone); }
 
-.outputs { margin-top: 18px; display: grid; grid-template-columns: 1fr 1fr; gap: 24px; }
-.run { min-width: 0; }
+.outputs { flex-grow: 1; margin-top: 18px; display: grid; grid-template-columns: 1fr 1fr; gap: 24px; }
+.run { min-width: 0; display: flex; flex-direction: column; }
 .run h2 { margin: 0 0 8px; font-size: 21px; font-weight: 700; font-stretch: 108%; }
 .run h2 small { margin-left: 8px; font-size: 14px; font-weight: 400; font-stretch: 100%; color: var(--stone); }
-.output { margin: 0; height: 236px; overflow: auto; padding: 14px 16px; border: 1px solid var(--rule); border-radius: 4px;
+.output { margin: 0; flex: 1 1 0; min-height: 236px; overflow: auto; padding: 14px 16px; border: 1px solid var(--rule); border-radius: 4px;
   background: var(--well); font-family: var(--mono); font-size: 14px; line-height: 1.55; white-space: pre-wrap;
   overflow-wrap: anywhere; font-variant-ligatures: none; scrollbar-width: thin; scrollbar-color: var(--rule) transparent; }
 .run.onyx .output { border-color: var(--onyx); }
@@ -117,7 +118,7 @@ button:disabled { opacity: 0.45; cursor: default; }
   #track-onyx { grid-row: 5; }
   .caption { grid-column: 1 / -1; grid-row: 6; }
   .outputs { grid-template-columns: 1fr; }
-  .output { height: 240px; }
+  .output { flex: none; height: 240px; }
   .brief { grid-template-columns: 1fr; }
 }
 @media (prefers-reduced-motion: reduce) {
