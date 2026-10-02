@@ -796,8 +796,6 @@ def decode_speculative_events(
                 raise RuntimeError("Generation emitted events after completion")
             if isinstance(event, AcceptedTokenEvent):
                 token_ids.append(event.token_id)
-                # ponytail: cumulative decode is bounded by max_tokens; use
-                # raw token bytes only if profiling shows this helper matters.
                 current = tokenizer.decode(token_ids, skip_special_tokens=True)
                 replacement = current.find("\ufffd")
                 stable = current if replacement < 0 else current[:replacement]
