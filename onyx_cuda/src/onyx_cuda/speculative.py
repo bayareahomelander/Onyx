@@ -797,8 +797,7 @@ def decode_speculative_events(
             if isinstance(event, AcceptedTokenEvent):
                 token_ids.append(event.token_id)
                 current = tokenizer.decode(token_ids, skip_special_tokens=True)
-                replacement = current.find("\ufffd")
-                stable = current if replacement < 0 else current[:replacement]
+                stable = current.rstrip("\ufffd")
                 if not stable.startswith(decoded):
                     raise RuntimeError("Tokenizer changed already-decoded text")
                 pending += stable[len(decoded) :]

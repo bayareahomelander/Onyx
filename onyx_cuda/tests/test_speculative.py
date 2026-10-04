@@ -679,6 +679,59 @@ def test_text_events_preserve_fragmented_stops_and_final_prefix(pieces, stops, t
     assert sum(isinstance(event, GenerationFinishedEvent) for event in decoded) == 1
 
 
+def test_text_events_stream_past_literal_replacement_character_and_stop_early():
+    consumed = []
+    closed = []
+
+    def source():
+        try:
+            for token in (1, 2, 3, 4, 5, 6):
+                consumed.append(token)
+                yield AcceptedTokenEvent(token)
+            yield GenerationFinishedEvent(GenerationResult([1, 2, 3, 4, 5, 6], None, "length"))
+        finally:
+            closed.append(True)
+
+    tokenizer = _MappedTokenizer(
+        {1: "Customer: Jos", 2: "�", 3: " Garcia", 4: " END", 5: " wasted", 6: " work"}
+    )
+    arrivals = []
+    finished = []
+    for event in decode_speculative_events(source(), tokenizer, stop=["END"]):
+        if isinstance(event, TextDeltaEvent):
+            arrivals.append((len(consumed), event.text))
+        else:
+            finished.append(event)
+
+    def streamed_by(count):
+        return "".join(text for seen, text in arrivals if seen <= count)
+
+    assert streamed_by(1) == "Customer: Jos"
+    # A trailing U+FFFD may still be half a character, so it can wait one token.
+    assert streamed_by(2) in ("Customer: Jos", "Customer: Jos�")
+    assert streamed_by(3) == "Customer: Jos� Garcia"
+    assert streamed_by(4) == "Customer: Jos� Garcia "
+    assert consumed == [1, 2, 3, 4]
+    assert closed == [True]
+    assert len(finished) == 1
+    assert finished[0].result.token_ids == [1, 2, 3, 4]
+    assert finished[0].result.finish_reason == "stop"
+
+
+@pytest.mark.parametrize("stop", [None, ["END"]])
+def test_text_events_flush_trailing_literal_replacement_character(stop):
+    events = [
+        AcceptedTokenEvent(1),
+        AcceptedTokenEvent(2),
+        GenerationFinishedEvent(GenerationResult([1, 2], None, "eos")),
+    ]
+    result, text = _result_from_events(
+        events, _MappedTokenizer({1: "Customer: Jos", 2: "�"}), stop=stop,
+    )
+    assert text == "Customer: Jos�"
+    assert result.finish_reason == "eos"
+
+
 def test_text_events_decode_split_utf8_and_hide_fragmented_stop(monkeypatch):
     events, _, _ = _run_scripted_speculation(
         monkeypatch,
