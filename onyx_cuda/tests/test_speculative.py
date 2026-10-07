@@ -534,6 +534,7 @@ def test_single_token_outputs_never_prefill_the_draft(monkeypatch, first_token, 
     assert (result.token_ids, result.finish_reason) == ([first_token], finish_reason)
     assert prefilled == ["target"]
     assert result.speculation[:3] == (0, 0, 0)
+    assert result.timings.acceptance_rate is None
 
 
 @pytest.mark.parametrize(

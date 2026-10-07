@@ -689,8 +689,9 @@ def generate_speculative_events(
             grammar_compile_seconds=grammar_compile_seconds,
             proposed_token_count=proposed_token_count,
             accepted_proposal_count=accepted_proposal_count,
+            # With no proposals there is no rate, as for target-only runs.
             acceptance_rate=(
-                accepted_proposal_count / proposed_token_count if proposed_token_count else 0.0
+                accepted_proposal_count / proposed_token_count if proposed_token_count else None
             ),
             speculative_iteration_count=speculative_iteration_count,
             draft_seconds=draft_seconds if measure else None,
