@@ -96,6 +96,16 @@ such as `[0-9]+` are not cut off at their first match. Partial output has
 strings cannot be combined with regex or JSON Schema constraints; these
 combinations return HTTP 422.
 
+JSON Schema support is a checked subset: `type` (a name or a list of names),
+`properties`, `required`, boolean `additionalProperties`, `items`, `enum`,
+`pattern`, `minLength`/`maxLength`, and `minItems`/`maxItems`, plus the
+annotations `title`, `description`, `default`, `examples`, and `$comment`. Other
+keywords, such as `$ref`, `oneOf`, `format`, or `minimum`, are rejected rather
+than ignored. Generated objects contain only declared properties, however
+`additionalProperties` is set. A schema `pattern` matches anywhere in the
+string, as JSON Schema specifies, while a `regex` constraint must match the
+whole output.
+
 The API follows OpenAI's request and response shapes but is not a drop-in
 replacement. Messages take plain-string `content` with the `system`, `user`, and
 `assistant` roles. Besides `model` and `messages`, requests accept `max_tokens`
@@ -104,9 +114,10 @@ without streaming), `stop`, `stream`, and `response_format` (`text` or
 `json_schema`), plus Onyx's `regex`, `json_schema`, `compact_json`,
 `enable_thinking`, and `speculative`. Any other field, such as `tools`,
 `stream_options`, or `presence_penalty`, returns HTTP 422 instead of being
-ignored. Request errors use FastAPI's `detail` body rather than OpenAI's `error`
-object; an error during a stream arrives as an `error` object followed by
-`[DONE]`.
+ignored. A regex that does not compile, an unsupported JSON Schema, or an
+unknown `model` returns HTTP 400. Request errors use FastAPI's `detail` body
+rather than OpenAI's `error` object; an error during a stream arrives as an
+`error` object followed by `[DONE]`.
 
 For live SSE output on Linux, add `"stream":true` to the body and pass `-N` to
 `curl`. In PowerShell, set `stream = $true` before converting the body to JSON:

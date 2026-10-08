@@ -1,5 +1,25 @@
 # Changelog
 
+## Unreleased
+
+### Fixes
+
+- A generation result's `past_key_values` now always holds the prompt and every
+  returned token but the last. A stop sequence, or during speculation an
+  accepted EOS or grammar-completing draft token, previously left extra tokens
+  in it. Output tokens were never affected, and the API does not expose the
+  cache.
+
+### Documentation
+
+- The README lists the supported JSON Schema keywords and which request errors
+  return HTTP 400 rather than 422.
+
+### Cleanup
+
+- Removed the unused `fallback_reason` from graph recovery, left over from
+  when running out of memory closed the recovery graphs.
+
 ## 0.1.0 - 2026-10-08
 
 First tagged release of the NVIDIA CUDA implementation.
