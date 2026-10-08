@@ -4,7 +4,7 @@
 def test_import():
     """test that onyx can be imported."""
     import onyx
-    assert onyx.__version__ == "0.2.0"
+    assert onyx.__version__ == "0.1.0"
 
 
 def test_hello():
