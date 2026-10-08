@@ -16,6 +16,8 @@ from onyx_cuda.vocabulary import TokenByteVocabulary
 
 
 class GenerationResult(NamedTuple):
+    """past_key_values holds the prompt and every returned token but the last."""
+
     token_ids: list[int]
     past_key_values: Cache | None
     finish_reason: Literal["eos", "stop", "length"]
@@ -369,6 +371,9 @@ def generate_token_events(
             if matched_stop_length:
                 del generated[-matched_stop_length:]
                 del pending[-matched_stop_length:]
+                # The stop's earlier tokens are already in KV; drop them so the
+                # last returned token stays outside KV, as at any other finish.
+                cache.crop(len(prompt_token_ids) + max(len(generated) - 1, 0))
                 finish_reason = "stop"
                 break
             if token in eos_token_ids:

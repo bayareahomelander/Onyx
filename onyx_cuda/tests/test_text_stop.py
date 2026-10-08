@@ -175,6 +175,29 @@ def test_text_stop_during_pending_token_flush(runtime, mode, budget, stop_tokens
 
 
 @pytest.mark.parametrize("mode", ["target", "sampled", "fixed"])
+@pytest.mark.parametrize("finish", ["eos", "stop_sequence", "grammar"])
+def test_finished_cache_excludes_the_last_returned_token(runtime, monkeypatch, mode, finish):
+    # Every model predicts 1, 2, 3, ...; speculation verifies [1, 2, 3] in one
+    # round, consuming the accepted EOS, stop sequence, or completing token.
+    args = arguments(runtime, mode)
+    if finish == "eos":
+        args["eos_token_ids"] = [3]
+    elif finish == "stop_sequence":
+        args["stop_sequences"] = [[2, 3]]
+    else:
+        for module in (generation, speculative):
+            monkeypatch.setattr(module, "grammar_argmax", lambda logits, valid, **_: logits.argmax(dim=-1))
+        monkeypatch.setattr(generation, "apply_grammar_mask", lambda logits, valid: logits)
+        args.update(regex="xxx", token_byte_vocabulary=TokenByteVocabulary([b"x"] * 32, 0, 32))
+    result = speculative.generate_speculative(**args)
+    expected = [1] if finish == "stop_sequence" else [1, 2, 3]
+    assert result.token_ids == expected
+    assert result.finish_reason == ("eos" if finish == "eos" else "stop")
+    assert result.past_key_values.history == [0] * 4 + expected[:-1]
+    assert not runtime.backend.active
+
+
+@pytest.mark.parametrize("mode", ["target", "sampled", "fixed"])
 def test_text_stop_releases_native_grammar_states(runtime, monkeypatch, mode):
     constraints = []
     original = generation._initialize_grammar_constraint

@@ -645,6 +645,12 @@ def generate_speculative_events(
             for ready_token_id in ready_events:
                 yield AcceptedTokenEvent(ready_token_id)
 
+        # Verification can consume an accepted EOS, a token completing the
+        # grammar, or a stop sequence. Return KV through the returned prefix
+        # only, its last token still outside KV, as target-only generation does.
+        returned_length = len(prompt_token_ids) + max(len(generated) - 1, 0)
+        if target_cache.length > returned_length:
+            target_cache.crop(returned_length)
         for token_id in _take_ready_tokens(pending_events):
             yield AcceptedTokenEvent(token_id)
 

@@ -24,7 +24,7 @@ def scripted_target(monkeypatch, tokens):
         calls.append(token_ids.item())
         return logits(tokens[len(calls)])[:, None, :]
 
-    cache = SimpleNamespace(past_key_values=object(), extend=extend)
+    cache = SimpleNamespace(past_key_values=object(), extend=extend, crop=lambda length: None)
     monkeypatch.setattr(
         generation,
         "prefill",
