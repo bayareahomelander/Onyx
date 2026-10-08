@@ -1,7 +1,7 @@
 # Onyx CUDA
 
 The NVIDIA CUDA implementation of [Onyx](../README.md) generates structured LLM
-output with regex and JSON Schema constraints. It provides an OpenAI-compatible
+output with regex and JSON Schema constraints. It provides an OpenAI-style
 chat-completions API and streaming on Windows and Linux.
 
 ## Demo
@@ -67,7 +67,15 @@ serializes GPU execution; extra Uvicorn workers would duplicate both models.
 
 ## Example
 
-In another PowerShell window:
+In another terminal on Linux:
+
+```sh
+curl http://127.0.0.1:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model":"onyx-speculative","messages":[{"role":"user","content":"Generate a product code."}],"regex":"[A-Z]{3}-[0-9]{4}","max_tokens":16}'
+```
+
+Or in another PowerShell window on Windows:
 
 ```powershell
 $body = @{
@@ -88,7 +96,20 @@ such as `[0-9]+` are not cut off at their first match. Partial output has
 strings cannot be combined with regex or JSON Schema constraints; these
 combinations return HTTP 422.
 
-For live SSE output, set `stream = $true` before converting the body to JSON:
+The API follows OpenAI's request and response shapes but is not a drop-in
+replacement. Messages take plain-string `content` with the `system`, `user`, and
+`assistant` roles. Besides `model` and `messages`, requests accept `max_tokens`
+(or `max_completion_tokens`), `temperature`, `top_p`, `seed`, `n` (up to four,
+without streaming), `stop`, `stream`, and `response_format` (`text` or
+`json_schema`), plus Onyx's `regex`, `json_schema`, `compact_json`,
+`enable_thinking`, and `speculative`. Any other field, such as `tools`,
+`stream_options`, or `presence_penalty`, returns HTTP 422 instead of being
+ignored. Request errors use FastAPI's `detail` body rather than OpenAI's `error`
+object; an error during a stream arrives as an `error` object followed by
+`[DONE]`.
+
+For live SSE output on Linux, add `"stream":true` to the body and pass `-N` to
+`curl`. In PowerShell, set `stream = $true` before converting the body to JSON:
 
 ```powershell
 $body | curl.exe --no-buffer http://127.0.0.1:8000/v1/chat/completions -H "Content-Type: application/json" --data-binary "@-"
@@ -192,7 +213,7 @@ Peak memory in the comparison was 17.31 GiB allocated. On September 27, forced
 recoveries with 5,000 to 8,000 prompt tokens and both graph sets loaded matched
 target-only output and peaked at 19.54 GiB allocated.
 
-On September 28 the full CUDA suite passed all 841 tests with gamma 3, draft
+On October 6 the full CUDA suite passed all 848 tests with gamma 3, draft
 graphs, and default graph recovery. September 22 checks
 matched full logits and KV caches bitwise through 8192 tokens with graph
 recovery, and the API completed a 4096-prompt/4096-output capacity test. If a

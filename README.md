@@ -1,7 +1,7 @@
 # Onyx
 
 Onyx generates structured LLM output by enforcing regex and supported JSON
-Schema constraints during token generation. It provides an OpenAI-compatible
+Schema constraints during token generation. It provides an OpenAI-style
 chat-completions API, streaming, and grammar-aware speculative decoding.
 
 See the [CUDA demo videos](onyx_cuda/README.md#demo) of Qwen3-8B alone racing

@@ -1,6 +1,8 @@
 import sys
 import gc
+import tomllib
 import weakref
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -203,6 +205,7 @@ def test_create_app_does_not_load_until_lifespan():
         body = root.json()
         assert body["status"] == "ok"
         assert body["service"] == "Onyx CUDA API"
+        assert body["version"] == server.SERVICE_VERSION
         assert body["endpoints"] == [
             "/",
             "/v1/models",
@@ -218,6 +221,15 @@ def test_create_app_does_not_load_until_lifespan():
     assert len(starts) == 1
     assert client.app.state.engine_locks == {}
     assert client.app.state.engines == {}
+
+
+def test_service_version_matches_package_and_native_versions():
+    # The GPU host runs from source without installing, so the API keeps a
+    # literal version; this keeps it in step with both manifests.
+    root = Path(__file__).resolve().parents[1]
+    package = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))
+    native = tomllib.loads((root / "rust" / "Cargo.toml").read_text(encoding="utf-8"))
+    assert server.SERVICE_VERSION == package["project"]["version"] == native["package"]["version"]
 
 
 def test_unknown_model_fails_and_known_id_matches_registry():
