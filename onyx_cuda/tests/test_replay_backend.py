@@ -331,7 +331,7 @@ def test_memory_failure_discards_partial_cache_and_keeps_graphs(monkeypatch, wid
             raise torch.OutOfMemoryError("injected allocation failure")
     backend = GraphReplayBackend.__new__(GraphReplayBackend)
     backend._lock = RLock(); backend.device = "cpu"; backend._event = None
-    backend.closed = False; backend.fallback_reason = None
+    backend.closed = False
     backend._graphs = {"allocated": object()}
     backend.supports = lambda cache, ids: not backend.closed
     cache = Cache()
@@ -339,7 +339,6 @@ def test_memory_failure_discards_partial_cache_and_keeps_graphs(monkeypatch, wid
     assert cache.past_key_values.tokens == [8]
     # Only this recovery falls back; later requests keep the graphs.
     assert not backend.closed and backend._graphs and released == [True]
-    assert backend.fallback_reason is None
 
 
 @pytest.mark.gpu

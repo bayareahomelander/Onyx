@@ -94,7 +94,7 @@ def test_sampled_json_budget_and_split_unicode(monkeypatch, budget, reason):
     scripted_target(monkeypatch, [0, 1, 2, 3])
     monkeypatch.setattr(
         generation, "grammar_argmax",
-        lambda *_, **__: pytest.fail("Sampling must not call the greedy CUDA selector"),
+        lambda *_, **__: pytest.fail("Sampling must not use greedy grammar selection"),
     )
     raw = [b'"', b"\xc3", b"\xa9", b'"', b"", b"", b"", b""]
     tokenizer = SimpleNamespace(

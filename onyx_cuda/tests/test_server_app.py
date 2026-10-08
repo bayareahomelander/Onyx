@@ -35,8 +35,8 @@ def test_replay_backend_startup_status_and_shutdown(monkeypatch):
     with TestClient(app) as client:
         assert client.get("/").json()["replay_backend"]["active"] == "graph"
         model._onyx_replay_backend.closed = True
-        model._onyx_replay_backend.fallback_reason = "memory pressure"
-        assert client.get("/").json()["replay_backend"]["reason"] == "memory pressure"
+        status = client.get("/").json()["replay_backend"]
+        assert status["active"] == "scalar" and status["reason"] == "graph backend was closed"
     assert calls == [("prepare", "graph"), ("close",)]
 
 

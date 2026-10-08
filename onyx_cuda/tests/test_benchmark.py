@@ -55,7 +55,7 @@ def benchmark(monkeypatch):
 
     model = SimpleNamespace(config=SimpleNamespace(vocab_size=8))
     tokenizer = SimpleNamespace(eos_token_id=7)
-    graphs = SimpleNamespace(closed=False, fallback_reason=None)
+    graphs = SimpleNamespace(closed=False)
     state = SimpleNamespace(graph=True, calls=[], closes=0, close_during_run=False, fallback_during_run=False)
 
     def prepare(target, mode):
@@ -74,7 +74,7 @@ def benchmark(monkeypatch):
         attached = getattr(model, "_onyx_replay_backend", None)
         state.calls.append((gamma, attached is graphs))
         if attached is not None and state.close_during_run:
-            graphs.closed, graphs.fallback_reason = True, "CUDA memory exhausted during graph recovery"
+            graphs.closed = True
         # Target-only generation has no speculative counters.
         speculation = SpeculationStats(2, 1, 1, {"graph_replay_fallbacks": int(
             attached is not None and state.fallback_during_run)}) if gamma else None
@@ -147,5 +147,5 @@ def test_graph_shutdown_during_the_run_fails_instead_of_timing_scalar_recovery(b
     with pytest.raises(RuntimeError, match="Graph recovery closed"):
         benchmark.run(output, repetitions=1)
     saved = json.loads(output.read_text())
-    assert not saved["complete"] and "CUDA memory exhausted" in saved["error"]
+    assert not saved["complete"] and "Graph recovery closed" in saved["error"]
     assert benchmark.closes == 1

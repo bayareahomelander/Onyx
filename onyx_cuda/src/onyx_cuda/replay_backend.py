@@ -91,7 +91,6 @@ class GraphReplayBackend:
         self._graphs = {}
         self._event = None
         self.closed = False
-        self.fallback_reason = None
         started = time.perf_counter()
         try:
             with torch.cuda.device(self.device), torch.inference_mode():
@@ -232,7 +231,7 @@ def replay_backend_status(model, configuration):
     backend = getattr(model, "_onyx_replay_backend", None)
     if configuration["active"] == "graph" and (backend is None or backend.closed):
         return {**configuration, "active": "scalar",
-                "reason": getattr(backend, "fallback_reason", None) or "graph backend was closed"}
+                "reason": "graph backend was closed"}
     return dict(configuration)
 
 

@@ -139,7 +139,7 @@ def run(output, *, repetitions=3, split="all", measure=False, gammas=(DEFAULT_GA
                 torch.cuda.synchronize(device)
                 seconds = time.perf_counter() - started
                 if graph and graphs.closed:
-                    raise RuntimeError(f"Graph recovery closed during {case['name']}: {graphs.fallback_reason}")
+                    raise RuntimeError(f"Graph recovery closed during {case['name']}")
                 # Unlike timings, speculative counters are present without --measure.
                 speculation = getattr(result, "speculation", None)
                 if graph and speculation is not None and speculation.replay_stats["graph_replay_fallbacks"]:
