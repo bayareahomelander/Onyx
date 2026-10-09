@@ -12,9 +12,14 @@
 
 ### Documentation
 
-- The README lists the supported JSON Schema keywords and which request errors
-  return HTTP 400 rather than 422.
-- The README breaks the 48-case benchmark down by workload category.
+- The CUDA README is now a short overview: the demo, one results table, a new
+  "How it works" section, setup, and a first request. The API reference moves
+  to `docs/api.md`, and benchmark method, history, and validation move to
+  `docs/performance.md`.
+- The API reference lists the supported JSON Schema keywords and which request
+  errors return HTTP 400 rather than 422.
+- The performance page breaks the 48-case benchmark down by workload category
+  for both recovery modes, with each category's prompts.
 
 ### Cleanup
 
