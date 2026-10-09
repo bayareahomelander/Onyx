@@ -202,6 +202,23 @@ per-case median generation times, excluding model loading and graph setup:
 | Fixed gamma 3, draft graphs, scalar recovery (`ONYX_REPLAY_BACKEND=scalar`) | 1.370x |
 | Fixed gamma 3, draft graphs, graph recovery (default on this GPU) | **1.492x** |
 
+The same comparison by workload category, as labeled in
+[benchmark_corpus.py](src/onyx_cuda/benchmark_corpus.py):
+
+| Category | Cases | Prompts | Graph recovery | Scalar recovery |
+| --- | ---: | --- | ---: | ---: |
+| Code | 6 | Python, TypeScript, and JavaScript functions and a SQL query | 2.439x | 2.438x |
+| JSON | 4 | JSON Schema: a boolean, an enum, an object, a 12-integer array | 2.112x | 2.110x |
+| Regex | 4 | Regex: a year, 32 digits, a product code, repeated words | 2.071x | 2.070x |
+| Extraction | 6 | Emails, dates, names, quantities, and CSV from given text | 1.852x | 1.849x |
+| Text | 9 | The original nine prompts, one regex- and one JSON-constrained | 1.621x | 1.619x |
+| Changing | 3 | Repetitive output that switches to free text, or the reverse | 1.392x | 1.213x |
+| Prose | 8 | Explanations, stories, and other short prose, plus a long-context summary | 1.220x | 1.097x |
+| Short | 8 | Answers of a number or a few words | 1.133x | 1.132x |
+
+The two recovery modes differ only where numerical recovery ran: four times in
+the prose prompts and once in the changing prompts.
+
 Every output in every mode matched target-only tokens and finish reasons. Nine cases
 remain slower than target-only: six very short requests (at most 21 ms slower)
 and three recovery-heavy prose requests. Earlier the same day, before draft

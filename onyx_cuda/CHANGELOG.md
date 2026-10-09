@@ -14,6 +14,7 @@
 
 - The README lists the supported JSON Schema keywords and which request errors
   return HTTP 400 rather than 422.
+- The README breaks the 48-case benchmark down by workload category.
 
 ### Cleanup
 
