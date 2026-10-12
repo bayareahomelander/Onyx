@@ -89,6 +89,16 @@ def test_sampled_stop_tokens_are_never_emitted(monkeypatch):
     assert events[-1].result.finish_reason == "stop"
 
 
+@pytest.mark.parametrize("top_p", [1.0, 0.9])
+@pytest.mark.parametrize("temperature", [1e-40, 5e-324])
+def test_tiny_temperature_samples_the_top_logit(temperature, top_p):
+    # Dividing raw logits by these overflowed (or divided zero by zero) into NaN
+    # probabilities; on CUDA that trips a device-side assert for the process.
+    logits = torch.tensor([[3.0, 1.0, -torch.inf, -2.0]], dtype=torch.float16)
+    generator = torch.Generator().manual_seed(0)
+    assert generation._sample_token(logits, temperature, top_p, generator).item() == 0
+
+
 @pytest.mark.parametrize("budget,reason", [(1, "length"), (4, "stop")])
 def test_sampled_json_budget_and_split_unicode(monkeypatch, budget, reason):
     scripted_target(monkeypatch, [0, 1, 2, 3])

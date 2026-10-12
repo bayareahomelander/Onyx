@@ -9,6 +9,9 @@
   accepted EOS or grammar-completing draft token, previously left extra tokens
   in it. Output tokens were never affected, and the API does not expose the
   cache.
+- A positive temperature below about 1e-37 no longer produces NaN sampling
+  probabilities. On CUDA these tripped a device-side assert that left every
+  later request in the process failing until a restart.
 
 ### Documentation
 

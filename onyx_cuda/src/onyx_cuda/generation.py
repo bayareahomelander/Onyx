@@ -94,6 +94,9 @@ def _matched_stop_length(token_ids: list[int], stop_sequences: list[list[int]]) 
     )
 
 
+_MIN_TEMPERATURE = torch.finfo(torch.float32).tiny
+
+
 def _sample_token(
     logits: torch.Tensor,
     temperature: float,
@@ -103,7 +106,13 @@ def _sample_token(
     if temperature == 0:
         return logits.argmax(dim=-1)
 
-    probabilities = torch.softmax(logits.float() / temperature, dim=-1)
+    # Scale each logit's distance from the largest, which is never positive, so
+    # no positive temperature overflows to infinity. NaN probabilities would trip
+    # a CUDA device-side assert that breaks every later request in the process.
+    # The floor keeps a tiny temperature from rounding to zero in float32.
+    logits = logits.float()
+    distances = logits - logits.amax(dim=-1, keepdim=True)
+    probabilities = torch.softmax(distances / max(temperature, _MIN_TEMPERATURE), dim=-1)
     if top_p < 1:
         sorted_probabilities, sorted_indices = probabilities.sort(dim=-1, descending=True)
         cumulative_probabilities = sorted_probabilities.cumsum(dim=-1)
