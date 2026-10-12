@@ -12,6 +12,15 @@
 - A positive temperature below about 1e-37 no longer produces NaN sampling
   probabilities. On CUDA these tripped a device-side assert that left every
   later request in the process failing until a restart.
+- A `regex` now allows only tokens after which a match is still reachable. A
+  branch that can never match, such as `b$c` in `a|b$c`, previously failed
+  partway through generation, and a regex that can never match, such as `a$b`,
+  failed only after the prompt prefill; it now returns HTTP 400 up front.
+- A schema `pattern` without `maxLength` now allows only characters after which
+  the string can still match. A string such as `"X` for the pattern `^AB` could
+  previously never close, so generation ran to `length`. A `pattern` that can
+  never match, or cannot match within its `maxLength`, now returns HTTP 400
+  instead of generating until `length`.
 
 ### Documentation
 

@@ -1,6 +1,6 @@
 //! DFA-based regex constraint engine.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use regex_automata::dfa::{dense, Automaton};
@@ -54,6 +54,59 @@ pub fn compile_pattern_dfa(pattern: &str) -> Result<CompiledDfa, String> {
     Ok(CompiledDfa { dfa, initial_state })
 }
 
+/// JSON Schema patterns search: a match may occur anywhere in the string.
+fn schema_pattern_search(normalized: &str) -> String {
+    format!("(?s:.*(?:{normalized}).*)")
+}
+
+/// Reject a normalized schema pattern that no string satisfies within
+/// maxLength, so generation never opens a string it can never close.
+pub fn check_pattern_satisfiable(normalized: &str, max_length: Option<usize>) -> Result<(), String> {
+    let compiled = compile_pattern_dfa(&schema_pattern_search(normalized))?;
+    let Some(bytes) = shortest_match_bytes(&compiled.dfa, compiled.initial_state) else {
+        return Err("pattern can never match".to_string());
+    };
+    // Characters never outnumber bytes, so the cheap byte search usually decides.
+    let Some(maximum) = max_length.filter(|&maximum| bytes > maximum) else {
+        return Ok(());
+    };
+    let lengths = completion_lengths(&compiled.dfa, compiled.initial_state);
+    match lengths.get(&compiled.initial_state) {
+        Some(&characters) if characters > maximum => Err(format!(
+            "pattern needs at least {characters} characters, more than maxLength"
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// Bytes in the shortest input that reaches a match at the end of input, by
+/// breadth-first search over byte classes; None when no match is reachable.
+fn shortest_match_bytes(dfa: &dense::DFA<Vec<u32>>, initial: StateID) -> Option<usize> {
+    let mut seen = HashSet::from([initial]);
+    let mut layer = vec![initial];
+    let mut length = 0;
+    while !layer.is_empty() {
+        if layer
+            .iter()
+            .any(|&state| dfa.is_match_state(dfa.next_eoi_state(state)))
+        {
+            return Some(length);
+        }
+        let mut next_layer = Vec::new();
+        for state in layer {
+            for byte in dfa.byte_classes().representatives(..).filter_map(|unit| unit.as_u8()) {
+                let next = dfa.next_state(state, byte);
+                if !dfa.is_dead_state(next) && seen.insert(next) {
+                    next_layer.push(next);
+                }
+            }
+        }
+        layer = next_layer;
+        length += 1;
+    }
+    None
+}
+
 /// Shared JSON string pattern and minimum completion lengths in characters.
 #[derive(Debug)]
 pub struct StringPattern {
@@ -66,14 +119,12 @@ pub struct StringPattern {
 }
 
 impl StringPattern {
-    pub fn new(normalized: &str, bounded: bool) -> Self {
-        let compiled = compile_pattern_dfa(&format!("(?s:.*(?:{normalized}).*)"))
+    pub fn new(normalized: &str) -> Self {
+        let compiled = compile_pattern_dfa(&schema_pattern_search(normalized))
             .expect("validated pattern DFA");
-        let remaining = if bounded {
-            completion_lengths(&compiled.dfa, compiled.initial_state)
-        } else {
-            HashMap::new()
-        };
+        // Needed without maxLength too: a state missing from this map can never
+        // close the string, such as any state after a leading `X` for `^AB`.
+        let remaining = completion_lengths(&compiled.dfa, compiled.initial_state);
         Self {
             dfa: compiled.dfa,
             initial_state: compiled.initial_state,
@@ -204,9 +255,62 @@ fn completion_lengths(dfa: &dense::DFA<Vec<u32>>, initial: StateID) -> HashMap<S
         .collect()
 }
 
+/// Whether a match at the end of input is still reachable from each state,
+/// indexed by `state >> stride2`. Determinization keeps states that can never
+/// match apart from the dead state, such as the one after `a` for `a$b`; a
+/// token entering one leaves generation with no valid continuation.
+fn live_states(dfa: &dense::DFA<Vec<u32>>, initial: StateID) -> Vec<bool> {
+    let mut states = vec![initial];
+    let mut indices = HashMap::from([(initial, 0)]);
+    let mut reverse = vec![Vec::new()];
+    let mut index = 0;
+    while index < states.len() {
+        let mut successors: Vec<StateID> = dfa
+            .byte_classes()
+            .representatives(..)
+            .filter_map(|unit| unit.as_u8())
+            .map(|byte| dfa.next_state(states[index], byte))
+            .filter(|&state| !dfa.is_dead_state(state))
+            .collect();
+        successors.sort_unstable();
+        successors.dedup();
+        for next in successors {
+            let next_index = *indices.entry(next).or_insert_with(|| {
+                states.push(next);
+                reverse.push(Vec::new());
+                states.len() - 1
+            });
+            reverse[next_index].push(index);
+        }
+        index += 1;
+    }
+    let mut reached = vec![false; states.len()];
+    let mut queue: VecDeque<usize> = (0..states.len())
+        .filter(|&index| dfa.is_match_state(dfa.next_eoi_state(states[index])))
+        .collect();
+    for &index in &queue {
+        reached[index] = true;
+    }
+    while let Some(index) = queue.pop_front() {
+        for &previous in &reverse[index] {
+            if !reached[previous] {
+                reached[previous] = true;
+                queue.push_back(previous);
+            }
+        }
+    }
+    let slot = |state: StateID| state.as_usize() >> dfa.stride2();
+    let mut live = vec![false; states.iter().map(|&state| slot(state) + 1).max().unwrap_or(0)];
+    for (state, reached) in states.into_iter().zip(reached) {
+        live[slot(state)] = reached;
+    }
+    live
+}
+
 pub struct RegexEngine {
     vocabulary: Arc<Vec<Vec<u8>>>,
     dfa: Arc<dense::DFA<Vec<u32>>>,
+    live: Arc<Vec<bool>>,
     current_state: StateID,
 }
 
@@ -231,11 +335,24 @@ impl RegexEngine {
             ConstraintError::CompilationError(format!("Failed to get start state: {error}"))
         })?;
 
-        Ok(Self {
+        let engine = Self {
             vocabulary: Arc::new(vocabulary),
+            live: Arc::new(live_states(&dfa, initial_state)),
             dfa: Arc::new(dfa),
             current_state: initial_state,
-        })
+        };
+        // Reject before any model work instead of failing at the first token.
+        if !engine.is_live(initial_state) {
+            return Err(compile_error("pattern can never match"));
+        }
+        Ok(engine)
+    }
+
+    fn is_live(&self, state: StateID) -> bool {
+        self.live
+            .get(state.as_usize() >> self.dfa.stride2())
+            .copied()
+            .unwrap_or(false)
     }
 
     fn advance_state_by_token(&self, state: StateID, token_id: usize) -> StateID {
@@ -266,7 +383,8 @@ impl ConstraintEngine for RegexEngine {
                 }
             }
 
-            if is_valid {
+            // Not dead is not enough: the token must leave a match reachable.
+            if is_valid && self.is_live(state) {
                 valid_tokens.push(token_id);
             }
         }
@@ -299,6 +417,7 @@ impl ConstraintEngine for RegexEngine {
         Box::new(Self {
             vocabulary: Arc::clone(&self.vocabulary),
             dfa: Arc::clone(&self.dfa),
+            live: Arc::clone(&self.live),
             current_state: self.current_state,
         })
     }
@@ -416,5 +535,25 @@ mod tests {
         assert_eq!(engine.get_valid_tokens(), vec![1]);
         engine.advance(1).unwrap();
         assert!(engine.is_finished());
+    }
+
+    #[test]
+    fn test_pattern_that_can_never_match_is_rejected() {
+        for pattern in [r"[^\s\S]", "a$b", r"x(?-u:\b)y"] {
+            let error = RegexEngine::new(make_test_vocab(), pattern)
+                .err()
+                .unwrap_or_else(|| panic!("{pattern} compiled"));
+            assert!(error.to_string().contains("can never match"), "{pattern}: {error}");
+        }
+        // Matching only the empty string still matches.
+        assert!(RegexEngine::new(make_test_vocab(), "(?:)").unwrap().is_finished());
+    }
+
+    #[test]
+    fn test_tokens_into_branches_that_can_never_match_are_invalid() {
+        let vocab = vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec(), b"bc".to_vec()];
+        // `b$c` never matches, so `b` and `bc` would leave no continuation.
+        let engine = RegexEngine::new(vocab, "(?:a|b$c)").unwrap();
+        assert_eq!(engine.get_valid_tokens(), vec![0]);
     }
 }

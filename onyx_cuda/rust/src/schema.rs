@@ -218,7 +218,11 @@ pub fn validate_schema(schema: &Value, path: &str) -> Result<(), ConstraintError
             .as_str()
             .ok_or_else(|| invalid(path, "pattern must be a string"))?;
         let normalized = schema_pattern(pattern).map_err(|e| invalid(path, e))?;
-        crate::regex_engine::compile_pattern_dfa(&format!("(?s:.*(?:{normalized}).*)"))
+        let max_length = schema
+            .get("maxLength")
+            .and_then(Value::as_u64)
+            .map(|n| n as usize);
+        crate::regex_engine::check_pattern_satisfiable(&normalized, max_length)
             .map_err(|e| invalid(path, e))?;
     }
     if let Some(values) = schema.get("enum") {
@@ -500,7 +504,7 @@ impl PropertyBlueprint {
         // parser clones and repeated array items.
         let pattern = value.get("pattern").and_then(Value::as_str).map(|pattern| {
             let normalized = schema_pattern(pattern).expect("validated pattern");
-            Arc::new(StringPattern::new(&normalized, max_length.is_some()))
+            Arc::new(StringPattern::new(&normalized))
         });
 
         // parse array length constraints

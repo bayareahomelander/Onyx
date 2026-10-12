@@ -38,7 +38,9 @@ keywords, such as `$ref`, `oneOf`, `format`, or `minimum`, are rejected rather
 than ignored. Generated objects contain only declared properties, however
 `additionalProperties` is set. A schema `pattern` matches anywhere in the
 string, as JSON Schema specifies, while a `regex` constraint must match the
-whole output.
+whole output. Both allow only tokens after which a match is still reachable, and
+a `regex` that can never match, or a `pattern` that cannot match within its
+string's `maxLength`, is rejected before generation.
 
 ## Streaming and metrics
 
@@ -67,7 +69,8 @@ The `/demo` page uses this to race both modes on a preset prompt.
 
 Unknown fields, unsupported option combinations, and token budgets beyond the
 limits return HTTP 422. A regex that
-does not compile, an unsupported JSON Schema, or an unknown `model` returns
+does not compile or can never match, an unsupported JSON Schema or one whose
+`pattern` cannot match within its `maxLength`, or an unknown `model` returns
 HTTP 400. Requests beyond the active-request limit receive HTTP 429. Request
 errors use FastAPI's `detail` body rather than OpenAI's `error` object; an error
 during a stream arrives as an `error` object followed by `[DONE]`.

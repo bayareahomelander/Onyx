@@ -49,6 +49,23 @@ def test_regex_state_handles_branch_complete_die_and_release():
         constraint.release_state(initial)
 
 
+@pytest.mark.parametrize("pattern", [r"[^\s\S]", "a$b", r"x(?-u:\b)y"])
+def test_regex_that_can_never_match_fails_to_compile(pattern):
+    with pytest.raises(ValueError, match="can never match"):
+        _rust.GrammarConstraint([b"a", b"b", b"x"]).compile_regex(pattern)
+
+
+def test_regex_tokens_into_branches_that_can_never_match_are_invalid():
+    # After "b" only "b$c" remains, which no continuation can match.
+    constraint = _rust.GrammarConstraint([b"a", b"b", b"c", b"bc"])
+    constraint.compile_regex("(?:a|b$c)")
+    initial = constraint.init_state()
+    try:
+        assert constraint.get_valid_token_ids(initial) == [0]
+    finally:
+        constraint.release_state(initial)
+
+
 def test_json_state_handles_branch_and_release_from_python():
     vocab = [b"{", b'"a"', b'"b"', b":", b'"', b"1"]
     schema = '{"type":"object","properties":{"a":{"type":"string"},"b":{"type":"number"}}}'

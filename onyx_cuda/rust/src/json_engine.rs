@@ -204,13 +204,19 @@ impl StringState {
             .is_some_and(|prefix| prefix.eq_ignore_ascii_case(&self.pending))
     }
 
+    /// Characters this string may still add; unlimited without maxLength.
+    fn length_budget(&self) -> Option<usize> {
+        match self.max_length {
+            Some(maximum) => maximum.checked_sub(self.char_count),
+            None => Some(usize::MAX),
+        }
+    }
+
     fn can_complete_pattern(&self) -> bool {
-        let (Some(pattern), Some(state), Some(maximum)) =
-            (&self.pattern, self.dfa_state, self.max_length)
-        else {
+        let (Some(pattern), Some(state)) = (&self.pattern, self.dfa_state) else {
             return true;
         };
-        let Some(budget) = maximum.checked_sub(self.char_count) else {
+        let Some(budget) = self.length_budget() else {
             return false;
         };
         if self.pending.is_empty() {
@@ -285,6 +291,7 @@ impl StringState {
         match step {
             StringStep::Character(character) => {
                 self.char_count += 1;
+                let budget = self.length_budget();
                 if let (Some(pattern), Some(state)) = (&self.pattern, &mut self.dfa_state) {
                     let dfa = &pattern.dfa;
                     let mut buffer = [0; 4];
@@ -294,10 +301,10 @@ impl StringState {
                             return None;
                         }
                     }
-                    if let Some(maximum) = self.max_length {
-                        if !pattern.can_finish(*state, maximum - self.char_count) {
-                            return None;
-                        }
+                    // A match must stay reachable, with or without maxLength,
+                    // or the string could never close.
+                    if !budget.is_some_and(|budget| pattern.can_finish(*state, budget)) {
+                        return None;
                     }
                 }
             }
@@ -2074,6 +2081,18 @@ mod tests {
 
         engine.advance(0).unwrap();
         assert!(engine.is_finished());
+    }
+
+    #[test]
+    fn test_unbounded_pattern_rejects_characters_that_can_never_match() {
+        let vocab = vec![b"\"".to_vec(), b"A".to_vec(), b"B".to_vec(), b"X".to_vec()];
+        let mut engine = JsonEngine::new(vocab, r#"{"type":"string","pattern":"^AB"}"#).unwrap();
+        engine.advance(0).unwrap();
+        // After a leading X the string could never match, so never close.
+        assert_eq!(engine.get_valid_tokens(), vec![1]);
+        engine.advance(1).unwrap();
+        engine.advance(2).unwrap();
+        assert_eq!(engine.get_valid_tokens(), vec![0, 1, 2, 3]);
     }
 
     #[test]

@@ -156,12 +156,48 @@ def test_bounded_pattern_prefixes_match_independent_completion_oracle(pattern):
             constraint.release_state(state)
 
 
+@pytest.mark.parametrize("pattern", ["^AB", "AB", "^A?B$", "A$", "^[AB]+$", "^é|🚀$"])
+def test_unbounded_pattern_prefixes_match_independent_completion_oracle(pattern):
+    # Without maxLength a character must still leave some match reachable:
+    # after a leading X, "^AB" could never close its string.
+    alphabet = "ABXé🚀"
+    schema = {"type": "string", "pattern": pattern}
+    validator = Draft202012Validator(schema)
+    # Each pattern needs at most two more characters to match when it still can,
+    # so five-character words decide every prefix of up to two characters.
+    words = ["".join(chars) for length in range(6)
+             for chars in itertools.product(alphabet, repeat=length)]
+    valid = [word for word in words if validator.is_valid(word)]
+    vocabulary = [b'"', *(character.encode() for character in alphabet)]
+    constraint = _rust.GrammarConstraint(vocabulary)
+    constraint.compile_json_schema(json.dumps(schema))
+    for prefix in (word for word in words if len(word) <= 2):
+        if not any(word.startswith(prefix) for word in valid):
+            continue
+        state = constraint.init_state()
+        try:
+            for token in [0, *(1 + alphabet.index(character) for character in prefix)]:
+                assert token in constraint.get_valid_token_ids(state)
+                previous = state
+                state = constraint.advance_state(state, token)
+                constraint.release_state(previous)
+            allowed = constraint.get_valid_token_ids(state)
+            assert (0 in allowed) == validator.is_valid(prefix)
+            for token, character in enumerate(alphabet, 1):
+                assert (token in allowed) == any(word.startswith(prefix + character) for word in valid)
+        finally:
+            constraint.release_state(state)
+
+
 @pytest.mark.parametrize("schema,prefix", [
     ({"type": "object", "properties": {"value": {"type": "string", "pattern": "AB", "maxLength": 2}},
       "required": ["value"]}, b'{"value":"'),
     ({"type": "array", "items": {"type": "string", "pattern": "AB", "maxLength": 2}}, b'["AB","'),
+    ({"type": "object", "properties": {"value": {"type": "string", "pattern": "^AB"}},
+      "required": ["value"]}, b'{"value":"'),
+    ({"type": "array", "items": {"type": "string", "pattern": "^AB"}}, b'["AB","'),
 ])
-def test_nested_bounded_patterns_reject_dead_end_tokens(schema, prefix):
+def test_nested_patterns_reject_dead_end_tokens(schema, prefix):
     constraint = _rust.GrammarConstraint([prefix, b'X', b'A', b'\\u005'])
     constraint.compile_json_schema(json.dumps(schema))
     initial = constraint.init_state()
@@ -308,6 +344,9 @@ def test_schema_validity_across_token_boundaries(schema, document, expected, chu
         {"type": "string", "pattern": "(?=x)"},
         {"type": "string", "pattern": r"\p{L}"},
         {"type": "string", "pattern": "[a-z&&[^x]]"},
+        {"type": "string", "pattern": "a$b"},
+        {"type": "array", "items": {"type": "string", "pattern": "$x"}},
+        {"type": "string", "pattern": "^[0-9]{5}$", "maxLength": 3},
         {"minLength": 2},
         {"enum": []},
         {"enum": [1, 1]},
