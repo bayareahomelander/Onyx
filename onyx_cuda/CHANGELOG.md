@@ -1,6 +1,9 @@
 # Changelog
 
-## Unreleased
+## 0.1.1 - 2026-10-13
+
+Fixes for requests that could break the server or never finish, and a shorter
+README. Models, defaults, and request fields are unchanged.
 
 ### Fixes
 
@@ -37,6 +40,19 @@
 
 - Removed the unused `fallback_reason` from graph recovery, left over from
   when running out of memory closed the recovery graphs.
+
+### Validation
+
+- The full suite passed 881 tests on a Linux RTX 2080 Ti (22 GiB) on
+  October 12, 2026, with 51 native Rust tests.
+- Greedy output that completed before is unchanged. The benchmark was not
+  rerun.
+
+### Known limitations
+
+- The 0.1.0 limitations still apply.
+- A `minLength` longer than any string a `pattern` can match is not rejected
+  up front, and generation ends with an error when it reaches that point.
 
 ## 0.1.0 - 2026-10-08
 

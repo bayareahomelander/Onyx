@@ -77,7 +77,7 @@ does not apply to constrained requests.
 
 ## Validation
 
-On October 8 the full CUDA suite passed all 858 tests with gamma 3, draft graphs,
+On October 12 the full CUDA suite passed all 881 tests with gamma 3, draft graphs,
 and default graph recovery. September 22 checks matched full logits and KV
 caches bitwise through 8192 tokens with graph recovery, and the API completed a
 4096-prompt/4096-output capacity test. If a graph block still exhausts GPU
