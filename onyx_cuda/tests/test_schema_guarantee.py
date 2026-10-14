@@ -126,67 +126,54 @@ def test_bounded_pattern_unicode_boundaries(codepoint, ensure_ascii):
     assert accepts(schema, document, 1)
 
 
-@pytest.mark.parametrize("pattern", ["AB", "A{2}", "^A?B$", "A$", "A*", "éB|🚀A", "[^A]B"])
-def test_bounded_pattern_prefixes_match_independent_completion_oracle(pattern):
-    alphabet = "ABXé🚀"
-    maximum = 3
-    schema = {"type": "string", "pattern": pattern, "maxLength": maximum}
+ALPHABET = "ABXé🚀"
+
+
+def assert_prefixes_match_completion_oracle(schema, longest, longest_prefix):
+    """Every prefix that can still complete allows exactly the characters an
+    independent validator says can still complete it, and the closing quote
+    exactly when the prefix itself is valid. Words up to `longest` characters
+    decide every prefix up to `longest_prefix` characters."""
     validator = Draft202012Validator(schema)
-    words = ["".join(chars) for length in range(maximum + 1)
-             for chars in itertools.product(alphabet, repeat=length)]
+    words = ["".join(chars) for length in range(longest + 1)
+             for chars in itertools.product(ALPHABET, repeat=length)]
     valid = [word for word in words if validator.is_valid(word)]
-    vocabulary = [b'"', *(character.encode() for character in alphabet)]
+    assert valid
+    vocabulary = [b'"', *(character.encode() for character in ALPHABET)]
     constraint = _rust.GrammarConstraint(vocabulary)
     constraint.compile_json_schema(json.dumps(schema))
-    for prefix in words:
+    for prefix in (word for word in words if len(word) <= longest_prefix):
         if not any(word.startswith(prefix) for word in valid):
             continue
         state = constraint.init_state()
         try:
-            for token in [0, *(1 + alphabet.index(character) for character in prefix)]:
+            for token in [0, *(1 + ALPHABET.index(character) for character in prefix)]:
                 assert token in constraint.get_valid_token_ids(state)
                 previous = state
                 state = constraint.advance_state(state, token)
                 constraint.release_state(previous)
             allowed = constraint.get_valid_token_ids(state)
             assert (0 in allowed) == validator.is_valid(prefix)
-            for token, character in enumerate(alphabet, 1):
+            for token, character in enumerate(ALPHABET, 1):
                 assert (token in allowed) == any(word.startswith(prefix + character) for word in valid)
         finally:
             constraint.release_state(state)
+
+
+@pytest.mark.parametrize("pattern", ["AB", "A{2}", "^A?B$", "A$", "A*", "éB|🚀A", "[^A]B"])
+def test_bounded_pattern_prefixes_match_independent_completion_oracle(pattern):
+    assert_prefixes_match_completion_oracle(
+        {"type": "string", "pattern": pattern, "maxLength": 3}, longest=3, longest_prefix=3)
 
 
 @pytest.mark.parametrize("pattern", ["^AB", "AB", "^A?B$", "A$", "^[AB]+$", "^é|🚀$"])
 def test_unbounded_pattern_prefixes_match_independent_completion_oracle(pattern):
     # Without maxLength a character must still leave some match reachable:
     # after a leading X, "^AB" could never close its string.
-    alphabet = "ABXé🚀"
-    schema = {"type": "string", "pattern": pattern}
-    validator = Draft202012Validator(schema)
     # Each pattern needs at most two more characters to match when it still can,
     # so five-character words decide every prefix of up to two characters.
-    words = ["".join(chars) for length in range(6)
-             for chars in itertools.product(alphabet, repeat=length)]
-    valid = [word for word in words if validator.is_valid(word)]
-    vocabulary = [b'"', *(character.encode() for character in alphabet)]
-    constraint = _rust.GrammarConstraint(vocabulary)
-    constraint.compile_json_schema(json.dumps(schema))
-    for prefix in (word for word in words if len(word) <= 2):
-        if not any(word.startswith(prefix) for word in valid):
-            continue
-        state = constraint.init_state()
-        try:
-            for token in [0, *(1 + alphabet.index(character) for character in prefix)]:
-                assert token in constraint.get_valid_token_ids(state)
-                previous = state
-                state = constraint.advance_state(state, token)
-                constraint.release_state(previous)
-            allowed = constraint.get_valid_token_ids(state)
-            assert (0 in allowed) == validator.is_valid(prefix)
-            for token, character in enumerate(alphabet, 1):
-                assert (token in allowed) == any(word.startswith(prefix + character) for word in valid)
-        finally:
-            constraint.release_state(state)
+    assert_prefixes_match_completion_oracle(
+        {"type": "string", "pattern": pattern}, longest=5, longest_prefix=2)
 
 
 @pytest.mark.parametrize("pattern,minimum,maximum", [
@@ -204,37 +191,14 @@ def test_unbounded_pattern_prefixes_match_independent_completion_oracle(pattern)
 def test_min_length_pattern_prefixes_match_independent_completion_oracle(pattern, minimum, maximum):
     # Every character must leave a match reachable at a length minLength allows:
     # for "^(A|BBB)$" with minLength 2, a leading A can never close the string.
-    alphabet = "ABXé🚀"
     schema = {"type": "string", "pattern": pattern, "minLength": minimum}
     if maximum is not None:
         schema["maxLength"] = maximum
-    validator = Draft202012Validator(schema)
     # Unbounded cases need at most three more characters once a two-character
     # prefix can still match, so five-character words decide those prefixes.
-    longest = 5 if maximum is None else maximum
-    words = ["".join(chars) for length in range(longest + 1)
-             for chars in itertools.product(alphabet, repeat=length)]
-    valid = [word for word in words if validator.is_valid(word)]
-    assert valid
-    vocabulary = [b'"', *(character.encode() for character in alphabet)]
-    constraint = _rust.GrammarConstraint(vocabulary)
-    constraint.compile_json_schema(json.dumps(schema))
-    for prefix in (word for word in words if len(word) <= (2 if maximum is None else maximum)):
-        if not any(word.startswith(prefix) for word in valid):
-            continue
-        state = constraint.init_state()
-        try:
-            for token in [0, *(1 + alphabet.index(character) for character in prefix)]:
-                assert token in constraint.get_valid_token_ids(state)
-                previous = state
-                state = constraint.advance_state(state, token)
-                constraint.release_state(previous)
-            allowed = constraint.get_valid_token_ids(state)
-            assert (0 in allowed) == validator.is_valid(prefix)
-            for token, character in enumerate(alphabet, 1):
-                assert (token in allowed) == any(word.startswith(prefix + character) for word in valid)
-        finally:
-            constraint.release_state(state)
+    assert_prefixes_match_completion_oracle(
+        schema, longest=5 if maximum is None else maximum,
+        longest_prefix=2 if maximum is None else maximum)
 
 
 @pytest.mark.parametrize("schema", [
