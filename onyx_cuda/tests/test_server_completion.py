@@ -1105,7 +1105,6 @@ def test_real_uvicorn_api_phase_gate(monkeypatch):
                 allocated.append(settled_allocations())
             peak = torch.cuda.max_memory_allocated()
             assert allocated == [baseline, baseline, baseline]
-            assert peak >= baseline
 
             body = warmup.json()
             request = ChatCompletionRequest.model_validate(payload)

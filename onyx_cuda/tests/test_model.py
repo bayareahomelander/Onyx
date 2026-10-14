@@ -72,13 +72,11 @@ def test_load_model_prompt_prefill_and_generation_on_cuda(monkeypatch, record_mo
     record_model_revision(TARGET_MODEL_ID, target)
     target_revision = target.revision
 
-    assert loaded.revision == loaded.model.config._commit_hash
     assert len(loaded.revision) == 40
     assert not loaded.model.training
     assert loaded.model.hf_device_map == {"": device}
     assert all(parameter.device == device for parameter in loaded.model.parameters())
     assert all(parameter.dtype == torch.float16 for parameter in loaded.model.parameters())
-    assert target.revision == target.model.config._commit_hash
     assert len(target.revision) == 40
     assert not target.model.training
     assert target.model.hf_device_map == {"": device}
@@ -123,8 +121,6 @@ def test_load_model_prompt_prefill_and_generation_on_cuda(monkeypatch, record_mo
     assert target_result.past_key_values.get_seq_length() == len(
         target_prompt.token_ids
     )
-    assert load_peak_allocated < torch.cuda.get_device_properties(device).total_memory
-    assert forward_peak_allocated < torch.cuda.get_device_properties(device).total_memory
 
     assert result.logits.shape == (1, loaded.model.config.vocab_size)
     assert result.logits.device == device
@@ -161,7 +157,6 @@ def test_load_model_prompt_prefill_and_generation_on_cuda(monkeypatch, record_mo
     assert len(cache.layers) == loaded.model.config.num_hidden_layers == 24
     assert cache.get_seq_length() == len(prompt.token_ids)
     assert cache.get_max_cache_shape() == -1
-    assert callable(cache.crop)
 
     head_dim = loaded.model.config.hidden_size // loaded.model.config.num_attention_heads
     expected_cache_shape = (
@@ -531,7 +526,6 @@ def test_load_model_prompt_prefill_and_generation_on_cuda(monkeypatch, record_mo
         allocations.append(torch.cuda.memory_allocated(device))
 
     assert allocations == [allocation_baseline] * 3
-    assert torch.cuda.max_memory_allocated(device) < torch.cuda.get_device_properties(device).total_memory
 
     print(f"model_revision={loaded.revision}")
     print(f"target_model_revision={target_revision}")

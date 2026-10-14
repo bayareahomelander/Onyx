@@ -70,7 +70,7 @@ def pytest_runtest_teardown(item, nextitem):
 
 
 @pytest.fixture
-def record_model_revision(request):
+def record_model_revision():
     from onyx_cuda.revisions import MODEL_REVISIONS
 
     def record(model_id, loaded):

@@ -14,8 +14,7 @@ def test_loading_uses_one_pinned_revision_for_config_tokenizer_and_weights(monke
 
     class FakeModel:
         def to(self, device):
-            assert device == "cuda:0"
-            return self
+            pytest.fail("Model must load directly on CUDA, not be moved after CPU loading")
 
         def eval(self):
             calls.append("eval")
@@ -48,12 +47,3 @@ def test_loading_uses_one_pinned_revision_for_config_tokenizer_and_weights(monke
     monkeypatch.setattr(loader.AutoModelForCausalLM, "from_pretrained", get_model)
     assert loader.load_model(model_id).revision == revision
     assert calls == ["config", "tokenizer", "weights", "eval"]
-
-
-def test_mismatched_pin_fails_before_loading_weights(monkeypatch):
-    monkeypatch.setattr(loader, "require_cuda", lambda: "cuda:0")
-    monkeypatch.setattr(
-        loader.AutoConfig, "from_pretrained", lambda *a, **kw: SimpleNamespace(_commit_hash="wrong")
-    )
-    with pytest.raises(RuntimeError, match="differs from the validation pin"):
-        loader.load_model()

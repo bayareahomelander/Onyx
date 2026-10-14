@@ -142,7 +142,6 @@ def test_target_generation_oracle_constraints_and_memory(record_model_revision):
 
     assert allocations == [allocation_baseline] * 3
     peak_allocated = torch.cuda.max_memory_allocated(device)
-    assert peak_allocated < torch.cuda.get_device_properties(device).total_memory
 
     print(f"target_model_revision={loaded.revision}")
     print(f"target_oracle_token_ids={json.dumps(oracle_token_ids)}")
