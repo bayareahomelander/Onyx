@@ -419,6 +419,7 @@ def test_response_format_and_json_exhaustion_contract(monkeypatch, stream, finis
         ({"regex": "["}, 400),
         ({"regex": "a$b"}, 400),
         ({"json_schema": {"type": "string", "pattern": "^[0-9]{5}$", "maxLength": 3}}, 400),
+        ({"json_schema": {"type": "string", "pattern": "^[0-9]{5}$", "minLength": 6}}, 400),
         ({"response_format": {"type": "json_object"}}, 422),
         (
             {

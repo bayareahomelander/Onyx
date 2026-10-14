@@ -218,11 +218,12 @@ pub fn validate_schema(schema: &Value, path: &str) -> Result<(), ConstraintError
             .as_str()
             .ok_or_else(|| invalid(path, "pattern must be a string"))?;
         let normalized = schema_pattern(pattern).map_err(|e| invalid(path, e))?;
-        let max_length = schema
-            .get("maxLength")
-            .and_then(Value::as_u64)
-            .map(|n| n as usize);
-        crate::regex_engine::check_pattern_satisfiable(&normalized, max_length)
+        let length = |key| schema.get(key).and_then(Value::as_u64).map(|n| n as usize);
+        crate::regex_engine::check_pattern_satisfiable(
+            &normalized,
+            length("minLength"),
+            length("maxLength"),
+        )
             .map_err(|e| invalid(path, e))?;
     }
     if let Some(values) = schema.get("enum") {
@@ -428,7 +429,7 @@ pub struct PropertyBlueprint {
     pub required: bool,
     /// for enums: allowed values (serialized json bytes)
     pub enum_values: Option<Vec<Vec<u8>>>,
-    /// for strings: shared compiled pattern and completion distances
+    /// for strings: shared compiled pattern, its length limits and completion distances
     pub pattern: Option<Arc<StringPattern>>,
     /// for strings: min char count
     pub min_length: Option<usize>,
@@ -504,7 +505,7 @@ impl PropertyBlueprint {
         // parser clones and repeated array items.
         let pattern = value.get("pattern").and_then(Value::as_str).map(|pattern| {
             let normalized = schema_pattern(pattern).expect("validated pattern");
-            Arc::new(StringPattern::new(&normalized))
+            Arc::new(StringPattern::new(&normalized, min_length, max_length))
         });
 
         // parse array length constraints

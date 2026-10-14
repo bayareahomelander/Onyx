@@ -189,6 +189,82 @@ def test_unbounded_pattern_prefixes_match_independent_completion_oracle(pattern)
             constraint.release_state(state)
 
 
+@pytest.mark.parametrize("pattern,minimum,maximum", [
+    ("^(A|BBB)$", 2, 4),
+    ("^(A|BBB)$", 2, None),
+    ("^[AB]{1,3}$", 3, 4),
+    ("^A*$", 2, 4),
+    ("^AB", 4, None),
+    ("A$", 3, None),
+    ("A", 3, 4),
+    ("^[AB]+$", 3, None),
+    ("^é|🚀$", 2, 3),
+    ("^(é|BB)X?$", 2, 3),
+])
+def test_min_length_pattern_prefixes_match_independent_completion_oracle(pattern, minimum, maximum):
+    # Every character must leave a match reachable at a length minLength allows:
+    # for "^(A|BBB)$" with minLength 2, a leading A can never close the string.
+    alphabet = "ABXé🚀"
+    schema = {"type": "string", "pattern": pattern, "minLength": minimum}
+    if maximum is not None:
+        schema["maxLength"] = maximum
+    validator = Draft202012Validator(schema)
+    # Unbounded cases need at most three more characters once a two-character
+    # prefix can still match, so five-character words decide those prefixes.
+    longest = 5 if maximum is None else maximum
+    words = ["".join(chars) for length in range(longest + 1)
+             for chars in itertools.product(alphabet, repeat=length)]
+    valid = [word for word in words if validator.is_valid(word)]
+    assert valid
+    vocabulary = [b'"', *(character.encode() for character in alphabet)]
+    constraint = _rust.GrammarConstraint(vocabulary)
+    constraint.compile_json_schema(json.dumps(schema))
+    for prefix in (word for word in words if len(word) <= (2 if maximum is None else maximum)):
+        if not any(word.startswith(prefix) for word in valid):
+            continue
+        state = constraint.init_state()
+        try:
+            for token in [0, *(1 + alphabet.index(character) for character in prefix)]:
+                assert token in constraint.get_valid_token_ids(state)
+                previous = state
+                state = constraint.advance_state(state, token)
+                constraint.release_state(previous)
+            allowed = constraint.get_valid_token_ids(state)
+            assert (0 in allowed) == validator.is_valid(prefix)
+            for token, character in enumerate(alphabet, 1):
+                assert (token in allowed) == any(word.startswith(prefix + character) for word in valid)
+        finally:
+            constraint.release_state(state)
+
+
+@pytest.mark.parametrize("schema", [
+    {"type": "object", "properties": {"value": {"type": "string", "pattern": "^(A|BB)$", "minLength": 2}},
+     "required": ["value"]},
+    {"type": "array", "items": {"type": "string", "pattern": "^(A|BB)$", "minLength": 2}},
+])
+def test_nested_min_length_patterns_reject_short_branches(schema):
+    prefix = b'{"value":"' if schema["type"] == "object" else b'["'
+    constraint = _rust.GrammarConstraint([prefix, b'A', b'B', b'\\u0041', b'\\u004'])
+    constraint.compile_json_schema(json.dumps(schema))
+    initial = constraint.init_state()
+    state = constraint.advance_state(initial, 0)
+    try:
+        # "\u004" can still finish as B (B); "A" is a complete A.
+        assert constraint.get_valid_token_ids(state) == [2, 4]
+    finally:
+        constraint.release_states([initial, state])
+
+
+@pytest.mark.parametrize("schema", [
+    {"type": "string", "pattern": "^é{2}$", "minLength": 2},
+    {"type": "string", "pattern": "^(A|BBBB)$", "minLength": 2, "maxLength": 4},
+    {"type": "string", "pattern": "^AB", "minLength": 5},
+    {"type": "string", "pattern": "^[0-9]+$", "minLength": 500},
+])
+def test_satisfiable_min_length_patterns_are_accepted(schema):
+    _rust.validate_json_schema(json.dumps(schema))
+
+
 @pytest.mark.parametrize("schema,prefix", [
     ({"type": "object", "properties": {"value": {"type": "string", "pattern": "AB", "maxLength": 2}},
       "required": ["value"]}, b'{"value":"'),
@@ -347,6 +423,10 @@ def test_schema_validity_across_token_boundaries(schema, document, expected, chu
         {"type": "string", "pattern": "a$b"},
         {"type": "array", "items": {"type": "string", "pattern": "$x"}},
         {"type": "string", "pattern": "^[0-9]{5}$", "maxLength": 3},
+        {"type": "string", "pattern": "^[A-Z]{3}$", "minLength": 5},
+        {"type": "string", "pattern": "^é{2}$", "minLength": 3},
+        {"type": "string", "pattern": "^(A|BBBB)$", "minLength": 2, "maxLength": 3},
+        {"type": "array", "items": {"type": "string", "pattern": "^A?$", "minLength": 2}},
         {"minLength": 2},
         {"enum": []},
         {"enum": [1, 1]},

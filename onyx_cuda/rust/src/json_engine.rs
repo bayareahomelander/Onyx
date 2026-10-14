@@ -204,27 +204,16 @@ impl StringState {
             .is_some_and(|prefix| prefix.eq_ignore_ascii_case(&self.pending))
     }
 
-    /// Characters this string may still add; unlimited without maxLength.
-    fn length_budget(&self) -> Option<usize> {
-        match self.max_length {
-            Some(maximum) => maximum.checked_sub(self.char_count),
-            None => Some(usize::MAX),
-        }
-    }
-
     fn can_complete_pattern(&self) -> bool {
         let (Some(pattern), Some(state)) = (&self.pattern, self.dfa_state) else {
             return true;
         };
-        let Some(budget) = self.length_budget() else {
-            return false;
-        };
         if self.pending.is_empty() {
-            return pattern.can_finish(state, budget);
+            return pattern.can_finish(state, self.char_count);
         }
-        self.pending_character_ranges()
-            .into_iter()
-            .any(|(low, high)| pattern.can_finish_after_character(state, low, high, budget))
+        self.pending_character_ranges().into_iter().any(|(low, high)| {
+            pattern.can_finish_after_character(state, low, high, self.char_count)
+        })
     }
 
     /// Scalar ranges still encodable by this unfinished JSON character. The
@@ -291,7 +280,6 @@ impl StringState {
         match step {
             StringStep::Character(character) => {
                 self.char_count += 1;
-                let budget = self.length_budget();
                 if let (Some(pattern), Some(state)) = (&self.pattern, &mut self.dfa_state) {
                     let dfa = &pattern.dfa;
                     let mut buffer = [0; 4];
@@ -301,9 +289,9 @@ impl StringState {
                             return None;
                         }
                     }
-                    // A match must stay reachable, with or without maxLength,
-                    // or the string could never close.
-                    if !budget.is_some_and(|budget| pattern.can_finish(*state, budget)) {
+                    // A match must stay reachable at a length within
+                    // minLength and maxLength, or the string could never close.
+                    if !pattern.can_finish(*state, self.char_count) {
                         return None;
                     }
                 }
@@ -2093,6 +2081,39 @@ mod tests {
         engine.advance(1).unwrap();
         engine.advance(2).unwrap();
         assert_eq!(engine.get_valid_tokens(), vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn test_min_length_pattern_rejects_branches_that_end_too_short() {
+        let vocab = vec![b"\"".to_vec(), b"A".to_vec(), b"B".to_vec()];
+        let schema = r#"{"type":"string","pattern":"^(A|BBB)$","minLength":2}"#;
+        let mut engine = JsonEngine::new(vocab, schema).unwrap();
+        engine.advance(0).unwrap();
+        // "A" matches but is shorter than minLength and cannot grow.
+        assert_eq!(engine.get_valid_tokens(), vec![2]);
+        engine.advance(2).unwrap();
+        engine.advance(2).unwrap();
+        assert_eq!(engine.get_valid_tokens(), vec![2]);
+        engine.advance(2).unwrap();
+        assert_eq!(engine.get_valid_tokens(), vec![0]);
+    }
+
+    #[test]
+    fn test_min_length_outside_pattern_lengths_is_rejected() {
+        let vocab = || vec![b"\"".to_vec(), b"A".to_vec()];
+        for (schema, accepted) in [
+            (r#"{"type":"string","pattern":"^[A-Z]{3}$","minLength":5}"#, false),
+            // Two characters are four bytes: lengths count characters.
+            (r#"{"type":"string","pattern":"^é{2}$","minLength":3}"#, false),
+            (r#"{"type":"string","pattern":"^é{2}$","minLength":2}"#, true),
+            // Lengths 1 and 4 match, but none in 2..=3.
+            (r#"{"type":"string","pattern":"^(A|BBBB)$","minLength":2,"maxLength":3}"#, false),
+            (r#"{"type":"string","pattern":"^(A|BBBB)$","minLength":2,"maxLength":4}"#, true),
+            // Search semantics: anything may follow the match.
+            (r#"{"type":"string","pattern":"^AB","minLength":5}"#, true),
+        ] {
+            assert_eq!(JsonEngine::new(vocab(), schema).is_ok(), accepted, "{schema}");
+        }
     }
 
     #[test]

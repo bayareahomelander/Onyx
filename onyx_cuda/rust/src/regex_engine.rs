@@ -60,19 +60,34 @@ fn schema_pattern_search(normalized: &str) -> String {
 }
 
 /// Reject a normalized schema pattern that no string satisfies within
-/// maxLength, so generation never opens a string it can never close.
-pub fn check_pattern_satisfiable(normalized: &str, max_length: Option<usize>) -> Result<(), String> {
+/// minLength and maxLength, so generation never opens a string it can never
+/// close.
+pub fn check_pattern_satisfiable(
+    normalized: &str,
+    min_length: Option<usize>,
+    max_length: Option<usize>,
+) -> Result<(), String> {
     let compiled = compile_pattern_dfa(&schema_pattern_search(normalized))?;
     let Some(bytes) = shortest_match_bytes(&compiled.dfa, compiled.initial_state) else {
         return Err("pattern can never match".to_string());
     };
+    if min_length.is_some_and(|minimum| minimum > 0) {
+        // Matching lengths can have gaps, such as 1 and 4 for `^(A|BBBB)$`,
+        // so only the per-count rows decide.
+        let pattern = StringPattern::from_compiled(compiled, min_length, max_length);
+        return if pattern.can_finish(pattern.initial_state, 0) {
+            Ok(())
+        } else {
+            Err("pattern cannot match a string within minLength and maxLength".to_string())
+        };
+    }
     // Characters never outnumber bytes, so the cheap byte search usually decides.
     let Some(maximum) = max_length.filter(|&maximum| bytes > maximum) else {
         return Ok(());
     };
-    let lengths = completion_lengths(&compiled.dfa, compiled.initial_state);
-    match lengths.get(&compiled.initial_state) {
-        Some(&characters) if characters > maximum => Err(format!(
+    let graph = CharacterGraph::new(&compiled.dfa, compiled.initial_state);
+    match completion_lengths(&compiled.dfa, &graph)[0] {
+        characters if characters != usize::MAX && characters > maximum => Err(format!(
             "pattern needs at least {characters} characters, more than maxLength"
         )),
         _ => Ok(()),
@@ -107,67 +122,153 @@ fn shortest_match_bytes(dfa: &dense::DFA<Vec<u32>>, initial: StateID) -> Option<
     None
 }
 
-/// Shared JSON string pattern and minimum completion lengths in characters.
+/// Shared JSON string pattern with its schema's length limits, and the
+/// character distances that decide whether a string can still close.
 #[derive(Debug)]
 pub struct StringPattern {
     pub dfa: dense::DFA<Vec<u32>>,
     pub initial_state: StateID,
-    remaining: HashMap<StateID, usize>,
+    min_length: usize,
+    max_length: Option<usize>,
+    indices: HashMap<StateID, usize>,
+    // Fewest characters to a match from each indexed state; usize::MAX when
+    // none is reachable, such as any state after a leading `X` for `^AB`.
+    remaining: Vec<usize>,
+    short_rows: ShortRows,
     // Partial UTF-8 and JSON escapes repeatedly ask about the same character
     // intervals during vocabulary scans. Bound this schema-owned cache.
-    range_remaining: Mutex<HashMap<(StateID, u32, u32), Option<usize>>>,
+    range_successors: Mutex<HashMap<(StateID, u32, u32), Arc<[StateID]>>>,
 }
 
 impl StringPattern {
-    pub fn new(normalized: &str) -> Self {
+    pub fn new(normalized: &str, min_length: Option<usize>, max_length: Option<usize>) -> Self {
         let compiled = compile_pattern_dfa(&schema_pattern_search(normalized))
             .expect("validated pattern DFA");
-        // Needed without maxLength too: a state missing from this map can never
-        // close the string, such as any state after a leading `X` for `^AB`.
-        let remaining = completion_lengths(&compiled.dfa, compiled.initial_state);
+        Self::from_compiled(compiled, min_length, max_length)
+    }
+
+    fn from_compiled(
+        compiled: CompiledDfa,
+        min_length: Option<usize>,
+        max_length: Option<usize>,
+    ) -> Self {
+        let graph = CharacterGraph::new(&compiled.dfa, compiled.initial_state);
+        let remaining = completion_lengths(&compiled.dfa, &graph);
+        let min_length = min_length.unwrap_or(0);
+        let short_rows = ShortRows::new(&graph, &remaining, min_length, max_length);
         Self {
             dfa: compiled.dfa,
             initial_state: compiled.initial_state,
+            min_length,
+            max_length,
+            indices: graph.indices,
             remaining,
-            range_remaining: Mutex::new(HashMap::new()),
+            short_rows,
+            range_successors: Mutex::new(HashMap::new()),
         }
     }
 
-    pub fn can_finish(&self, state: StateID, budget: usize) -> bool {
-        self.remaining
-            .get(&state)
-            .is_some_and(|&length| length <= budget)
+    /// Whether a string in `state` after `count` characters can still close
+    /// on a match whose length the schema allows.
+    pub fn can_finish(&self, state: StateID, count: usize) -> bool {
+        let Some(&index) = self.indices.get(&state) else {
+            return false;
+        };
+        if count < self.min_length {
+            return self.short_rows.row(self.min_length, count)[index];
+        }
+        finishes_within(self.remaining[index], count, self.max_length)
     }
 
+    /// Like `can_finish`, after one more character from `low..=high`.
     pub fn can_finish_after_character(
         &self,
         state: StateID,
         low: u32,
         high: u32,
-        budget: usize,
+        count: usize,
     ) -> bool {
-        if budget == 0 || low > high {
-            return false;
-        }
         let key = (state, low, high);
         let cached = self
-            .range_remaining
+            .range_successors
             .lock()
             .expect("pattern cache lock")
             .get(&key)
-            .copied();
-        let length = cached.unwrap_or_else(|| {
-            let length = character_successors(&self.dfa, state, low, high)
-                .iter()
-                .filter_map(|state| self.remaining.get(state).copied())
-                .min();
-            let mut cache = self.range_remaining.lock().expect("pattern cache lock");
+            .cloned();
+        let successors = cached.unwrap_or_else(|| {
+            let successors: Arc<[StateID]> = character_successors(&self.dfa, state, low, high).into();
+            let mut cache = self.range_successors.lock().expect("pattern cache lock");
             if cache.len() < 4096 {
-                cache.insert(key, length);
+                cache.insert(key, successors.clone());
             }
-            length
+            successors
         });
-        length.is_some_and(|length| length < budget)
+        successors
+            .iter()
+            .any(|&state| self.can_finish(state, count + 1))
+    }
+}
+
+/// From minLength characters on, a string closes as soon as its pattern
+/// matches, so only the fewest remaining characters matter.
+fn finishes_within(remaining: usize, count: usize, max_length: Option<usize>) -> bool {
+    remaining != usize::MAX
+        && max_length.map_or(true, |maximum| {
+            count <= maximum && remaining <= maximum - count
+        })
+}
+
+/// Below minLength a string cannot close yet, even on a match. Row `count`
+/// marks the states from which, after `count` characters, some match of an
+/// allowed length is reachable; matching lengths can have gaps, so the
+/// fewest remaining characters do not decide. Each row depends only on the
+/// next longer count, so once a row recurs the rows below repeat with that
+/// period; only rows down to the first repeat are stored.
+#[derive(Debug)]
+struct ShortRows {
+    // rows[k] is the row for count `min_length - 1 - k`.
+    rows: Vec<Vec<bool>>,
+    period: usize,
+}
+
+impl ShortRows {
+    fn new(
+        graph: &CharacterGraph,
+        remaining: &[usize],
+        min_length: usize,
+        max_length: Option<usize>,
+    ) -> Self {
+        let mut next: Vec<bool> = remaining
+            .iter()
+            .map(|&remaining| finishes_within(remaining, min_length, max_length))
+            .collect();
+        let mut seen = HashMap::new();
+        let mut rows = Vec::new();
+        let mut period = 0;
+        for k in 0..min_length {
+            let row: Vec<bool> = graph
+                .successors
+                .iter()
+                .map(|successors| successors.iter().any(|&index| next[index]))
+                .collect();
+            if let Some(&first) = seen.get(&row) {
+                period = k - first;
+                break;
+            }
+            seen.insert(row.clone(), k);
+            rows.push(row.clone());
+            next = row;
+        }
+        Self { rows, period }
+    }
+
+    fn row(&self, min_length: usize, count: usize) -> &[bool] {
+        let k = min_length - 1 - count;
+        if k < self.rows.len() {
+            return &self.rows[k];
+        }
+        let start = self.rows.len() - self.period;
+        &self.rows[start + (k - start) % self.period]
     }
 }
 
@@ -214,27 +315,48 @@ fn character_successors(
     successors
 }
 
-/// Reverse breadth-first search over character transitions, computed once per
-/// blueprint. The runtime check is independent of the requested length limit.
-fn completion_lengths(dfa: &dense::DFA<Vec<u32>>, initial: StateID) -> HashMap<StateID, usize> {
-    let mut states = vec![initial];
-    let mut indices = HashMap::from([(initial, 0)]);
-    let mut reverse = vec![Vec::new()];
-    let mut index = 0;
-    while index < states.len() {
-        for next in character_successors(dfa, states[index], 0, 0x10ffff) {
-            let next_index = *indices.entry(next).or_insert_with(|| {
-                states.push(next);
-                reverse.push(Vec::new());
-                states.len() - 1
-            });
-            reverse[next_index].push(index);
+/// The DFA states reachable from `initial` one Unicode scalar at a time,
+/// with their character transitions; `initial` has index 0.
+struct CharacterGraph {
+    states: Vec<StateID>,
+    indices: HashMap<StateID, usize>,
+    successors: Vec<Vec<usize>>,
+}
+
+impl CharacterGraph {
+    fn new(dfa: &dense::DFA<Vec<u32>>, initial: StateID) -> Self {
+        let mut states = vec![initial];
+        let mut indices = HashMap::from([(initial, 0)]);
+        let mut successors = Vec::new();
+        let mut index = 0;
+        while index < states.len() {
+            let mut next_indices = Vec::new();
+            for next in character_successors(dfa, states[index], 0, 0x10ffff) {
+                next_indices.push(*indices.entry(next).or_insert_with(|| {
+                    states.push(next);
+                    states.len() - 1
+                }));
+            }
+            successors.push(next_indices);
+            index += 1;
         }
-        index += 1;
+        Self { states, indices, successors }
     }
-    let mut lengths = vec![usize::MAX; states.len()];
+}
+
+/// Fewest characters from each graph state to a match, by reverse
+/// breadth-first search, computed once per blueprint; usize::MAX when no
+/// match is reachable.
+fn completion_lengths(dfa: &dense::DFA<Vec<u32>>, graph: &CharacterGraph) -> Vec<usize> {
+    let mut reverse = vec![Vec::new(); graph.states.len()];
+    for (index, successors) in graph.successors.iter().enumerate() {
+        for &next in successors {
+            reverse[next].push(index);
+        }
+    }
+    let mut lengths = vec![usize::MAX; graph.states.len()];
     let mut queue = VecDeque::new();
-    for (index, &state) in states.iter().enumerate() {
+    for (index, &state) in graph.states.iter().enumerate() {
         if dfa.is_match_state(dfa.next_eoi_state(state)) {
             lengths[index] = 0;
             queue.push_back(index);
@@ -248,11 +370,7 @@ fn completion_lengths(dfa: &dense::DFA<Vec<u32>>, initial: StateID) -> HashMap<S
             }
         }
     }
-    states
-        .into_iter()
-        .zip(lengths)
-        .filter(|(_, length)| *length != usize::MAX)
-        .collect()
+    lengths
 }
 
 /// Whether a match at the end of input is still reachable from each state,

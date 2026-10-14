@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+### Fixes
+
+- A schema `pattern` with a `minLength` now allows only characters after which
+  the string can still match at an allowed length. For `^(A|BBB)$` with
+  `minLength: 2`, generation could previously write `A`, which matches but is
+  too short and cannot grow, and then end with an error. A `pattern` that
+  cannot match within its `minLength` and `maxLength`, such as `^[A-Z]{3}$`
+  with `minLength: 5`, now returns HTTP 400. This removes the known limitation
+  listed for 0.1.1.
+
 ## 0.1.1 - 2026-10-13
 
 Fixes for requests that could break the server or never finish, and a shorter
