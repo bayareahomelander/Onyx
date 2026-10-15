@@ -8,6 +8,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::constraint::ConstraintError;
+use crate::regex_engine::{compile_pattern_dfa, StringPattern};
 
 /// the type of a JSON schema node
 #[derive(Debug, Clone, PartialEq)]
@@ -71,8 +72,9 @@ pub struct PropertyBlueprint {
     pub required: bool,
     /// for enums: allowed values (serialized json bytes)
     pub enum_values: Option<Vec<Vec<u8>>>,
-    /// for strings: regex pattern
-    pub pattern: Option<String>,
+    /// for strings: compiled pattern with its length limits, shared by parser
+    /// clones and repeated array items
+    pub pattern: Option<Arc<StringPattern>>,
     /// for strings: min char count
     pub min_length: Option<usize>,
     /// for strings: max char count
@@ -86,7 +88,7 @@ pub struct PropertyBlueprint {
 
 impl PropertyBlueprint {
     /// create a property blueprint from a JSON schema value
-    pub fn from_value(_name: &str, value: &Value) -> Self {
+    pub fn from_value(_name: &str, value: &Value) -> Result<Self, ConstraintError> {
         let schema_types = SchemaType::types_from_value(value);
 
         let mut properties = HashMap::new();
@@ -96,7 +98,7 @@ impl PropertyBlueprint {
                 for (prop_name, prop_value) in props {
                     properties.insert(
                         prop_name.clone(),
-                        PropertyBlueprint::from_value(prop_name, prop_value),
+                        PropertyBlueprint::from_value(prop_name, prop_value)?,
                     );
                 }
             }
@@ -120,7 +122,10 @@ impl PropertyBlueprint {
         let items = if schema_types.contains(&SchemaType::Array) {
             value
                 .get("items")
-                .map(|item_schema| Arc::new(PropertyBlueprint::from_value("_item", item_schema)))
+                .map(|item_schema| {
+                    PropertyBlueprint::from_value("_item", item_schema).map(Arc::new)
+                })
+                .transpose()?
         } else {
             None
         };
@@ -132,12 +137,6 @@ impl PropertyBlueprint {
                 .collect()
         });
 
-        // parse pattern for string regex constraints
-        let pattern = value
-            .get("pattern")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
-
         // parse string length constraints
         let min_length = value
             .get("minLength")
@@ -147,6 +146,22 @@ impl PropertyBlueprint {
             .get("maxLength")
             .and_then(|v| v.as_u64())
             .map(|n| n as usize);
+
+        // parse pattern for string regex constraints; one the DFA builder
+        // rejects leaves the string unconstrained.
+        let mut pattern = None;
+        if let Some(source) = value.get("pattern").and_then(|v| v.as_str()) {
+            if let Ok(compiled) = compile_pattern_dfa(source) {
+                let compiled =
+                    StringPattern::new(compiled, min_length, max_length).map_err(|e| {
+                        ConstraintError::CompilationError(format!(
+                            "Invalid JSON schema: {}: {:?}",
+                            e, source
+                        ))
+                    })?;
+                pattern = Some(Arc::new(compiled));
+            }
+        }
 
         // parse array length constraints
         let min_items = value
@@ -171,7 +186,7 @@ impl PropertyBlueprint {
             None
         };
 
-        PropertyBlueprint {
+        Ok(PropertyBlueprint {
             schema_types,
             properties,
             items,
@@ -183,7 +198,7 @@ impl PropertyBlueprint {
             min_items,
             max_items,
             object_blueprint,
-        }
+        })
     }
 }
 
@@ -212,7 +227,7 @@ impl SchemaBlueprint {
                 for (name, prop_value) in props {
                     properties.insert(
                         name.clone(),
-                        PropertyBlueprint::from_value(name, prop_value),
+                        PropertyBlueprint::from_value(name, prop_value)?,
                     );
                     allowed_keys.push(name.clone());
                 }

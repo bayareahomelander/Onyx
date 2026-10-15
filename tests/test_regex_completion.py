@@ -132,6 +132,16 @@ def test_grammar_without_continuation_fails_the_request(monkeypatch, method, dra
         run(engine, method, "ab", **kwargs)
 
 
+@pytest.mark.parametrize("method", SPECULATIVE + ["generate_baseline"])
+def test_regex_that_can_never_match_fails_before_generation(monkeypatch, method):
+    vocab = [b"", b"a", b"b"]
+    engine = make_engine(monkeypatch, method, vocab, target=[0.0, 2.0, 1.0])
+
+    with pytest.raises(ValueError, match="can never match"):
+        run(engine, method, "a$b")
+    assert engine.target_model.calls == 0
+
+
 @pytest.mark.parametrize("gamma", [2, 4])
 @pytest.mark.parametrize("draft_grammar_aware", [True, False])
 @pytest.mark.parametrize("method", SPECULATIVE)

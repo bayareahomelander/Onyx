@@ -4,14 +4,14 @@
 //! constraints during LLM generation. each level of JSON nesting has its own
 //! scope on the stack, enabling proper tracking of nested objects and arrays.
 
-use regex_automata::dfa::{dense, Automaton};
+use regex_automata::dfa::Automaton;
 use regex_automata::util::primitives::StateID;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::constraint::{ConstraintEngine, ConstraintError};
-use crate::regex_engine::compile_pattern_dfa;
+use crate::regex_engine::StringPattern;
 use crate::schema::{PropertyBlueprint, SchemaBlueprint, SchemaType};
 
 /// syntax state within an object scope
@@ -36,8 +36,8 @@ pub enum ObjectSyntaxState {
 pub struct StringState {
     /// in escape sequence
     in_escape: bool,
-    /// compiled dfa for pattern validation
-    pattern_dfa: Option<Arc<dense::DFA<Vec<u32>>>>,
+    /// compiled pattern with its length limits
+    pattern: Option<Arc<StringPattern>>,
     /// current dfa state
     dfa_state: Option<StateID>,
     /// chars consumed so far
@@ -53,7 +53,7 @@ impl StringState {
     pub fn new_started() -> Self {
         StringState {
             in_escape: false,
-            pattern_dfa: None,
+            pattern: None,
             dfa_state: None,
             char_count: 0,
             min_length: None,
@@ -61,35 +61,43 @@ impl StringState {
         }
     }
 
-    /// string state with regex pattern
-    pub fn with_pattern(pattern: &str) -> Self {
-        match compile_pattern_dfa(pattern) {
-            Ok(compiled) => StringState {
-                in_escape: false,
-                pattern_dfa: Some(Arc::new(compiled.dfa)),
-                dfa_state: Some(compiled.initial_state),
-                char_count: 0,
-                min_length: None,
-                max_length: None,
-            },
-            Err(_) => StringState::new_started(),
-        }
-    }
-
     /// string state with pattern and length constraints
     pub fn with_pattern_and_constraints(
-        pattern: Option<&str>,
+        pattern: Option<&Arc<StringPattern>>,
         min_len: Option<usize>,
         max_len: Option<usize>,
     ) -> Self {
-        let mut state = if let Some(p) = pattern {
-            StringState::with_pattern(p)
-        } else {
-            StringState::new_started()
+        StringState {
+            pattern: pattern.cloned(),
+            dfa_state: pattern.map(|p| p.initial_state),
+            min_length: min_len,
+            max_length: max_len,
+            ..StringState::new_started()
+        }
+    }
+
+    /// feed one byte to the pattern. a byte after which no match of an
+    /// allowed length is reachable is refused: the string could never close.
+    fn advance_pattern(&mut self, byte: u8) -> bool {
+        let (Some(pattern), Some(state)) = (&self.pattern, &mut self.dfa_state) else {
+            return true;
         };
-        state.min_length = min_len;
-        state.max_length = max_len;
-        state
+        let next = pattern.dfa.next_state(*state, byte);
+        if !pattern.can_finish(next, self.char_count + 1) {
+            return false;
+        }
+        *state = next;
+        true
+    }
+
+    /// whether the byte an escape feeds to the pattern can keep it reachable.
+    fn can_escape(&self) -> bool {
+        match (&self.pattern, self.dfa_state) {
+            (Some(pattern), Some(state)) => {
+                pattern.can_finish_after_any_byte(state, self.char_count)
+            }
+            _ => true,
+        }
     }
 }
 
@@ -250,7 +258,7 @@ impl JsonEngine {
         })?;
 
         let root_blueprint = Arc::new(SchemaBlueprint::from_value(&schema)?);
-        let root_value_blueprint = Arc::new(PropertyBlueprint::from_value("_root", &schema));
+        let root_value_blueprint = Arc::new(PropertyBlueprint::from_value("_root", &schema)?);
 
         let vocab_size = vocabulary.len();
         let mut vocab = HashMap::with_capacity(vocab_size);
@@ -370,7 +378,7 @@ impl JsonEngine {
                         // pass constraints from item blueprint
                         let string_state = if let Some(bp) = item_bp {
                             StringState::with_pattern_and_constraints(
-                                bp.pattern.as_deref(),
+                                bp.pattern.as_ref(),
                                 bp.min_length,
                                 bp.max_length,
                             )
@@ -773,7 +781,7 @@ impl JsonEngine {
                                         let string_state =
                                             if let Some(prop) = blueprint.get_property(&key) {
                                                 StringState::with_pattern_and_constraints(
-                                                    prop.pattern.as_deref(),
+                                                    prop.pattern.as_ref(),
                                                     prop.min_length,
                                                     prop.max_length,
                                                 )
@@ -893,20 +901,17 @@ impl JsonEngine {
                     if state.in_escape {
                         state.in_escape = false;
                         // feed escaped byte to dfa
-                        if let (Some(dfa), Some(dfa_state)) =
-                            (&state.pattern_dfa, &mut state.dfa_state)
-                        {
-                            let new_state = dfa.next_state(*dfa_state, byte);
-                            if dfa.is_dead_state(new_state) {
-                                return false;
-                            }
-                            *dfa_state = new_state;
+                        if !state.advance_pattern(byte) {
+                            return false;
                         }
                         // count escaped char
                         state.char_count += 1;
                         return true;
                     }
                     if byte == b'\\' {
+                        if !state.can_escape() {
+                            return false;
+                        }
                         state.in_escape = true;
                         return true;
                     }
@@ -918,10 +923,10 @@ impl JsonEngine {
                             }
                         }
                         // check dfa match state
-                        if let (Some(dfa), Some(dfa_state)) = (&state.pattern_dfa, state.dfa_state)
+                        if let (Some(pattern), Some(dfa_state)) = (&state.pattern, state.dfa_state)
                         {
-                            let eoi_state = dfa.next_eoi_state(dfa_state);
-                            if !dfa.is_match_state(eoi_state) {
+                            let eoi_state = pattern.dfa.next_eoi_state(dfa_state);
+                            if !pattern.dfa.is_match_state(eoi_state) {
                                 return false;
                             }
                         }
@@ -939,13 +944,8 @@ impl JsonEngine {
                         }
                     }
                     // validate against dfa
-                    if let (Some(dfa), Some(dfa_state)) = (&state.pattern_dfa, &mut state.dfa_state)
-                    {
-                        let new_state = dfa.next_state(*dfa_state, byte);
-                        if dfa.is_dead_state(new_state) {
-                            return false;
-                        }
-                        *dfa_state = new_state;
+                    if !state.advance_pattern(byte) {
+                        return false;
                     }
                     // count this char
                     state.char_count += 1;
@@ -1804,6 +1804,63 @@ mod tests {
 
         engine.advance(0).unwrap();
         assert!(engine.is_finished());
+    }
+
+    #[test]
+    fn test_unbounded_pattern_rejects_characters_that_can_never_match() {
+        let vocab = vec![b"\"".to_vec(), b"A".to_vec(), b"B".to_vec(), b"X".to_vec()];
+        let mut engine = JsonEngine::new(vocab, r#"{"type":"string","pattern":"^AB"}"#).unwrap();
+        engine.advance(0).unwrap();
+        assert_eq!(engine.get_valid_tokens(), vec![1]);
+        engine.advance(1).unwrap();
+        engine.advance(2).unwrap();
+        // the pattern must match the whole string, so after "AB" another
+        // character could never close it.
+        assert_eq!(engine.get_valid_tokens(), vec![0]);
+    }
+
+    #[test]
+    fn test_min_length_pattern_rejects_branches_that_end_too_short() {
+        let vocab = vec![b"\"".to_vec(), b"A".to_vec(), b"B".to_vec()];
+        let schema = r#"{"type":"string","pattern":"^(A|BBB)$","minLength":2}"#;
+        let mut engine = JsonEngine::new(vocab, schema).unwrap();
+        engine.advance(0).unwrap();
+        // "A" matches but is shorter than minLength and cannot grow.
+        assert_eq!(engine.get_valid_tokens(), vec![2]);
+        engine.advance(2).unwrap();
+        engine.advance(2).unwrap();
+        assert_eq!(engine.get_valid_tokens(), vec![2]);
+        engine.advance(2).unwrap();
+        assert_eq!(engine.get_valid_tokens(), vec![0]);
+    }
+
+    #[test]
+    fn test_min_length_outside_pattern_lengths_is_rejected() {
+        let vocab = || vec![b"\"".to_vec(), b"A".to_vec()];
+        // string lengths count bytes here, so only ASCII cases are listed.
+        for (schema, accepted) in [
+            (
+                r#"{"type":"string","pattern":"^[A-Z]{3}$","minLength":5}"#,
+                false,
+            ),
+            // lengths 1 and 4 match, but none in 2..=3.
+            (
+                r#"{"type":"string","pattern":"^(A|BBBB)$","minLength":2,"maxLength":3}"#,
+                false,
+            ),
+            (
+                r#"{"type":"string","pattern":"^(A|BBBB)$","minLength":2,"maxLength":4}"#,
+                true,
+            ),
+            // anything may follow the match.
+            (r#"{"type":"string","pattern":"^AB.*","minLength":5}"#, true),
+        ] {
+            assert_eq!(
+                JsonEngine::new(vocab(), schema).is_ok(),
+                accepted,
+                "{schema}"
+            );
+        }
     }
 
     #[test]
