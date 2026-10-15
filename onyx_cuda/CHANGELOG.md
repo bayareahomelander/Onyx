@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+### Fixes
+
+- A schema type list that names `integer` before `number`, such as
+  `["integer", "number"]`, now allows fractions and exponents. A digit
+  previously started an integer-only number, so values such as `2.25` could
+  not be generated. `["number", "integer"]` was not affected.
+
 ## 0.1.3 - 2026-10-15
 
 A fix for schema strings that could end generation with an error partway

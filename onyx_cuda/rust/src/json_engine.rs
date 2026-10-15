@@ -897,6 +897,15 @@ impl JsonEngine {
         // find which types match this byte
         for schema_type in &schema_types {
             if byte_matches_type(byte, schema_type) {
+                // a digit opens one number, which keeps the fraction and
+                // exponent "number" allows even when "integer" is listed first
+                let schema_type = if *schema_type == SchemaType::Integer
+                    && schema_types.contains(&SchemaType::Number)
+                {
+                    &SchemaType::Number
+                } else {
+                    schema_type
+                };
                 return push_scope_for_type(stack, schema_type, byte, item_bp);
             }
         }
@@ -1971,6 +1980,28 @@ mod tests {
         engine.advance(1).unwrap(); // '}'
 
         assert!(engine.is_finished());
+    }
+
+    #[test]
+    fn test_union_type_with_number_allows_fractions() {
+        // "integer" listed before "number" must not drop the fraction and
+        // exponent that "number" allows.
+        for types in [
+            r#"["integer", "number"]"#,
+            r#"["number", "integer"]"#,
+            r#"["integer", "null", "number"]"#,
+        ] {
+            let schema = format!(r#"{{"type": {types}}}"#);
+            for doc in ["2.25", "-0.5", "1e5", "7"] {
+                assert!(accepts_complete(&schema, doc), "{types} {doc}");
+            }
+        }
+        let schema = r#"{"type": ["integer", "null"]}"#;
+        assert_eq!(rejected_at(schema, "2.25"), Some(1));
+        assert!(accepts_complete(schema, "7"));
+        let property =
+            r#"{"type": "object", "properties": {"a": {"type": ["integer", "number"]}}}"#;
+        assert!(accepts_complete(property, r#"{"a":-0.5}"#));
     }
 
     #[test]

@@ -176,6 +176,27 @@ def test_key_character_encodings_remain_completable(key, document, chunk_size):
     Draft202012Validator(schema).validate(json.loads(document))
 
 
+@pytest.mark.parametrize("types,document,expected", [
+    (["integer", "number"], "2.25", True),
+    (["number", "integer"], "2.25", True),
+    (["integer", "null", "number"], "-0.5e3", True),
+    (["integer", "number"], "7", True),
+    (["integer", "null"], "2.25", False),
+])
+@pytest.mark.parametrize("in_object", [False, True])
+def test_union_type_with_number_allows_fractions(types, document, expected, in_object):
+    # A digit opens one number; "integer" listed before "number" must not
+    # drop the fraction and exponent that "number" allows, at the root or
+    # as a property value.
+    schema = {"type": types}
+    if in_object:
+        schema = {"type": "object", "properties": {"a": schema}, "required": ["a"]}
+        document = '{"a":' + document + "}"
+    for chunk_size in [None, 1]:
+        assert accepts(schema, document, chunk_size) is expected
+    assert Draft202012Validator(schema).is_valid(json.loads(document)) is expected
+
+
 ALPHABET = "ABXé🚀"
 
 
