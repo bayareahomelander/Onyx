@@ -96,6 +96,28 @@ def test_pattern_prefix_can_finish_within_max_length(pattern, maximum, prefix, t
         constraint.release_states([initial, state])
 
 
+@pytest.mark.parametrize("pattern", [None, "B"])
+@pytest.mark.parametrize("prefix,token,expected", [
+    (b'"', b'\\uDC', False),  # every completion is a lone low surrogate
+    (b'"', b'\\uD83D', True),
+    (b'"\\uD83D', b'\\uDC', True),
+    (b'"\\uD83D', b'\\uD8', False),
+    (b'"\\uD83D', b'\\u0', False),
+    (b'"\\uD83D', b'A', False),
+    (b'"\\uD83D\\uDC', b'A', True),
+])
+def test_partial_escape_must_still_encode_a_character(pattern, prefix, token, expected):
+    schema = {"type": "string"} if pattern is None else {"type": "string", "pattern": pattern}
+    constraint = _rust.GrammarConstraint([prefix, token])
+    constraint.compile_json_schema(json.dumps(schema))
+    initial = constraint.init_state()
+    state = constraint.advance_state(initial, 0)
+    try:
+        assert (1 in constraint.get_valid_token_ids(state)) is expected
+    finally:
+        constraint.release_states([initial, state])
+
+
 @pytest.mark.parametrize("chunk_size", [None, 1, 2])
 @pytest.mark.parametrize("pattern,maximum,document", [
     ("AB", 2, '"AB"'),

@@ -204,20 +204,28 @@ impl StringState {
             .is_some_and(|prefix| prefix.eq_ignore_ascii_case(&self.pending))
     }
 
-    fn can_complete_pattern(&self) -> bool {
-        let (Some(pattern), Some(state)) = (&self.pattern, self.dfa_state) else {
-            return true;
-        };
+    /// Whether the string can still close: an unfinished character must still
+    /// encode some scalar, and with a pattern one after which a match of an
+    /// allowed length stays reachable.
+    fn can_complete(&self) -> bool {
+        let pattern = self.pattern.as_ref().zip(self.dfa_state);
         if self.pending.is_empty() {
-            return pattern.can_finish(state, self.char_count);
+            return pattern.map_or(true, |(pattern, state)| {
+                pattern.can_finish(state, self.char_count)
+            });
         }
-        self.pending_character_ranges().into_iter().any(|(low, high)| {
-            pattern.can_finish_after_character(state, low, high, self.char_count)
-        })
+        let ranges = self.pending_character_ranges();
+        match pattern {
+            Some((pattern, state)) => ranges.into_iter().any(|(low, high)| {
+                pattern.can_finish_after_character(state, low, high, self.char_count)
+            }),
+            None => !ranges.is_empty(),
+        }
     }
 
-    /// Scalar ranges still encodable by this unfinished JSON character. The
-    /// pattern consumes decoded Unicode, so escape bytes do not spend length.
+    /// Scalar ranges still encodable by this unfinished JSON character; empty
+    /// when it can encode none, such as a lone low surrogate. The pattern
+    /// consumes decoded Unicode, so escape bytes do not spend length.
     fn pending_character_ranges(&self) -> Vec<(u32, u32)> {
         fn hex_range(digits: &[u8]) -> (u32, u32) {
             let prefix = digits.iter().fold(0, |value, &byte| {
@@ -256,6 +264,7 @@ impl StringState {
                     0x10000 + ((last - 0xd800) << 10) + 0x3ff,
                 ));
             }
+            ranges.retain(|&(low, high)| low <= high);
             return ranges;
         }
         // A completed high surrogate is pending until its low surrogate ends.
@@ -308,7 +317,7 @@ impl StringState {
                 }
             }
             StringStep::Pending => {
-                if !self.can_complete_pattern() {
+                if !self.can_complete() {
                     return None;
                 }
             }
@@ -746,7 +755,7 @@ impl JsonEngine {
                         } else {
                             StringState::new_started()
                         };
-                        if !string_state.can_complete_pattern() {
+                        if !string_state.can_complete() {
                             return false;
                         }
                         stack.push(Scope::String(string_state));
@@ -2113,6 +2122,77 @@ mod tests {
             (r#"{"type":"string","pattern":"^AB","minLength":5}"#, true),
         ] {
             assert_eq!(JsonEngine::new(vocab(), schema).is_ok(), accepted, "{schema}");
+        }
+    }
+
+    fn feed_bytes(schema: &str, doc: impl AsRef<[u8]>) -> Result<JsonEngine, usize> {
+        let vocab = (0..=255u8).map(|b| vec![b]).collect();
+        let mut engine = JsonEngine::new(vocab, schema).unwrap();
+        for (offset, &byte) in doc.as_ref().iter().enumerate() {
+            if !engine.get_valid_tokens().contains(&(byte as usize)) {
+                return Err(offset);
+            }
+            engine.advance(byte as usize).unwrap();
+        }
+        Ok(engine)
+    }
+
+    fn rejected_at(schema: &str, doc: impl AsRef<[u8]>) -> Option<usize> {
+        feed_bytes(schema, doc).err()
+    }
+
+    fn accepts_complete(schema: &str, doc: impl AsRef<[u8]>) -> bool {
+        feed_bytes(schema, doc).is_ok_and(|engine| engine.is_finished())
+    }
+
+    #[test]
+    fn test_invalid_string_contents_are_rejected() {
+        let string = r#"{"type":"string"}"#;
+        for (doc, offset) in [
+            (&br#""\x""#[..], 2),
+            (br#""\u00G0""#, 5),
+            // A low surrogate cannot stand alone, and a high one needs one
+            // next; refused at the first byte that leaves no scalar to encode.
+            (br#""\uDC00""#, 4),
+            (br#""\uD800x""#, 7),
+            (br#""\uD800\u0041""#, 9),
+            // Raw control characters must be escaped.
+            (b"\"a\nb\"", 2),
+            // Invalid UTF-8: a continuation byte alone, and an overlong lead.
+            (b"\"\x80\"", 1),
+            (b"\"\xc0\xaf\"", 1),
+            (b"\"\xed\xa0\x80\"", 2),
+        ] {
+            assert_eq!(rejected_at(string, doc), Some(offset), "{doc:?}");
+        }
+        assert!(accepts_complete(string, r#""\u00e9\uD83D\uDE80é🚀""#));
+    }
+
+    #[test]
+    fn test_partial_escape_must_still_encode_a_character() {
+        // Every completion of these prefixes is a lone surrogate, which no
+        // string may hold, so offering them would leave no valid next token.
+        for schema in [r#"{"type":"string"}"#, r#"{"type":"string","pattern":"B"}"#] {
+            for (prefix, token, expected) in [
+                (&br#"""#[..], &br"\uDC"[..], false),
+                (br#"""#, br"\uD", true),
+                (br#"""#, br"\uD83D", true),
+                (br#""\uD83D"#, br"\", true),
+                (br#""\uD83D"#, br"\uDC", true),
+                (br#""\uD83D"#, br"\uD8", false),
+                (br#""\uD83D"#, br"\u0", false),
+                (br#""\uD83D"#, b"A", false),
+                (br#""\uD83D\uDC"#, b"A", true),
+            ] {
+                let mut engine =
+                    JsonEngine::new(vec![prefix.to_vec(), token.to_vec()], schema).unwrap();
+                engine.advance(0).unwrap();
+                assert_eq!(
+                    engine.get_valid_tokens().contains(&1),
+                    expected,
+                    "{schema} {prefix:?} {token:?}"
+                );
+            }
         }
     }
 

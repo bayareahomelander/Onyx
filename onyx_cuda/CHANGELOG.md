@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+### Fixes
+
+- A schema string no longer accepts a partial `\u` escape that can only end
+  as a lone surrogate. In a string without a `pattern`, generation could
+  previously write `\uDC` and another hex digit, after which no token was
+  valid, and the request ended with an error. Strings with a `pattern`
+  already refused these escapes.
+
 ## 0.1.2 - 2026-10-14
 
 A fix for schema strings that combine `pattern` with `minLength`, and the
