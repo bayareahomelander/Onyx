@@ -26,7 +26,7 @@ from onyx_cuda.config import (reject_removed_settings, resolve_model_selection,
                               resolve_service_limits)
 
 MODEL_ID = "onyx-speculative"
-SERVICE_VERSION = "0.1.1"
+SERVICE_VERSION = "0.1.2"
 GAMMA = DEFAULT_GAMMA
 # Default service envelope validated on the 22 GiB server; configurable at startup.
 MAX_OUTPUT_TOKENS = DEFAULT_OUTPUT_TOKENS

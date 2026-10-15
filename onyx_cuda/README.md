@@ -159,4 +159,4 @@ docs/          API reference and performance details
 
 ## License
 
-[MIT](../LICENSE).
+[MIT](LICENSE).

@@ -1,6 +1,10 @@
 # Changelog
 
-## Unreleased
+## 0.1.2 - 2026-10-14
+
+A fix for schema strings that combine `pattern` with `minLength`, and the
+license text in the source package. Models, defaults, and request fields are
+unchanged.
 
 ### Fixes
 
@@ -11,6 +15,25 @@
   cannot match within its `minLength` and `maxLength`, such as `^[A-Z]{3}$`
   with `minLength: 5`, now returns HTTP 400. This removes the known limitation
   listed for 0.1.1.
+
+### Packaging
+
+- The source distribution now includes the MIT license text, and the
+  package README links to it. Before, the package declared the MIT license
+  but shipped without the file.
+
+### Validation
+
+- The full suite passed all 902 tests on a Linux RTX 2080 Ti (22 GiB) on
+  October 14, 2026, with 53 native Rust tests. A test review removed checks
+  that could not fail and one duplicate test; no coverage changed.
+- Greedy output that completed before is unchanged. The benchmark was not
+  rerun.
+
+### Known limitations
+
+- The 0.1.0 limitations still apply. The accepted request fields they refer
+  to are listed in `docs/api.md`.
 
 ## 0.1.1 - 2026-10-13
 
