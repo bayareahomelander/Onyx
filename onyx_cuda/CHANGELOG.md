@@ -1,6 +1,9 @@
 # Changelog
 
-## Unreleased
+## 0.1.3 - 2026-10-15
+
+A fix for schema strings that could end generation with an error partway
+through an escape. Models, defaults, and request fields are unchanged.
 
 ### Fixes
 
@@ -9,6 +12,33 @@
   previously write `\uDC` and another hex digit, after which no token was
   valid, and the request ended with an error. Strings with a `pattern`
   already refused these escapes.
+
+### Validation
+
+- The full suite passed all 916 tests on a Linux RTX 2080 Ti (22 GiB) on
+  October 15, 2026, with 55 native Rust tests.
+- Greedy output that completed before is unchanged. The benchmark was not
+  rerun.
+
+### Known limitations
+
+- The default model pair needs about 22 GiB of VRAM. Quantization and CPU or
+  disk offload are not supported.
+- Graph recovery is qualified only on a Linux RTX 2080 Ti; elsewhere it falls
+  back to scalar recovery. Draft graphs have not been validated on a Windows GPU.
+- Positive temperature samples from the target alone, without speculation.
+- The API is not a drop-in OpenAI replacement: unsupported request fields
+  return HTTP 422. `docs/api.md` lists the accepted fields.
+- A `regex` uses Rust regex syntax, in which `\d` and `\w` also match non-ASCII
+  digits and letters. A schema `pattern` accepts a portable subset, listed in
+  `docs/api.md`, with ASCII `\d` and `\w` as JSON Schema specifies. Neither
+  supports lookaround or backreferences; they return HTTP 400.
+- One inference worker serves trusted local clients; there is no
+  authentication.
+- The `/demo` page loads its fonts from Google Fonts and falls back to system
+  fonts offline.
+- No prebuilt wheels are published. Source builds need Rust, plus the MSVC
+  toolchain on Windows.
 
 ## 0.1.2 - 2026-10-14
 

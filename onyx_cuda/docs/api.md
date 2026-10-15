@@ -38,10 +38,17 @@ keywords, such as `$ref`, `oneOf`, `format`, or `minimum`, are rejected rather
 than ignored. Generated objects contain only declared properties, however
 `additionalProperties` is set. A schema `pattern` matches anywhere in the
 string, as JSON Schema specifies, while a `regex` constraint must match the
-whole output. Both allow only tokens after which a match is still reachable,
-and for a `pattern` only at a length within the string's `minLength` and
-`maxLength`. A `regex` that can never match, or a `pattern` that cannot match
-within its string's `minLength` and `maxLength`, is rejected before generation.
+whole output. A `regex` uses Rust regex syntax, in which `\d` and `\w` also
+match non-ASCII digits and letters. A `pattern` accepts a portable subset with
+JSON Schema's meanings: `\d` and `\w` are ASCII, and `.` does not match line
+breaks. Escapes other than `\d`, `\D`, `\w`, `\W`, `\n`, `\r`, `\t`, `\f`, and
+escaped punctuation (such as `\s`), character-class set operations, nested
+classes, and groups other than ordinary and noncapturing ones are rejected.
+Neither form supports lookaround or backreferences. Both allow only tokens
+after which a match is still reachable, and for a `pattern` only at a length
+within the string's `minLength` and `maxLength`. A `regex` that can never
+match, or a `pattern` that cannot match within its string's `minLength` and
+`maxLength`, is rejected before generation.
 
 ## Streaming and metrics
 

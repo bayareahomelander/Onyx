@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "onyx-cuda"
-version = "0.1.2"
+version = "0.1.3"
 description = "NVIDIA CUDA implementation of Onyx for Windows and Linux"
 readme = "README.md"
 license = "MIT"
