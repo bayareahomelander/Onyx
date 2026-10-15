@@ -68,6 +68,10 @@ The default Mac model pair remains the 4-bit 0.5B draft / 1.5B target. Selecting
 `onyx-speculative-8b` loads the 8B target lazily. Both API modes still use gamma 4.
 These API changes do **not** alter the independent CUDA service contract.
 
+`stop` cannot be combined with `regex` or `json_schema` and returns HTTP 422,
+as on CUDA: the constraint decides when output is complete. Set
+`ONYX_API_DOCS=0` before startup to turn off the interactive API docs at `/docs`.
+
 For Mac development tests, install `python -m pip install -e ".[server,dev]"`
 and run `python -m pytest tests`. The HTTP contract tests use fake engines;
 the generation-loop unit tests use simulated MLX operations. They do not

@@ -63,6 +63,11 @@ class ChatCompletionRequest(BaseModel):
     def validate_options(self):
         if self.regex is not None and self.json_schema is not None:
             raise ValueError("Specify either regex or json_schema, not both")
+        # Truncating at a stop string could cut constrained output short.
+        if self.stop and self.regex is not None:
+            raise ValueError("stop is unsupported with regex output; the regex determines completion")
+        if self.stop and self.json_schema is not None:
+            raise ValueError("stop is unsupported with JSON output; the schema determines completion")
         if self.__dict__["compact_json"]:
             raise ValueError("compact_json=true is no longer supported; format JSON in the client")
         return self
@@ -441,4 +446,4 @@ async def create_chat_completion(request: ChatCompletionRequest):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="127.0.0.1", port=8000)

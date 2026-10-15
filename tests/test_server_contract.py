@@ -59,6 +59,7 @@ def payload(**kwargs):
     {"compact_json": True}, {"compact_json": None},
     {"stop": [""]}, {"stop": "END"}, {"stream": None},
     {"regex": "x", "json_schema": {}}, {"unsupported": True},
+    {"regex": "x", "stop": ["END"]}, {"json_schema": {}, "stop": ["END"]},
 ])
 def test_invalid_options_fail_before_generation(api, options):
     _, client, _, calls, _, _ = api
@@ -76,7 +77,7 @@ def chunks(response):
 def test_stream_and_collected_contract_match(api, reason):
     _, client, _, calls, closed, metrics = api
     metrics["finish_reason"] = reason
-    options = payload(json_schema={}, stop=["END"], temperature=0, top_p=0.5,
+    options = payload(json_schema={}, temperature=0, top_p=0.5,
                       compact_json=False, n=1, max_tokens=3)
     collected = client.post("/v1/chat/completions", json=options).json()
     streamed = client.post("/v1/chat/completions", json={**options, "stream": True})
@@ -86,7 +87,7 @@ def test_stream_and_collected_contract_match(api, reason):
     assert "".join(e["choices"][0]["delta"].get("content") or "" for e in events) == "abc"
     assert calls[0] == calls[1]
     assert calls[0]["json_schema"] == "{}"
-    assert calls[0]["stop_tokens"] == [[9], [7, 8]]
+    assert calls[0]["stop_tokens"] == [[9]]
     assert calls[0]["temperature"] == 0
     assert closed == [True]
 
