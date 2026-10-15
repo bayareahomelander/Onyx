@@ -6,6 +6,7 @@ encode. The oracles below therefore use an independent JSON Schema validator.
 """
 import itertools
 import json
+import re
 
 import pytest
 from jsonschema import Draft202012Validator
@@ -329,12 +330,66 @@ def test_unsatisfiable_patterns_fail_to_compile(schema):
         GrammarConstraint([b'"', b"A"]).compile_json_schema(json.dumps(schema))
 
 
-@pytest.mark.parametrize("pattern", ["(", "a)|(b", r"(?<=a)b"])
+@pytest.mark.parametrize("pattern", ["(", "a)|(b", "[z-a]"])
 def test_uncompilable_patterns_fail_to_compile(pattern):
     # A pattern that cannot compile must not leave the string unconstrained.
     with pytest.raises(ValueError, match="Failed to compile regex"):
         GrammarConstraint([b'"', b"A"]).compile_json_schema(
             json.dumps({"type": "string", "pattern": pattern}))
+
+
+@pytest.mark.parametrize("pattern,message", [
+    (r"\s", r"unsupported escape \s"),
+    (r"a\b", r"unsupported escape \b"),
+    (r"(a)\1", r"unsupported escape \1"),
+    (r"\u0041", r"unsupported escape \u"),
+    (r"\p{L}", r"unsupported escape \p"),
+    ("[[a]]", "nested character classes"),
+    ("[a-z&&[^x]]", "set operations are unsupported"),
+    ("(?=x)", "noncapturing groups are supported"),
+    ("(?<=a)b", "noncapturing groups are supported"),
+    ("(?P<n>a)", "noncapturing groups are supported"),
+])
+def test_unsupported_pattern_syntax_fails_to_compile(pattern, message):
+    # Syntax that Rust reads differently from ECMA-262, or that a schema
+    # pattern does not support, fails rather than changing its meaning.
+    for schema in [{"type": "string", "pattern": pattern},
+                   {"type": "array", "items": {"type": "string", "pattern": pattern}}]:
+        with pytest.raises(ValueError, match=re.escape(message)):
+            GrammarConstraint([b'"', b"A"]).compile_json_schema(json.dumps(schema))
+
+
+@pytest.mark.parametrize("pattern,documents", [
+    (r"^\d{2}-\w+$", ["12-ab_", "12-", "1a-b", "12-a b"]),
+    (r"^(?:ab)+(c|d)$", ["abd", "ababc", "abac", "c"]),
+    (r"^\.\/\-\$[.]$", ["./-$.", "./-$x", "x/-$."]),
+    (r"[\w.-]+@\w+", ["a.b-c@d", "@d", "x a@b y"]),
+    (r"^\t\f?$", ["\t", "\t\f", "t"]),
+])
+def test_portable_pattern_syntax_matches_independent_validator(pattern, documents):
+    schema = {"type": "string", "pattern": pattern}
+    validator = Draft202012Validator(schema)
+    for text in documents:
+        assert accepts(schema, json.dumps(text)) == validator.is_valid(text), text
+
+
+@pytest.mark.parametrize("pattern,document,expected", [
+    (r"^\d\w[\d]$", '"7_7"', True),
+    (r"^\d$", '"٣"', False),
+    (r"^[\d]$", '"٣"', False),
+    (r"^\w$", '"é"', False),
+    (r"^\D\W$", '"٣é"', True),
+    (r"^a.b$", '"aéb"', True),
+    (r"^a.b$", '"a🚀b"', True),
+    (r"^a.b$", r'"a\rb"', False),
+    (r"^a.b$", r'"a\u2028b"', False),
+    (r"^a.b$", b'"a\xe2\x80\xa9b"', False),
+])
+def test_pattern_classes_and_dot_follow_json_schema(pattern, document, expected):
+    # Python's re, and so jsonschema, differs here: its \d and \w also match
+    # other scripts' digits and letters, and its . matches \r and U+2028.
+    for chunk_size in [None, 1]:
+        assert accepts({"type": "string", "pattern": pattern}, document, chunk_size) == expected
 
 
 @pytest.mark.parametrize("schema", [

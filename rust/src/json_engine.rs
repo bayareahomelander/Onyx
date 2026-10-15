@@ -2031,7 +2031,7 @@ mod tests {
     #[test]
     fn test_uncompilable_pattern_is_rejected() {
         // `a)|(b` is unbalanced; spliced into a wrapper it would compile.
-        for pattern in ["(", "a)|(b", r"(?<=a)b", r"\p{NotAClass}"] {
+        for pattern in ["(", "a)|(b", "[z-a]"] {
             let schema = serde_json::json!({"type": "string", "pattern": pattern}).to_string();
             let error = JsonEngine::new(vec![b"\"".to_vec()], &schema)
                 .err()
@@ -2041,6 +2041,77 @@ mod tests {
                 "{pattern}: {error}"
             );
         }
+    }
+
+    #[test]
+    fn test_unsupported_pattern_syntax_is_rejected() {
+        // syntax that Rust reads differently from ECMA-262, or that a schema
+        // pattern does not support, fails rather than changing its meaning.
+        for (pattern, message) in [
+            (r"\s", r"unsupported escape \s"),
+            (r"a\b", r"unsupported escape \b"),
+            (r"(a)\1", r"unsupported escape \1"),
+            (r"\u0041", r"unsupported escape \u"),
+            (r"\p{L}", r"unsupported escape \p"),
+            (r"\x41", r"unsupported escape \x"),
+            (r"a\", "unfinished escape"),
+            ("[[a]]", "nested character classes"),
+            ("[a-z&&[^x]]", "set operations are unsupported"),
+            ("[a--b]", "set operations are unsupported"),
+            ("[a~~b]", "set operations are unsupported"),
+            ("(?=x)", "noncapturing groups are supported"),
+            ("(?<=a)b", "noncapturing groups are supported"),
+            ("(?P<n>a)", "noncapturing groups are supported"),
+            ("(?i)a", "noncapturing groups are supported"),
+        ] {
+            let schema = serde_json::json!({"type": "string", "pattern": pattern}).to_string();
+            let error = JsonEngine::new(vec![b"\"".to_vec()], &schema)
+                .err()
+                .unwrap_or_else(|| panic!("{pattern} compiled"));
+            assert!(error.to_string().contains(message), "{pattern}: {error}");
+        }
+    }
+
+    #[test]
+    fn test_pattern_shorthand_classes_are_ascii() {
+        let schema =
+            |pattern: &str| serde_json::json!({"type": "string", "pattern": pattern}).to_string();
+        assert!(accepts_complete(&schema(r"^\d\w[\d]$"), r#""7_7""#));
+        // other scripts' digits and letters are `\D` and `\W`, as in ECMA-262.
+        assert_eq!(rejected_at(&schema(r"^\d$"), r#""٣""#), Some(1));
+        assert_eq!(rejected_at(&schema(r"^[\d]$"), r#""٣""#), Some(1));
+        assert_eq!(rejected_at(&schema(r"^\w$"), r#""é""#), Some(1));
+        assert!(accepts_complete(&schema(r"^\D\W$"), r#""٣é""#));
+        assert_eq!(rejected_at(&schema(r"^\D$"), r#""7""#), Some(1));
+        assert_eq!(rejected_at(&schema(r"^\W$"), r#""_""#), Some(1));
+    }
+
+    #[test]
+    fn test_pattern_dot_excludes_line_terminators() {
+        let dot = serde_json::json!({"type": "string", "pattern": "^a.b$"}).to_string();
+        for doc in [r#""a\tb""#, r#""aéb""#, r#""a🚀b""#, r#""a.b""#] {
+            assert!(accepts_complete(&dot, doc), "{doc}");
+        }
+        assert_eq!(rejected_at(&dot, r#""a\nb""#), Some(3));
+        assert_eq!(rejected_at(&dot, r#""a\rb""#), Some(3));
+        assert_eq!(rejected_at(&dot, b"\"a\xe2\x80\xa8b\""), Some(4));
+        assert_eq!(rejected_at(&dot, b"\"a\xe2\x80\xa9b\""), Some(4));
+        assert_eq!(rejected_at(&dot, r#""a\u2028b""#), Some(7));
+        assert_eq!(rejected_at(&dot, r#""a\u2029b""#), Some(7));
+    }
+
+    #[test]
+    fn test_portable_pattern_syntax_keeps_its_meaning() {
+        let schema =
+            |pattern: &str| serde_json::json!({"type": "string", "pattern": pattern}).to_string();
+        let groups = schema("^(?:ab)+(c|d)$");
+        assert!(accepts_complete(&groups, r#""ababd""#));
+        assert_eq!(rejected_at(&groups, r#""abac""#), Some(4));
+        // escaped punctuation is itself, and `.` in a class is literal.
+        let punctuation = schema(r"^\.\/\-\$\[\]\{\}[.]$");
+        assert!(accepts_complete(&punctuation, r#""./-$[]{}.""#));
+        assert_eq!(rejected_at(&punctuation, r#""./-$[]{}x""#), Some(9));
+        assert!(accepts_complete(&schema(r"^\t\f$"), r#""\t\f""#));
     }
 
     #[test]
@@ -2064,7 +2135,7 @@ mod tests {
         for (pattern, doc) in [
             (r"^\n$", r#""\n""#),
             (r"^\t\r$", r#""\t\r""#),
-            (r"^\x08\x0C$", r#""\b\f""#),
+            ("^\x08\\f$", r#""\b\f""#),
             (r#"^"\\/$"#, r#""\"\\\/""#),
             ("^A$", r#""\u0041""#),
             ("^é$", r#""\u00E9""#),

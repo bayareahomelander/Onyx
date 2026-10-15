@@ -10,6 +10,62 @@ use std::sync::Arc;
 use crate::constraint::ConstraintError;
 use crate::regex_engine::{compile_pattern_dfa, StringPattern};
 
+/// restrict a schema `pattern` to a portable subset with JSON Schema's
+/// meanings, as onyx_cuda does: `\d` and `\w` are ASCII, `.` excludes line
+/// terminators, and syntax that Rust and ECMA-262 read differently is an
+/// error. returns the Rust regex to compile.
+pub fn schema_pattern(pattern: &str) -> Result<String, String> {
+    let mut normalized = String::new();
+    let mut chars = pattern.chars().peekable();
+    let mut in_class = false;
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\\' => {
+                let escaped = chars.next().ok_or("unfinished escape")?;
+                match escaped {
+                    'd' => normalized.push_str("[0-9]"),
+                    'D' => normalized.push_str("[^0-9]"),
+                    'w' => normalized.push_str("[A-Za-z0-9_]"),
+                    'W' => normalized.push_str("[^A-Za-z0-9_]"),
+                    'n' | 'r' | 't' | 'f' => {
+                        normalized.push('\\');
+                        normalized.push(escaped);
+                    }
+                    c if "\\/.*+?()[]{}^$|-".contains(c) => {
+                        if c != '/' {
+                            normalized.push('\\');
+                        }
+                        normalized.push(c);
+                    }
+                    _ => return Err(format!("unsupported escape \\{escaped}")),
+                }
+            }
+            '[' if in_class => return Err("nested character classes are unsupported".into()),
+            '[' => {
+                in_class = true;
+                normalized.push(ch);
+            }
+            ']' => {
+                in_class = false;
+                normalized.push(ch);
+            }
+            '&' | '-' | '~' if in_class && chars.peek() == Some(&ch) => {
+                return Err("character class set operations are unsupported".into());
+            }
+            '(' if chars.peek() == Some(&'?') => {
+                chars.next();
+                if chars.next() != Some(':') {
+                    return Err("only ordinary and noncapturing groups are supported".into());
+                }
+                normalized.push_str("(?:");
+            }
+            '.' if !in_class => normalized.push_str("[^\\n\\r\\u{2028}\\u{2029}]"),
+            _ => normalized.push(ch),
+        }
+    }
+    Ok(normalized)
+}
+
 /// the type of a JSON schema node
 #[derive(Debug, Clone, PartialEq)]
 pub enum SchemaType {
@@ -147,11 +203,13 @@ impl PropertyBlueprint {
             .and_then(|v| v.as_u64())
             .map(|n| n as usize);
 
-        // parse pattern for string regex constraints; one that cannot compile,
-        // or that no string within the length limits matches, fails the schema.
+        // parse pattern for string regex constraints; one outside the portable
+        // subset, that cannot compile, or that no string within the length
+        // limits matches, fails the schema.
         let mut pattern = None;
         if let Some(source) = value.get("pattern").and_then(|v| v.as_str()) {
-            let compiled = compile_pattern_dfa(source)
+            let compiled = schema_pattern(source)
+                .and_then(|normalized| compile_pattern_dfa(&normalized))
                 .and_then(|compiled| StringPattern::new(compiled, min_length, max_length))
                 .map_err(|e| {
                     ConstraintError::CompilationError(format!(
