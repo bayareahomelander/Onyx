@@ -75,9 +75,9 @@ pub struct PropertyBlueprint {
     /// for strings: compiled pattern with its length limits, shared by parser
     /// clones and repeated array items
     pub pattern: Option<Arc<StringPattern>>,
-    /// for strings: min char count
+    /// for strings: min unicode character count
     pub min_length: Option<usize>,
-    /// for strings: max char count
+    /// for strings: max unicode character count
     pub max_length: Option<usize>,
     /// for arrays: min item count
     pub min_items: Option<usize>,
@@ -147,20 +147,19 @@ impl PropertyBlueprint {
             .and_then(|v| v.as_u64())
             .map(|n| n as usize);
 
-        // parse pattern for string regex constraints; one the DFA builder
-        // rejects leaves the string unconstrained.
+        // parse pattern for string regex constraints; one that cannot compile,
+        // or that no string within the length limits matches, fails the schema.
         let mut pattern = None;
         if let Some(source) = value.get("pattern").and_then(|v| v.as_str()) {
-            if let Ok(compiled) = compile_pattern_dfa(source) {
-                let compiled =
-                    StringPattern::new(compiled, min_length, max_length).map_err(|e| {
-                        ConstraintError::CompilationError(format!(
-                            "Invalid JSON schema: {}: {:?}",
-                            e, source
-                        ))
-                    })?;
-                pattern = Some(Arc::new(compiled));
-            }
+            let compiled = compile_pattern_dfa(source)
+                .and_then(|compiled| StringPattern::new(compiled, min_length, max_length))
+                .map_err(|e| {
+                    ConstraintError::CompilationError(format!(
+                        "Invalid JSON schema: {}: {:?}",
+                        e, source
+                    ))
+                })?;
+            pattern = Some(Arc::new(compiled));
         }
 
         // parse array length constraints

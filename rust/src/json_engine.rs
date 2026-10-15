@@ -31,16 +31,24 @@ pub enum ObjectSyntaxState {
     ExpectCommaOrEnd,
 }
 
+/// one byte of a json string: a decoded character, part of an unfinished
+/// escape or UTF-8 sequence, or the closing quote
+enum StringStep {
+    Pending,
+    Character(char),
+    End,
+}
+
 /// state for parsing a json string value
 #[derive(Debug, Clone)]
 pub struct StringState {
-    /// in escape sequence
-    in_escape: bool,
+    /// bytes of an unfinished escape or UTF-8 sequence
+    pending: Vec<u8>,
     /// compiled pattern with its length limits
     pattern: Option<Arc<StringPattern>>,
     /// current dfa state
     dfa_state: Option<StateID>,
-    /// chars consumed so far
+    /// unicode characters decoded so far
     char_count: usize,
     /// min chars required
     min_length: Option<usize>,
@@ -52,7 +60,7 @@ impl StringState {
     /// new string state with opening quote seen
     pub fn new_started() -> Self {
         StringState {
-            in_escape: false,
+            pending: Vec::new(),
             pattern: None,
             dfa_state: None,
             char_count: 0,
@@ -76,29 +84,189 @@ impl StringState {
         }
     }
 
-    /// feed one byte to the pattern. a byte after which no match of an
-    /// allowed length is reachable is refused: the string could never close.
-    fn advance_pattern(&mut self, byte: u8) -> bool {
-        let (Some(pattern), Some(state)) = (&self.pattern, &mut self.dfa_state) else {
-            return true;
-        };
-        let next = pattern.dfa.next_state(*state, byte);
-        if !pattern.can_finish(next, self.char_count + 1) {
-            return false;
+    /// decode one byte of the string's JSON text; None when it is not valid
+    /// JSON: a raw control character, invalid UTF-8, or a bad escape.
+    fn decode_byte(&mut self, byte: u8) -> Option<StringStep> {
+        if self.pending.is_empty() {
+            return match byte {
+                b'"' => Some(StringStep::End),
+                b'\\' | 0xc2..=0xf4 => {
+                    self.pending.push(byte);
+                    Some(StringStep::Pending)
+                }
+                0x20..=0x7f => Some(StringStep::Character(byte as char)),
+                _ => None,
+            };
         }
-        *state = next;
-        true
+        self.pending.push(byte);
+        let character = if self.pending[0] == b'\\' {
+            match self.pending.len() {
+                2 => match byte {
+                    b'"' | b'\\' | b'/' => byte as char,
+                    b'b' => '\x08',
+                    b'f' => '\x0c',
+                    b'n' => '\n',
+                    b'r' => '\r',
+                    b't' => '\t',
+                    b'u' => return Some(StringStep::Pending),
+                    _ => return None,
+                },
+                // the hex digits of one Unicode escape, or of a surrogate
+                // pair's second escape
+                3..=6 | 9..=12 => {
+                    if !byte.is_ascii_hexdigit() {
+                        return None;
+                    }
+                    let length = self.pending.len();
+                    if length != 6 && length != 12 {
+                        return Some(StringStep::Pending);
+                    }
+                    let first = hex_value(&self.pending[2..6]);
+                    if length == 6 {
+                        // a high surrogate waits for its low surrogate
+                        if (0xd800..=0xdbff).contains(&first) {
+                            return Some(StringStep::Pending);
+                        }
+                        char::from_u32(first)?
+                    } else {
+                        let second = hex_value(&self.pending[8..12]);
+                        if !(0xdc00..=0xdfff).contains(&second) {
+                            return None;
+                        }
+                        char::from_u32(0x10000 + ((first - 0xd800) << 10) + (second - 0xdc00))?
+                    }
+                }
+                7 if byte == b'\\' => return Some(StringStep::Pending),
+                8 if byte == b'u' => return Some(StringStep::Pending),
+                _ => return None,
+            }
+        } else {
+            match std::str::from_utf8(&self.pending) {
+                Ok(text) => text.chars().next()?,
+                Err(error) if error.error_len().is_none() => return Some(StringStep::Pending),
+                Err(_) => return None,
+            }
+        };
+        self.pending.clear();
+        Some(StringStep::Character(character))
     }
 
-    /// whether the byte an escape feeds to the pattern can keep it reachable.
-    fn can_escape(&self) -> bool {
-        match (&self.pattern, self.dfa_state) {
-            (Some(pattern), Some(state)) => {
-                pattern.can_finish_after_any_byte(state, self.char_count)
+    /// scalar ranges this unfinished escape or UTF-8 sequence can still
+    /// encode; empty when it can encode none, such as a lone low surrogate.
+    fn pending_character_ranges(&self) -> Vec<(u32, u32)> {
+        fn hex_range(digits: &[u8]) -> (u32, u32) {
+            let bits = 4 * (4 - digits.len() as u32);
+            let prefix = hex_value(digits) << bits;
+            (prefix, prefix | ((1 << bits) - 1))
+        }
+
+        if self.pending[0] != b'\\' {
+            let (width, mask, minimum) = match self.pending[0] {
+                0xc2..=0xdf => (2, 0x1f, 0x80),
+                0xe0..=0xef => (3, 0x0f, 0x800),
+                _ => (4, 0x07, 0x10000),
+            };
+            let prefix = self.pending[1..]
+                .iter()
+                .fold((self.pending[0] & mask) as u32, |value, &byte| {
+                    (value << 6) | (byte & 0x3f) as u32
+                });
+            let bits = 6 * (width - self.pending.len() as u32);
+            let low = prefix << bits;
+            return vec![(low.max(minimum), (low | ((1 << bits) - 1)).min(0x10ffff))];
+        }
+        // a lone backslash can still begin a Unicode escape for any scalar.
+        if self.pending.len() <= 2 {
+            return vec![(0, 0x10ffff)];
+        }
+        let mut ranges = Vec::new();
+        if self.pending.len() < 6 {
+            let (low, high) = hex_range(&self.pending[2..]);
+            ranges.push((low, high.min(0xd7ff)));
+            ranges.push((low.max(0xe000), high));
+            // high surrogates stand for the supplementary planes.
+            let (first, last) = (low.max(0xd800), high.min(0xdbff));
+            if first <= last {
+                ranges.push((
+                    0x10000 + ((first - 0xd800) << 10),
+                    0x10000 + ((last - 0xd800) << 10) + 0x3ff,
+                ));
             }
-            _ => true,
+        } else {
+            // a complete high surrogate, then its low surrogate's prefix
+            let high = hex_value(&self.pending[2..6]);
+            let (low_first, low_last) = hex_range(self.pending.get(8..).unwrap_or_default());
+            let (first, last) = (low_first.max(0xdc00), low_last.min(0xdfff));
+            let base = 0x10000 + ((high - 0xd800) << 10);
+            ranges.push((base + first - 0xdc00, base + last - 0xdc00));
+        }
+        ranges.retain(|&(low, high)| low <= high);
+        ranges
+    }
+
+    /// whether this unfinished character can still become one after which
+    /// the pattern can close at an allowed length.
+    fn can_complete_pending(&self) -> bool {
+        let ranges = self.pending_character_ranges();
+        match (&self.pattern, self.dfa_state) {
+            (Some(pattern), Some(state)) => ranges.iter().any(|&(low, high)| {
+                pattern.can_finish_after_character(state, low, high, self.char_count)
+            }),
+            _ => !ranges.is_empty(),
         }
     }
+
+    /// consume one byte; None refuses it. a character after which no match
+    /// of an allowed length is reachable is refused: the string could never
+    /// close. escapes feed the pattern the character they encode, as UTF-8,
+    /// and count as one character.
+    fn advance(&mut self, byte: u8) -> Option<StringStep> {
+        if self.pending.is_empty()
+            && byte != b'"'
+            && self.max_length.is_some_and(|max| self.char_count >= max)
+        {
+            return None;
+        }
+        let step = self.decode_byte(byte)?;
+        match step {
+            StringStep::Character(character) => {
+                self.char_count += 1;
+                if let (Some(pattern), Some(state)) = (&self.pattern, &mut self.dfa_state) {
+                    let mut buffer = [0; 4];
+                    for &byte in character.encode_utf8(&mut buffer).as_bytes() {
+                        *state = pattern.dfa.next_state(*state, byte);
+                    }
+                    if !pattern.can_finish(*state, self.char_count) {
+                        return None;
+                    }
+                }
+            }
+            StringStep::End => {
+                if self.min_length.is_some_and(|min| self.char_count < min) {
+                    return None;
+                }
+                if let (Some(pattern), Some(state)) = (&self.pattern, self.dfa_state) {
+                    let eoi_state = pattern.dfa.next_eoi_state(state);
+                    if !pattern.dfa.is_match_state(eoi_state) {
+                        return None;
+                    }
+                }
+            }
+            StringStep::Pending => {
+                if !self.can_complete_pending() {
+                    return None;
+                }
+            }
+        }
+        Some(step)
+    }
+}
+
+/// the value of up to four validated hex digits
+fn hex_value(digits: &[u8]) -> u32 {
+    digits.iter().fold(0, |value, &byte| {
+        (value << 4) | (byte as char).to_digit(16).expect("validated hex digit")
+    })
 }
 
 /// state for parsing a JSON number value
@@ -898,58 +1066,20 @@ impl JsonEngine {
                 }
 
                 Scope::String(state) => {
-                    if state.in_escape {
-                        state.in_escape = false;
-                        // feed escaped byte to dfa
-                        if !state.advance_pattern(byte) {
-                            return false;
-                        }
-                        // count escaped char
-                        state.char_count += 1;
-                        return true;
-                    }
-                    if byte == b'\\' {
-                        if !state.can_escape() {
-                            return false;
-                        }
-                        state.in_escape = true;
-                        return true;
-                    }
-                    if byte == b'"' {
-                        // check minlength
-                        if let Some(min) = state.min_length {
-                            if state.char_count < min {
-                                return false;
+                    // the string state checks minLength, maxLength and the
+                    // pattern as it decodes
+                    match state.advance(byte) {
+                        None => return false,
+                        Some(StringStep::End) => {
+                            // string complete
+                            stack.pop();
+                            if stack.is_empty() {
+                                *finished = true;
                             }
+                            return true;
                         }
-                        // check dfa match state
-                        if let (Some(pattern), Some(dfa_state)) = (&state.pattern, state.dfa_state)
-                        {
-                            let eoi_state = pattern.dfa.next_eoi_state(dfa_state);
-                            if !pattern.dfa.is_match_state(eoi_state) {
-                                return false;
-                            }
-                        }
-                        // string complete
-                        stack.pop();
-                        if stack.is_empty() {
-                            *finished = true;
-                        }
-                        return true;
+                        Some(_) => return true,
                     }
-                    // check maxlength before accepting char
-                    if let Some(max) = state.max_length {
-                        if state.char_count >= max {
-                            return false;
-                        }
-                    }
-                    // validate against dfa
-                    if !state.advance_pattern(byte) {
-                        return false;
-                    }
-                    // count this char
-                    state.char_count += 1;
-                    return true;
                 }
 
                 Scope::Number(state) => {
@@ -1811,12 +1941,128 @@ mod tests {
         let vocab = vec![b"\"".to_vec(), b"A".to_vec(), b"B".to_vec(), b"X".to_vec()];
         let mut engine = JsonEngine::new(vocab, r#"{"type":"string","pattern":"^AB"}"#).unwrap();
         engine.advance(0).unwrap();
+        // after a leading X the string could never match, so never close.
         assert_eq!(engine.get_valid_tokens(), vec![1]);
         engine.advance(1).unwrap();
         engine.advance(2).unwrap();
-        // the pattern must match the whole string, so after "AB" another
-        // character could never close it.
-        assert_eq!(engine.get_valid_tokens(), vec![0]);
+        assert_eq!(engine.get_valid_tokens(), vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn test_pattern_matches_anywhere_in_the_string() {
+        let schema =
+            |pattern: &str| serde_json::json!({"type": "string", "pattern": pattern}).to_string();
+        assert!(accepts_complete(&schema("AB"), r#""XABX""#));
+        assert!(accepts_complete(&schema("^AB"), r#""ABX""#));
+        assert!(accepts_complete(&schema("AB$"), r#""XAB""#));
+        assert_eq!(rejected_at(&schema("AB$"), r#""ABX""#), Some(4));
+        // the search wrapper must not change what the pattern's `.` matches.
+        assert_eq!(rejected_at(&schema("^A.B$"), r#""A\nB""#), Some(3));
+        assert!(accepts_complete(&schema("^A.B$"), r#""A\tB""#));
+    }
+
+    #[test]
+    fn test_uncompilable_pattern_is_rejected() {
+        // `a)|(b` is unbalanced; spliced into a wrapper it would compile.
+        for pattern in ["(", "a)|(b", r"(?<=a)b", r"\p{NotAClass}"] {
+            let schema = serde_json::json!({"type": "string", "pattern": pattern}).to_string();
+            let error = JsonEngine::new(vec![b"\"".to_vec()], &schema)
+                .err()
+                .unwrap_or_else(|| panic!("{pattern} compiled"));
+            assert!(
+                error.to_string().contains("Failed to compile regex"),
+                "{pattern}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_string_lengths_count_characters() {
+        let bounded = r#"{"type":"string","minLength":2,"maxLength":2}"#;
+        assert!(accepts_complete(bounded, r#""éé""#));
+        assert!(accepts_complete(bounded, r#""🚀A""#));
+        assert_eq!(rejected_at(bounded, r#""é""#), Some(3));
+        assert_eq!(rejected_at(bounded, r#""ééé""#), Some(5));
+        // an escape is one character, however many bytes encode it.
+        assert!(accepts_complete(bounded, r#""\u00e9\n""#));
+        let pattern = r#"{"type":"string","pattern":"^é+$","maxLength":2}"#;
+        assert!(accepts_complete(pattern, r#""éé""#));
+        assert_eq!(rejected_at(pattern, r#""ééé""#), Some(5));
+    }
+
+    #[test]
+    fn test_string_escapes_decode_to_the_characters_they_encode() {
+        let schema =
+            |pattern: &str| serde_json::json!({"type": "string", "pattern": pattern}).to_string();
+        for (pattern, doc) in [
+            (r"^\n$", r#""\n""#),
+            (r"^\t\r$", r#""\t\r""#),
+            (r"^\x08\x0C$", r#""\b\f""#),
+            (r#"^"\\/$"#, r#""\"\\\/""#),
+            ("^A$", r#""\u0041""#),
+            ("^é$", r#""\u00E9""#),
+            ("^🚀$", r#""\uD83D\uDE80""#),
+        ] {
+            assert!(accepts_complete(&schema(pattern), doc), "{pattern} {doc}");
+        }
+        // the escaped byte itself is not the character.
+        assert_eq!(rejected_at(&schema("^n$"), r#""\n""#), Some(2));
+        assert_eq!(rejected_at(&schema("^u0041$"), r#""\u0041""#), Some(5));
+    }
+
+    #[test]
+    fn test_invalid_string_contents_are_rejected() {
+        let string = r#"{"type":"string"}"#;
+        for (doc, offset) in [
+            (&br#""\x""#[..], 2),
+            (br#""\u00G0""#, 5),
+            // a low surrogate cannot stand alone, and a high one needs one
+            // next; refused at the first byte that leaves no scalar to encode.
+            (br#""\uDC00""#, 4),
+            (br#""\uD800x""#, 7),
+            (br#""\uD800\u0041""#, 9),
+            // raw control characters must be escaped.
+            (b"\"a\nb\"", 2),
+            // invalid UTF-8: a continuation byte alone, and an overlong lead.
+            (b"\"\x80\"", 1),
+            (b"\"\xc0\xaf\"", 1),
+            (b"\"\xed\xa0\x80\"", 2),
+        ] {
+            assert_eq!(rejected_at(string, doc), Some(offset), "{doc:?}");
+        }
+        assert!(accepts_complete(string, r#""\u00e9\uD83D\uDE80é🚀""#));
+    }
+
+    #[test]
+    fn test_pending_characters_must_keep_the_pattern_reachable() {
+        // a partial escape or UTF-8 sequence is allowed only if some
+        // character it can still become keeps a match reachable.
+        for (pattern, token, expected) in [
+            ("^AB", &br"\"[..], true),
+            ("^AB", br"\u004", true),
+            ("^AB", br"\u005", false),
+            ("^AB", b"\xc3", false),
+            ("^é", b"\xc3", true),
+            ("^é", b"\xc2", false),
+            ("^é", br"\u00E", true),
+            ("^é", br"\u00F", false),
+            ("^🚀", b"\xf0\x9f", true),
+            ("^🚀", b"\xf0\x90", false),
+            ("^🚀", br"\uD83", true),
+            ("^🚀", br"\uD84", false),
+            ("^🚀", br"\uD83D\uDE8", true),
+            ("^🚀", br"\uD83D\uDC", false),
+        ] {
+            let schema = serde_json::json!({"type": "string", "pattern": pattern}).to_string();
+            let mut engine =
+                JsonEngine::new(vec![b"\"".to_vec(), token.to_vec()], &schema).unwrap();
+            engine.advance(0).unwrap();
+            assert_eq!(
+                engine.get_valid_tokens().contains(&1),
+                expected,
+                "{pattern} {token:?}"
+            );
+        }
     }
 
     #[test]
@@ -1837,11 +2083,19 @@ mod tests {
     #[test]
     fn test_min_length_outside_pattern_lengths_is_rejected() {
         let vocab = || vec![b"\"".to_vec(), b"A".to_vec()];
-        // string lengths count bytes here, so only ASCII cases are listed.
         for (schema, accepted) in [
             (
                 r#"{"type":"string","pattern":"^[A-Z]{3}$","minLength":5}"#,
                 false,
+            ),
+            // two characters are four bytes: lengths count characters.
+            (
+                r#"{"type":"string","pattern":"^é{2}$","minLength":3}"#,
+                false,
+            ),
+            (
+                r#"{"type":"string","pattern":"^é{2}$","minLength":2}"#,
+                true,
             ),
             // lengths 1 and 4 match, but none in 2..=3.
             (
@@ -1852,8 +2106,8 @@ mod tests {
                 r#"{"type":"string","pattern":"^(A|BBBB)$","minLength":2,"maxLength":4}"#,
                 true,
             ),
-            // anything may follow the match.
-            (r#"{"type":"string","pattern":"^AB.*","minLength":5}"#, true),
+            // search semantics: anything may follow the match.
+            (r#"{"type":"string","pattern":"^AB","minLength":5}"#, true),
         ] {
             assert_eq!(
                 JsonEngine::new(vocab(), schema).is_ok(),
@@ -1892,10 +2146,10 @@ mod tests {
     /// feed `doc` one byte at a time through a byte-level vocabulary, requiring
     /// each byte to be in the valid token mask before advancing; returns the
     /// engine, or the offset of the first byte the mask rejected
-    fn feed_bytes(schema: &str, doc: &str) -> Result<JsonEngine, usize> {
+    fn feed_bytes(schema: &str, doc: impl AsRef<[u8]>) -> Result<JsonEngine, usize> {
         let vocab = (0..=255u8).map(|b| vec![b]).collect();
         let mut engine = JsonEngine::new(vocab, schema).unwrap();
-        for (offset, &byte) in doc.as_bytes().iter().enumerate() {
+        for (offset, &byte) in doc.as_ref().iter().enumerate() {
             if !engine.get_valid_tokens().contains(&(byte as usize)) {
                 return Err(offset);
             }
@@ -1904,11 +2158,11 @@ mod tests {
         Ok(engine)
     }
 
-    fn rejected_at(schema: &str, doc: &str) -> Option<usize> {
+    fn rejected_at(schema: &str, doc: impl AsRef<[u8]>) -> Option<usize> {
         feed_bytes(schema, doc).err()
     }
 
-    fn accepts_complete(schema: &str, doc: &str) -> bool {
+    fn accepts_complete(schema: &str, doc: impl AsRef<[u8]>) -> bool {
         feed_bytes(schema, doc).is_ok_and(|engine| engine.is_finished())
     }
 

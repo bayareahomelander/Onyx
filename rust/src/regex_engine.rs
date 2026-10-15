@@ -11,8 +11,9 @@ use regex_automata::util::start::Config as StartConfig;
 use regex_automata::util::syntax;
 use regex_automata::Anchored;
 use regex_syntax::hir::{Hir, Look};
+use regex_syntax::utf8::Utf8Sequences;
 use std::collections::{HashMap, VecDeque};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use crate::constraint::{ConstraintEngine, ConstraintError};
 
@@ -22,17 +23,39 @@ pub struct CompiledDfa {
     pub initial_state: StateID,
 }
 
-/// compile a regex pattern into a DFA
-/// returns the compiled DFA and initial state
-pub fn compile_pattern_dfa(pattern: &str) -> Result<CompiledDfa, String> {
+/// requested regexes can determinize exponentially, e.g. `(a|b)*a(a|b){24}`,
+/// taking minutes and gigabytes. realistic patterns, including unicode classes
+/// such as `\w{1,200}` (about 31 MiB), stay below this bound.
+const REGEX_DFA_SIZE_LIMIT: usize = 64 << 20;
+
+/// the configuration every pattern compiles with: anchored, and bounded in
+/// both construction and result.
+fn dfa_config() -> dense::Config {
+    dfa_config_with_limit(REGEX_DFA_SIZE_LIMIT)
+}
+
+fn dfa_config_with_limit(limit: usize) -> dense::Config {
+    dense::Config::new()
+        .start_kind(regex_automata::dfa::StartKind::Anchored)
+        .match_kind(regex_automata::MatchKind::LeftmostFirst)
+        .dfa_size_limit(Some(limit))
+        .determinize_size_limit(Some(limit))
+}
+
+fn compile_error(e: impl std::fmt::Display) -> String {
+    format!("Failed to compile regex: {}", e)
+}
+
+/// compile a parsed regex into a DFA with its anchored initial state
+fn compile_hir(hir: &Hir) -> Result<CompiledDfa, String> {
+    let nfa = thompson::Compiler::new()
+        .configure(thompson::Config::new().which_captures(thompson::WhichCaptures::None))
+        .build_from_hir(hir)
+        .map_err(compile_error)?;
     let dfa = dense::Builder::new()
-        .configure(
-            dense::Config::new()
-                .start_kind(regex_automata::dfa::StartKind::Anchored)
-                .match_kind(regex_automata::MatchKind::LeftmostFirst),
-        )
-        .build(pattern)
-        .map_err(|e| format!("Failed to compile regex: {}", e))?;
+        .configure(dfa_config())
+        .build_from_nfa(&nfa)
+        .map_err(compile_error)?;
 
     let start_config = StartConfig::new().anchored(Anchored::Yes);
     let initial_state = dfa
@@ -42,9 +65,20 @@ pub fn compile_pattern_dfa(pattern: &str) -> Result<CompiledDfa, String> {
     Ok(CompiledDfa { dfa, initial_state })
 }
 
+/// compile a JSON schema `pattern` into a DFA over the whole string. JSON
+/// schema patterns search: a match may occur anywhere in the string, so the
+/// parsed pattern is wrapped as `(?s:.)*(?:pattern)(?s:.)*`. wrapping the
+/// text instead would accept unbalanced input such as `a)|(b`, and inside
+/// `(?s:...)` the pattern's own `.` would also match a newline.
+pub fn compile_pattern_dfa(pattern: &str) -> Result<CompiledDfa, String> {
+    let anything = syntax::parse("(?s:.)*").expect("valid regex");
+    let hir = syntax::parse(pattern).map_err(compile_error)?;
+    compile_hir(&Hir::concat(vec![anything.clone(), hir, anything]))
+}
+
 /// a JSON string pattern with its schema's length limits, and the distances
-/// that decide whether a string can still close. a string's length here is
-/// the number of bytes fed to the pattern, one per character or escape.
+/// that decide whether a string can still close. a string's length is its
+/// number of unicode characters, each fed to the pattern as UTF-8.
 #[derive(Debug)]
 pub struct StringPattern {
     pub dfa: dense::DFA<Vec<u32>>,
@@ -52,11 +86,13 @@ pub struct StringPattern {
     min_length: usize,
     max_length: Option<usize>,
     indices: HashMap<StateID, usize>,
-    successors: Vec<Vec<usize>>,
-    // fewest bytes to a match from each indexed state; usize::MAX when none
-    // is reachable, such as after "ABX" for `^AB`.
+    // fewest characters to a match from each indexed state; usize::MAX when
+    // none is reachable, such as after a leading "X" for `^AB`.
     remaining: Vec<usize>,
     short_rows: ShortRows,
+    // partial UTF-8 and JSON escapes ask about the same character ranges
+    // again and again during vocabulary scans; bounded, owned per schema.
+    range_successors: Mutex<HashMap<(StateID, u32, u32), Arc<[StateID]>>>,
 }
 
 impl StringPattern {
@@ -67,7 +103,7 @@ impl StringPattern {
         min_length: Option<usize>,
         max_length: Option<usize>,
     ) -> Result<Self, String> {
-        let graph = ByteGraph::new(&compiled.dfa, compiled.initial_state);
+        let graph = StateGraph::characters(&compiled.dfa, compiled.initial_state);
         let remaining = completion_lengths(&compiled.dfa, &graph);
         let min_length = min_length.unwrap_or(0);
         let short_rows = ShortRows::new(&graph, &remaining, min_length, max_length);
@@ -77,9 +113,9 @@ impl StringPattern {
             min_length,
             max_length,
             indices: graph.indices,
-            successors: graph.successors,
             remaining,
             short_rows,
+            range_successors: Mutex::new(HashMap::new()),
         };
         // reject here, or generation opens a string it can never close.
         if pattern.remaining[0] == usize::MAX {
@@ -91,34 +127,51 @@ impl StringPattern {
         Ok(pattern)
     }
 
-    /// whether a string in `state` after `count` bytes can still close on a
-    /// match whose length the schema allows.
+    /// whether a string in `state` after `count` characters can still close
+    /// on a match whose length the schema allows.
     pub fn can_finish(&self, state: StateID, count: usize) -> bool {
-        self.indices
-            .get(&state)
-            .is_some_and(|&index| self.can_finish_index(index, count))
-    }
-
-    /// like `can_finish`, after one more byte of any value, as an escape
-    /// leaves open.
-    pub fn can_finish_after_any_byte(&self, state: StateID, count: usize) -> bool {
-        self.indices.get(&state).is_some_and(|&index| {
-            self.successors[index]
-                .iter()
-                .any(|&next| self.can_finish_index(next, count + 1))
-        })
-    }
-
-    fn can_finish_index(&self, index: usize, count: usize) -> bool {
+        let Some(&index) = self.indices.get(&state) else {
+            return false;
+        };
         if count < self.min_length {
             return self.short_rows.row(self.min_length, count)[index];
         }
         finishes_within(self.remaining[index], count, self.max_length)
     }
+
+    /// like `can_finish`, after one more character from `low..=high`, as an
+    /// unfinished escape or UTF-8 sequence leaves open.
+    pub fn can_finish_after_character(
+        &self,
+        state: StateID,
+        low: u32,
+        high: u32,
+        count: usize,
+    ) -> bool {
+        let key = (state, low, high);
+        let cached = self
+            .range_successors
+            .lock()
+            .expect("pattern cache lock")
+            .get(&key)
+            .cloned();
+        let successors = cached.unwrap_or_else(|| {
+            let successors: Arc<[StateID]> =
+                character_successors(&self.dfa, state, low, high).into();
+            let mut cache = self.range_successors.lock().expect("pattern cache lock");
+            if cache.len() < 4096 {
+                cache.insert(key, successors.clone());
+            }
+            successors
+        });
+        successors
+            .iter()
+            .any(|&next| self.can_finish(next, count + 1))
+    }
 }
 
 /// from minLength on, a string closes as soon as its pattern matches, so only
-/// the fewest remaining bytes matter.
+/// the fewest remaining characters matter.
 fn finishes_within(remaining: usize, count: usize, max_length: Option<usize>) -> bool {
     remaining != usize::MAX
         && max_length.map_or(true, |maximum| {
@@ -127,9 +180,9 @@ fn finishes_within(remaining: usize, count: usize, max_length: Option<usize>) ->
 }
 
 /// below minLength a string cannot close yet, even on a match. row `count`
-/// marks the states from which, after `count` bytes, some match of an allowed
+/// marks the states from which, after `count` characters, some match of an allowed
 /// length is reachable; matching lengths can have gaps (`^(A|BBBB)$` matches
-/// lengths 1 and 4), so the fewest remaining bytes do not decide. each row
+/// lengths 1 and 4), so the fewest remaining characters do not decide. each row
 /// depends only on the next longer count, so once a row recurs the rows below
 /// repeat with that period; only rows down to the first repeat are stored.
 #[derive(Debug)]
@@ -141,7 +194,7 @@ struct ShortRows {
 
 impl ShortRows {
     fn new(
-        graph: &ByteGraph,
+        graph: &StateGraph,
         remaining: &[usize],
         min_length: usize,
         max_length: Option<usize>,
@@ -180,37 +233,86 @@ impl ShortRows {
     }
 }
 
-/// requested regexes can determinize exponentially, e.g. `(a|b)*a(a|b){24}`,
-/// taking minutes and gigabytes. realistic patterns, including unicode classes
-/// such as `\w{1,200}` (about 31 MiB), stay below this bound.
-const REGEX_DFA_SIZE_LIMIT: usize = 64 << 20;
-
-fn compile_error(e: impl std::fmt::Display) -> ConstraintError {
-    ConstraintError::CompilationError(format!("Failed to compile regex: {}", e))
+/// advance by one unicode scalar from `low..=high`, without enumerating 1.1
+/// million characters. UTF-8 byte ranges exclude overlong encodings,
+/// surrogates and invalid scalars.
+fn character_successors(
+    dfa: &dense::DFA<Vec<u32>>,
+    state: StateID,
+    mut low: u32,
+    mut high: u32,
+) -> Vec<StateID> {
+    if (0xd800..=0xdfff).contains(&low) {
+        low = 0xe000;
+    }
+    if (0xd800..=0xdfff).contains(&high) {
+        high = 0xd7ff;
+    }
+    high = high.min(0x10ffff);
+    if low > high {
+        return Vec::new();
+    }
+    let mut successors = Vec::new();
+    for sequence in Utf8Sequences::new(char::from_u32(low).unwrap(), char::from_u32(high).unwrap())
+    {
+        let mut states = vec![state];
+        for range in sequence.as_slice() {
+            let mut next = Vec::new();
+            for state in states {
+                for byte in range.start..=range.end {
+                    let state = dfa.next_state(state, byte);
+                    if !dfa.is_dead_state(state) {
+                        next.push(state);
+                    }
+                }
+            }
+            next.sort_unstable();
+            next.dedup();
+            states = next;
+        }
+        successors.extend(states);
+    }
+    successors.sort_unstable();
+    successors.dedup();
+    successors
 }
 
-/// the DFA states reachable from `initial` one byte at a time, without the
-/// dead state, and their byte transitions; `initial` has index 0.
-struct ByteGraph {
+/// the DFA states reachable from `initial` one step at a time, without the
+/// dead state, and their transitions; `initial` has index 0.
+struct StateGraph {
     states: Vec<StateID>,
     indices: HashMap<StateID, usize>,
     successors: Vec<Vec<usize>>,
 }
 
-impl ByteGraph {
-    fn new(dfa: &dense::DFA<Vec<u32>>, initial: StateID) -> Self {
+impl StateGraph {
+    /// steps of one byte, as the regex engine feeds tokens.
+    fn bytes(dfa: &dense::DFA<Vec<u32>>, initial: StateID) -> Self {
+        Self::new(initial, |state| {
+            dfa.byte_classes()
+                .representatives(..)
+                .filter_map(|unit| unit.as_u8())
+                .map(|byte| dfa.next_state(state, byte))
+                .filter(|&next| !dfa.is_dead_state(next))
+                .collect()
+        })
+    }
+
+    /// steps of one unicode scalar, as JSON string lengths count.
+    fn characters(dfa: &dense::DFA<Vec<u32>>, initial: StateID) -> Self {
+        Self::new(initial, |state| {
+            character_successors(dfa, state, 0, 0x10ffff)
+        })
+    }
+
+    fn new(initial: StateID, step: impl Fn(StateID) -> Vec<StateID>) -> Self {
         let mut states = vec![initial];
         let mut indices = HashMap::from([(initial, 0)]);
         let mut successors = Vec::new();
         let mut index = 0;
         while index < states.len() {
-            let state = states[index];
-            let mut next_indices: Vec<usize> = dfa
-                .byte_classes()
-                .representatives(..)
-                .filter_map(|unit| unit.as_u8())
-                .map(|byte| dfa.next_state(state, byte))
-                .filter(|&next| !dfa.is_dead_state(next))
+            let mut next_indices: Vec<usize> = step(states[index])
+                .into_iter()
                 .map(|next| {
                     *indices.entry(next).or_insert_with(|| {
                         states.push(next);
@@ -231,9 +333,9 @@ impl ByteGraph {
     }
 }
 
-/// fewest bytes from each graph state to a match at the end of input, by
+/// fewest steps from each graph state to a match at the end of input, by
 /// reverse breadth-first search; usize::MAX when no match is reachable.
-fn completion_lengths(dfa: &dense::DFA<Vec<u32>>, graph: &ByteGraph) -> Vec<usize> {
+fn completion_lengths(dfa: &dense::DFA<Vec<u32>>, graph: &StateGraph) -> Vec<usize> {
     let mut reverse = vec![Vec::new(); graph.states.len()];
     for (index, successors) in graph.successors.iter().enumerate() {
         for &next in successors {
@@ -264,7 +366,7 @@ fn completion_lengths(dfa: &dense::DFA<Vec<u32>>, graph: &ByteGraph) -> Vec<usiz
 /// match apart from the dead state, such as the one after `a` for `a$b`; a
 /// token entering one leaves generation with no valid continuation.
 fn live_states(dfa: &dense::DFA<Vec<u32>>, initial: StateID) -> Vec<bool> {
-    let graph = ByteGraph::new(dfa, initial);
+    let graph = StateGraph::bytes(dfa, initial);
     let lengths = completion_lengths(dfa, &graph);
     let slot = |state: StateID| state.as_usize() >> dfa.stride2();
     let slots = graph
@@ -303,28 +405,11 @@ impl RegexEngine {
         // anchor the parsed pattern rather than the text: splicing it into
         // `\A(?:...)\z` accepts unbalanced input such as `a)|(b`, and a
         // trailing `(?x)` comment would swallow the closing anchor.
-        let hir = syntax::parse(pattern).map_err(compile_error)?;
+        let hir = syntax::parse(pattern)
+            .map_err(|e| ConstraintError::CompilationError(compile_error(e)))?;
         let hir = Hir::concat(vec![Hir::look(Look::Start), hir, Hir::look(Look::End)]);
-        let nfa = thompson::Compiler::new()
-            .configure(thompson::Config::new().which_captures(thompson::WhichCaptures::None))
-            .build_from_hir(&hir)
-            .map_err(compile_error)?;
-
-        let dfa = dense::Builder::new()
-            .configure(
-                dense::Config::new()
-                    .start_kind(regex_automata::dfa::StartKind::Anchored)
-                    .match_kind(regex_automata::MatchKind::LeftmostFirst)
-                    .dfa_size_limit(Some(REGEX_DFA_SIZE_LIMIT))
-                    .determinize_size_limit(Some(REGEX_DFA_SIZE_LIMIT)),
-            )
-            .build_from_nfa(&nfa)
-            .map_err(compile_error)?;
-
-        let start_config = StartConfig::new().anchored(Anchored::Yes);
-        let initial_state = dfa.start_state(&start_config).map_err(|e| {
-            ConstraintError::CompilationError(format!("Failed to get start state: {}", e))
-        })?;
+        let CompiledDfa { dfa, initial_state } =
+            compile_hir(&hir).map_err(ConstraintError::CompilationError)?;
 
         let engine = RegexEngine {
             vocabulary: Arc::new(vocabulary),
@@ -335,7 +420,9 @@ impl RegexEngine {
         };
         // reject before any model work instead of failing at the first token.
         if !engine.is_live(initial_state) {
-            return Err(compile_error("pattern can never match"));
+            return Err(ConstraintError::CompilationError(compile_error(
+                "pattern can never match",
+            )));
         }
         Ok(engine)
     }
@@ -461,6 +548,29 @@ mod tests {
         assert_eq!(engine.vocab_size(), 10);
         assert!(!engine.is_dead());
         assert!(!engine.is_finished());
+    }
+
+    #[test]
+    fn test_every_compiled_pattern_is_size_limited() {
+        let config = dfa_config();
+        assert_eq!(config.get_dfa_size_limit(), Some(REGEX_DFA_SIZE_LIMIT));
+        assert_eq!(
+            config.get_determinize_size_limit(),
+            Some(REGEX_DFA_SIZE_LIMIT)
+        );
+    }
+
+    #[test]
+    fn test_exponential_pattern_fails_instead_of_exhausting_memory() {
+        // rejecting at the production limit takes seconds in a debug build.
+        let build = |pattern: &str| {
+            dense::Builder::new()
+                .configure(dfa_config_with_limit(1 << 20))
+                .build(pattern)
+        };
+        let error = build("(a|b)*a(a|b){24}").unwrap_err().to_string();
+        assert!(error.contains("size limit"), "{error}");
+        assert!(build("[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{12}").is_ok());
     }
 
     #[test]
