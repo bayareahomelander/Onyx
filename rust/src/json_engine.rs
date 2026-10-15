@@ -216,6 +216,41 @@ impl StringState {
         }
     }
 
+    /// whether this unfinished character can still spell the next character
+    /// of an allowed key, raw or escaped; being valid JSON is not enough.
+    fn can_complete_key(&self, remaining: &str) -> bool {
+        if self.pending.is_empty() {
+            return true;
+        }
+        let Some(character) = remaining.chars().next() else {
+            return false;
+        };
+        let mut utf8 = [0; 4];
+        if character
+            .encode_utf8(&mut utf8)
+            .as_bytes()
+            .starts_with(&self.pending)
+        {
+            return true;
+        }
+        let quoted = serde_json::to_string(&character.to_string()).expect("JSON character");
+        if quoted.as_bytes()[1..quoted.len() - 1].starts_with(&self.pending)
+            || (character == '/' && b"\\/".starts_with(&self.pending))
+        {
+            return true;
+        }
+        let mut utf16 = [0; 2];
+        let escaped: String = character
+            .encode_utf16(&mut utf16)
+            .iter()
+            .map(|unit| format!("\\u{unit:04x}"))
+            .collect();
+        escaped
+            .as_bytes()
+            .get(..self.pending.len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(&self.pending))
+    }
+
     /// consume one byte; None refuses it. a character after which no match
     /// of an allowed length is reachable is refused: the string could never
     /// close. escapes feed the pattern the character they encode, as UTF-8,
@@ -388,8 +423,8 @@ pub enum Scope {
         key_buffer: String,
         /// keys that have been used (for detecting duplicates)
         used_keys: Vec<String>,
-        /// whether we're in an escape sequence (for key parsing)
-        in_escape: bool,
+        /// decoder for the key being read: escapes and UTF-8 sequences
+        key_state: StringState,
         /// required keys that haven't been provided yet
         missing_required_keys: std::collections::HashSet<String>,
     },
@@ -617,7 +652,7 @@ impl JsonEngine {
                             syntax_state: ObjectSyntaxState::ExpectKeyOrEnd,
                             key_buffer: String::new(),
                             used_keys: Vec::new(),
-                            in_escape: false,
+                            key_state: StringState::new_started(),
                             missing_required_keys: missing_req,
                         });
                         return true;
@@ -677,7 +712,7 @@ impl JsonEngine {
                             syntax_state: ObjectSyntaxState::ExpectKeyOrEnd,
                             key_buffer: String::new(),
                             used_keys: Vec::new(),
-                            in_escape: false,
+                            key_state: StringState::new_started(),
                             missing_required_keys: std::collections::HashSet::new(),
                         });
                         return true;
@@ -772,7 +807,7 @@ impl JsonEngine {
                             syntax_state: ObjectSyntaxState::ExpectKeyOrEnd,
                             key_buffer: String::new(),
                             used_keys: Vec::new(),
-                            in_escape: false,
+                            key_state: StringState::new_started(),
                             missing_required_keys: root_blueprint.required.clone(),
                         };
                         return true;
@@ -797,7 +832,7 @@ impl JsonEngine {
                     syntax_state,
                     key_buffer,
                     used_keys,
-                    in_escape,
+                    key_state,
                     missing_required_keys,
                 } => {
                     match syntax_state {
@@ -814,6 +849,7 @@ impl JsonEngine {
                                 if has_unused_key {
                                     *syntax_state = ObjectSyntaxState::InKey;
                                     key_buffer.clear();
+                                    *key_state = StringState::new_started();
                                     return true;
                                 }
                                 return false;
@@ -836,35 +872,32 @@ impl JsonEngine {
                         }
 
                         ObjectSyntaxState::InKey => {
-                            if *in_escape {
-                                *in_escape = false;
-                                key_buffer.push(byte as char);
-                                return true;
-                            }
-                            if byte == b'\\' {
-                                *in_escape = true;
-                                return true;
-                            }
-                            if byte == b'"' {
-                                if blueprint.is_key_allowed(key_buffer)
-                                    && !used_keys.contains(key_buffer)
-                                {
+                            // keys are matched by the characters their JSON
+                            // text decodes to, as string values are
+                            match key_state.advance(byte) {
+                                Some(StringStep::End) => {
+                                    if !blueprint.is_key_allowed(key_buffer)
+                                        || used_keys.contains(key_buffer)
+                                    {
+                                        return false;
+                                    }
                                     *syntax_state = ObjectSyntaxState::ExpectColon;
                                     return true;
                                 }
-                                return false;
+                                Some(StringStep::Character(character)) => {
+                                    key_buffer.push(character)
+                                }
+                                Some(StringStep::Pending) => {}
+                                None => return false,
                             }
-                            let test_key = format!("{}{}", key_buffer, byte as char);
-                            // only accept prefix if it matches an unused key
-                            let prefix_valid = blueprint
-                                .allowed_keys
-                                .iter()
-                                .any(|key| key.starts_with(&test_key) && !used_keys.contains(key));
-                            if prefix_valid {
-                                key_buffer.push(byte as char);
-                                return true;
-                            }
-                            return false;
+                            // only accept a prefix of an unused key that an
+                            // unfinished escape or UTF-8 sequence can still spell
+                            return blueprint.allowed_keys.iter().any(|key| {
+                                !used_keys.contains(key)
+                                    && key.strip_prefix(key_buffer.as_str()).is_some_and(
+                                        |remaining| key_state.can_complete_key(remaining),
+                                    )
+                            });
                         }
 
                         ObjectSyntaxState::ExpectColon => {
@@ -1005,7 +1038,7 @@ impl JsonEngine {
                                                 syntax_state: ObjectSyntaxState::ExpectKeyOrEnd,
                                                 key_buffer: String::new(),
                                                 used_keys: Vec::new(),
-                                                in_escape: false,
+                                                key_state: StringState::new_started(),
                                                 missing_required_keys: missing_req,
                                             });
                                         }
@@ -2179,6 +2212,56 @@ mod tests {
         assert!(serde_json::from_str::<Value>(r#"{"a":1,}"#).is_err());
         assert_eq!(rejected_at(INT_OBJECT, r#"{"a":1,}"#), Some(7));
         assert_eq!(rejected_at(INT_OBJECT, r#"{"a":1, }"#), Some(8));
+    }
+
+    fn keyed_schema(key: &str) -> String {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {key: {"type": "integer"}},
+            "required": [key]
+        });
+        schema.to_string()
+    }
+
+    #[test]
+    fn test_key_escapes_decode_to_the_characters_they_encode() {
+        for (key, doc) in [
+            ("name", r#"{"name":1}"#),
+            ("name", r#"{"\u006Eame":1}"#),
+            ("é", r#"{"é":1}"#),
+            ("é", r#"{"\u00e9":1}"#),
+            ("🚀", r#"{"🚀":1}"#),
+            ("🚀", r#"{"\uD83D\uDE80":1}"#),
+            ("a/b", r#"{"a\/b":1}"#),
+            ("a\"b", r#"{"a\"b":1}"#),
+            ("a\nb", r#"{"a\nb":1}"#),
+        ] {
+            assert!(accepts_complete(&keyed_schema(key), doc), "{key:?} {doc}");
+        }
+    }
+
+    #[test]
+    fn test_key_prefixes_must_still_spell_an_allowed_key() {
+        for (key, doc, offset) in [
+            // "\n" is a newline, not the "n" of "name".
+            ("name", &br#"{"\name":1}"#[..], 3),
+            ("name", br#"{"\q"#, 3),
+            ("name", br#"{"name\"#, 6),
+            // a UTF-8 lead byte is allowed only if it starts the next character.
+            ("é", b"{\"\xc2", 2),
+            ("é", b"{\"\xc3\xa8", 3),
+            ("🚀", br#"{"\ud83d\udc"#, 11),
+        ] {
+            assert_eq!(
+                rejected_at(&keyed_schema(key), doc),
+                Some(offset),
+                "{key:?} {doc:?}"
+            );
+        }
+        // an escaped key is used once decoded, so it cannot repeat raw.
+        let schema =
+            r#"{"type":"object","properties":{"a":{"type":"integer"},"b":{"type":"integer"}}}"#;
+        assert_eq!(rejected_at(schema, r#"{"\u0061":1,"a"#), Some(13));
     }
 
     #[test]

@@ -129,6 +129,53 @@ def test_invalid_string_contents_are_rejected(document):
         assert not accepts({"type": "string"}, document, chunk_size)
 
 
+@pytest.mark.parametrize("key,prefix,token,expected", [
+    ("content", b'{"c', b'\xe5\x82', False),  # Qwen token 99267: observed 3B dead end
+    ("c傀", b'{"c', b'\xe5\x82', True),
+    ("content", b'{"c', b'\xc2', False),
+    ("content", b'{"c', b'\\u4', False),
+    ("content", b'{"c', b'\\u00', True),
+    ("content", b'{"content', b'\\', False),
+    ("content", b'{"content', b'\xe5', False),
+    ("cé", b'{"c', b'\xc3', True),
+    ("cé", b'{"c', b'\xc2', False),
+    ("c🚀", b'{"c', b'\\uD83D\\uDE8', True),
+    ("c🚀", b'{"c', b'\\ud83d\\udc', False),
+    ("c/", b'{"c', b'\\', True),
+    # "\n" is a newline, not the "n" of "name".
+    ("name", b'{"\\', b'n', False),
+])
+def test_key_pending_sequence_must_match_remaining_key(key, prefix, token, expected):
+    constraint = GrammarConstraint([prefix, token])
+    constraint.compile_json_schema(json.dumps({
+        "type": "object", "properties": {key: {"type": "integer"}}, "required": [key],
+    }))
+    initial = constraint.init_state()
+    state = constraint.advance_state(initial, 0)
+    try:
+        assert (1 in constraint.get_valid_token_ids(state)) is expected
+    finally:
+        constraint.release_state(state)
+        constraint.release_state(initial)
+
+
+@pytest.mark.parametrize("chunk_size", [None, 1, 2])
+@pytest.mark.parametrize("key,document", [
+    ("content", r'{"c\u006Fntent":1}'),
+    ("cé", '{"cé":1}'),
+    ("cé", r'{"c\u00E9":1}'),
+    ("c🚀", '{"c🚀":1}'),
+    ("c🚀", r'{"c\uD83d\uDe80":1}'),
+    ("c/", r'{"c\/":1}'),
+    ('c"', r'{"c\"":1}'),
+    ("c\n", r'{"c\n":1}'),
+])
+def test_key_character_encodings_remain_completable(key, document, chunk_size):
+    schema = {"type": "object", "properties": {key: {"type": "integer"}}, "required": [key]}
+    assert accepts(schema, document, chunk_size)
+    Draft202012Validator(schema).validate(json.loads(document))
+
+
 ALPHABET = "ABXé🚀"
 
 
