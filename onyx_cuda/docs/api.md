@@ -18,7 +18,10 @@ without streaming), `stop`, `stream`, and `response_format` (`text` or
 ignored.
 
 The API allows up to 4096 output tokens within an 8192-token prompt-plus-output
-budget by default; see [Settings](#settings) to change the limits.
+budget by default; see [Settings](#settings) to change the limits. An omitted
+`max_tokens` shrinks to the room a long prompt leaves, while an explicit one
+that does not fit returns HTTP 422. With temperature 0 every choice is the same,
+so a request with `n` above 1 generates once and repeats the choice.
 
 ## Constraints
 
@@ -124,7 +127,7 @@ Set environment variables in the server's terminal before startup:
 | `ONYX_DRAFT_BACKEND` | `graph` | `eager` uses the ordinary draft forward |
 | `ONYX_REPLAY_BACKEND` | `auto` | `scalar` disables graph recovery; `graph` requires it on any CUDA capability 7.5 GPU and fails startup if it cannot be prepared |
 | `ONYX_MAX_CONTEXT_TOKENS` | `8192` | Prompt plus requested output tokens |
-| `ONYX_MAX_OUTPUT_TOKENS` | `4096` | Maximum requested output; omitted budgets use the smaller of 1024 and this limit |
+| `ONYX_MAX_OUTPUT_TOKENS` | `4096` | Maximum requested output; an omitted budget uses the smallest of 1024, this limit, and the room the prompt leaves |
 | `ONYX_MAX_ACTIVE_REQUESTS` | `8` | Running or queued completions; excess requests receive HTTP 429 |
 | `ONYX_STREAM_BUFFER_CHUNKS` | `64` | Buffered SSE chunks before the producer waits for the reader |
 

@@ -9,6 +9,16 @@
   previously started an integer-only number, so values such as `2.25` could
   not be generated. `["number", "integer"]` was not affected.
 
+### Changes
+
+- An omitted `max_tokens` now shrinks to the room a long prompt leaves.
+  Before, a prompt longer than the context limit minus 1024 tokens returned
+  HTTP 422 even though the client had not asked for 1024 tokens. A
+  `max_tokens` the client sets is never changed.
+- A request with temperature 0 and `n` above 1 generates once and repeats
+  the choice. Every greedy choice is the same, and each one used to cost a
+  full generation. Usage still counts the tokens of every choice.
+
 ## 0.1.3 - 2026-10-15
 
 A fix for schema strings that could end generation with an error partway

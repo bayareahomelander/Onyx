@@ -294,7 +294,8 @@ def resolve_stop_sequences(stop: list[str] | None, tokenizer) -> list[list[int]]
     return sequences or None
 
 
-def _request_prompt_token_ids(request: ChatCompletionRequest, engine, *, context_limit=MAX_CONTEXT_TOKENS) -> list[int]:
+def _request_prompt_token_ids(request: ChatCompletionRequest, engine, *, context_limit=MAX_CONTEXT_TOKENS,
+                              fit_budget: bool = False) -> list[int]:
     _text, token_ids = format_request_messages(request.messages, engine.target.tokenizer,
                                                enable_thinking=request.enable_thinking)
     limit = context_limit
@@ -303,6 +304,9 @@ def _request_prompt_token_ids(request: ChatCompletionRequest, engine, *, context
             context = getattr(getattr(loaded.model, "config", None), "max_position_embeddings", None)
             if isinstance(context, int) and context > 0:
                 limit = min(limit, context)
+    if fit_budget and 0 < len(token_ids) < limit:
+        # A budget the client omitted shrinks to the room the prompt leaves.
+        request.max_tokens = min(request.max_tokens, limit - len(token_ids))
     if not token_ids or len(token_ids) + request.max_tokens > limit:
         raise HTTPException(
             status_code=422,
@@ -783,7 +787,9 @@ def create_app(
     @app.post("/v1/chat/completions", response_model=ChatCompletionResponse)
     async def create_chat_completion(request: ChatCompletionRequest, http_request: Request):
         engine = get_engine(app, request.model)
-        if "max_tokens" not in request.model_fields_set:
+        # Read before the assignment below, which marks the field as set.
+        budget_omitted = "max_tokens" not in request.model_fields_set
+        if budget_omitted:
             request.max_tokens = min(request.max_tokens, limits.output_tokens)
         if request.max_tokens > limits.output_tokens:
             raise HTTPException(status_code=422, detail=f"max_tokens exceeds output limit {limits.output_tokens}")
@@ -791,7 +797,8 @@ def create_app(
             raise HTTPException(status_code=422,
                                 detail="speculative=true is unavailable: this server runs the target alone")
         gamma = _request_gamma(request, app.state.speculative_gamma)
-        prompt_token_ids = _request_prompt_token_ids(request, engine, context_limit=limits.context_tokens)
+        prompt_token_ids = _request_prompt_token_ids(request, engine, context_limit=limits.context_tokens,
+                                                     fit_budget=budget_omitted)
         if request.regex is not None:
             from onyx_cuda import _rust
 
@@ -825,17 +832,20 @@ def create_app(
             completion_tokens = 0
             choices = []
             last_timings = None
+            result = None
 
             for index in range(request.n):
                 if request.seed is not None:
                     arguments["seed"] = _choice_seed(request.seed, index)
-                if request.stop:
-                    result = await _off_event_loop(
-                        _generate_until_text_stop, arguments, tokenizer, request.stop,
-                        executor=app.state.inference_executor,
-                    )
-                else:
-                    result = await _generate_off_event_loop(arguments, app.state.inference_executor)
+                # Greedy choices are identical, so generate the first and repeat it.
+                if result is None or request.temperature > 0:
+                    if request.stop:
+                        result = await _off_event_loop(
+                            _generate_until_text_stop, arguments, tokenizer, request.stop,
+                            executor=app.state.inference_executor,
+                        )
+                    else:
+                        result = await _generate_off_event_loop(arguments, app.state.inference_executor)
                 completion_tokens += len(result.token_ids)
                 last_timings = result.timings
                 output = tokenizer.decode(result.token_ids, skip_special_tokens=True)

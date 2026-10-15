@@ -306,3 +306,31 @@ def test_omitted_output_budget_respects_smaller_configured_limit(monkeypatch):
             response = client.post("/v1/chat/completions", json={"messages": PAYLOAD["messages"], field: 129})
             assert response.status_code == 422
     assert budgets == [128]
+
+
+@pytest.mark.parametrize("prompt_length,context,room", [
+    (server.MAX_CONTEXT_TOKENS - 192, 32768, 192),
+    (90, 100, 10),
+])
+def test_omitted_output_budget_fits_the_room_the_prompt_leaves(monkeypatch, prompt_length, context, room):
+    budgets = []
+
+    def generate(arguments):
+        budgets.append(arguments["max_tokens"])
+        return result()
+
+    monkeypatch.setattr(server, "_generate", generate)
+    with TestClient(server.create_app(engine=engine(prompt_length, context))) as client:
+        response = client.post("/v1/chat/completions", json={"messages": PAYLOAD["messages"]})
+        assert response.status_code == 200, response.text
+        # A budget the client chose is never shrunk.
+        explicit = client.post("/v1/chat/completions", json={**PAYLOAD, "max_tokens": room + 1})
+        assert explicit.status_code == 422
+    assert budgets == [room]
+
+
+def test_omitted_output_budget_still_needs_room_for_one_token(monkeypatch):
+    monkeypatch.setattr(server, "_generate", lambda _: pytest.fail("Generation started"))
+    with TestClient(server.create_app(engine=engine(server.MAX_CONTEXT_TOKENS))) as client:
+        response = client.post("/v1/chat/completions", json={"messages": PAYLOAD["messages"]})
+    assert response.status_code == 422

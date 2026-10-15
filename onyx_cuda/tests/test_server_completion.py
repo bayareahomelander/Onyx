@@ -169,6 +169,7 @@ def test_stop_length_and_multiple_choices_use_final_choice_metrics(monkeypatch):
             json={
                 "messages": [{"role": "user", "content": "Hi"}],
                 "n": 2,
+                "temperature": 0.5,
                 "stop": ["STOP"],
             },
         )
@@ -198,11 +199,30 @@ def test_stop_length_and_multiple_choices_use_final_choice_metrics(monkeypatch):
         "ttft_ms": 20.0,
         "grammar_constrained": False,
         "speculative_iterations": 4,
-        "speculative": True,
+        "speculative": False,
         "total_ms": 500.0,
     }
     assert len(calls) == 2
     assert all(call["stop_sequences"] == [[40]] for call in calls)
+
+
+def test_greedy_choices_are_generated_once_and_repeated(monkeypatch):
+    tokenizer = FakeTokenizer({(20, 21): "same"})
+    calls = _fake_generation(monkeypatch, [_result([20, 21], "length")])
+    with TestClient(create_app(engine=_engine(tokenizer))) as client:
+        response = client.post(
+            "/v1/chat/completions",
+            json={"messages": [{"role": "user", "content": "Hi"}], "n": 3, "seed": 7},
+        )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert len(calls) == 1
+    assert [choice["index"] for choice in body["choices"]] == [0, 1, 2]
+    assert {choice["message"]["content"] for choice in body["choices"]} == {"same"}
+    assert {choice["finish_reason"] for choice in body["choices"]} == {"length"}
+    # Usage still counts each returned choice.
+    assert body["usage"]["completion_tokens"] == 6
 
 
 @pytest.mark.parametrize("stream", [False, True])

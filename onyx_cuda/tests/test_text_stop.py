@@ -308,10 +308,15 @@ def test_non_streaming_text_stop_ends_inference(runtime, monkeypatch, mode, n):
             # Only the consumed prefix through the stop-completing token was generated.
             assert body["usage"] == {"prompt_tokens": 4, "completion_tokens": 2 * n,
                                      "total_tokens": 4 + 2 * n}
-            # Per choice, the decoder reaches the stop and the handler then decodes
-            # the result. Equal snapshots mean no forward ran after the stop.
-            assert len(forwards_at_stop) == 2 * n
-            assert forwards_at_stop[0::2] == forwards_at_stop[1::2]
+            # Per generated choice, the decoder reaches the stop and the handler
+            # then decodes the result. Equal snapshots mean no forward ran after the
+            # stop. Greedy choices are identical, so one generation serves them all.
+            if mode == "sampled":
+                assert len(forwards_at_stop) == 2 * n
+                assert forwards_at_stop[0::2] == forwards_at_stop[1::2]
+            else:
+                assert len(forwards_at_stop) == 1 + n
+                assert all(snapshot == forwards_at_stop[0] for snapshot in forwards_at_stop)
             assert runtime.forwards == forwards_at_stop[-1]
             assert not app.state.engine_locks[MODEL_ID].locked()
             assert not runtime.backend.active
