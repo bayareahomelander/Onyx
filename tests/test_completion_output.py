@@ -74,7 +74,8 @@ def test_generation_paths_obey_budget_and_match(monkeypatch, budget, reject):
         def advance_state(self, state, token):
             return state + 1
         def get_valid_token_ids(self, state):
-            return [1]
+            # A complete fixed-length match cannot grow.
+            return [1] if state < 2 else []
         def is_match_state(self, state):
             return state >= 2
         def release_state(self, state):
