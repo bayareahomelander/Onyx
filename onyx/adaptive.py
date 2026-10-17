@@ -325,9 +325,13 @@ class AdaptiveSpeculativeEngine(SpeculativeEngine):
                     break
 
         generation_end = time.perf_counter()
-        output_text = self.tokenizer.decode(generated_tokens)
+        # The stop token that ended generation is not output, as in generate().
+        output_tokens = generated_tokens
+        if output_tokens and output_tokens[-1] in stop_tokens:
+            output_tokens = output_tokens[:-1]
+        output_text = self.tokenizer.decode(output_tokens) if output_tokens else ""
 
-        metrics["generated_tokens"] = len(generated_tokens)
+        metrics["generated_tokens"] = len(output_tokens)
         metrics["generation_time"] = generation_end - generation_start
 
         if metrics["generated_tokens"] > 0:

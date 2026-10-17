@@ -253,3 +253,17 @@ def test_pattern_matching_only_empty_output_generates_nothing(monkeypatch, metho
     assert text == ""
     assert_finish(method, metrics, "grammar_complete")
     assert engine.target_model.calls == 0
+
+
+@pytest.mark.parametrize("method", SPECULATIVE + ["generate_baseline"])
+def test_eos_that_ends_constrained_output_is_not_output_text(monkeypatch, method):
+    engine = make_engine(monkeypatch, method, DIGITS, target=PREFER_EOS)
+    # Like a real tokenizer, decode EOS to visible text.
+    engine.tokenizer.decode = lambda ids: "".join(
+        "<eos>" if i == 0 else DIGITS[i].decode() for i in ids
+    )
+
+    text, metrics = run(engine, method, "[0-9]{1,3}")
+
+    assert text == "5"
+    assert metrics["generated_tokens"] == 1

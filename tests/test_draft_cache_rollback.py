@@ -163,9 +163,10 @@ def test_draft_cache_holds_accepted_history(monkeypatch, method, scenario, gamma
             assert n_generated >= BUDGET
     generated = [target(p) for p in range(len(PROMPT) - 1, len(PROMPT) - 1 + n_generated)]
     visible = generated
-    if scenario == "stop" and method != "generate_adaptive":
+    if scenario == "stop":
         visible = generated[:-1]
     assert text == " ".join(map(str, visible))
+    assert metrics["generated_tokens"] == len(visible)
 
     # After every round both caches hold the accepted history except the new
     # current token, which the next round feeds again.
