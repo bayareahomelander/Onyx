@@ -69,7 +69,10 @@ The default Mac model pair remains the 4-bit 0.5B draft / 1.5B target. Selecting
 These API changes do **not** alter the independent CUDA service contract.
 
 `stop` cannot be combined with `regex` or `json_schema` and returns HTTP 422,
-as on CUDA: the constraint decides when output is complete. Set
+as on CUDA: the constraint decides when output is complete. Once the output
+matches but could still grow, such as `[0-9]+` after one digit, the model may
+end it with EOS (finish reason `stop`). A match that cannot grow ends it with
+finish reason `grammar_complete`. Set
 `ONYX_API_DOCS=0` before startup to turn off the interactive API docs at `/docs`.
 
 For Mac development tests, install `python -m pip install -e ".[server,dev]"`

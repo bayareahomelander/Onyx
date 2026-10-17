@@ -80,6 +80,37 @@ def _trim_stop_suffix(tokens: List[int], stop_sequences: List[List[int]]) -> Lis
     return tokens[:-len(matched)]
 
 
+def _grammar_eos_ids(tokenizer, stop_sequences: List[List[int]]) -> List[int]:
+    """Return the EOS IDs a complete match may select.
+
+    Only EOS tokens that also stop generation qualify, so selecting one always
+    ends the output. They decode to no grammar bytes and never advance the
+    grammar state.
+    """
+    eos = getattr(tokenizer, "eos_token_id", None)
+    return [token for token in (eos if isinstance(eos, list) else [eos])
+            if isinstance(token, int) and [token] in stop_sequences]
+
+
+def _grammar_choices(constraint, state: int, eos_ids: List[int]) -> List[int]:
+    """Return the token IDs selectable after state.
+
+    A complete match that can still grow (``[0-9]+`` after one digit) also
+    permits EOS, so the model rather than the first match decides where output
+    ends. An empty list means either a complete match that cannot grow or a
+    state no vocabulary token continues; is_match_state tells them apart.
+    """
+    valid_token_ids = constraint.get_valid_token_ids(state)
+    if valid_token_ids and constraint.is_match_state(state):
+        return [*valid_token_ids, *eos_ids]
+    return valid_token_ids
+
+
+def _grammar_finished(constraint, state: int) -> bool:
+    """A complete match that no token can extend: the constrained output is done."""
+    return constraint.is_match_state(state) and not constraint.get_valid_token_ids(state)
+
+
 class SpeculativeEngine:
     """
     speculative decoding engine using draft-verify pattern
@@ -428,6 +459,7 @@ class SpeculativeEngine:
         
         grammar_constraint = None
         grammar_state = None
+        grammar_eos_ids: List[int] = []
         
         if grammar_active:
             if _GrammarConstraint is None:
@@ -445,6 +477,11 @@ class SpeculativeEngine:
             metrics["grammar_compile_time"] = time.perf_counter() - compile_start
             
             grammar_state = grammar_constraint.init_state()
+            grammar_eos_ids = _grammar_eos_ids(self.tokenizer, stop_sequences)
+            if _grammar_finished(grammar_constraint, grammar_state):
+                # Only the empty output matches, so there is nothing to generate.
+                metrics["finish_reason"] = "grammar_complete"
+                return "", metrics
         
         generated_tokens = []
         generation_start = time.perf_counter()
@@ -462,7 +499,7 @@ class SpeculativeEngine:
         
         if grammar_constraint is not None:
             mask_start = time.perf_counter()
-            valid_tokens = grammar_constraint.get_valid_token_ids(grammar_state)
+            valid_tokens = _grammar_choices(grammar_constraint, grammar_state, grammar_eos_ids)
             mask_times.append(time.perf_counter() - mask_start)
             
             if valid_tokens:
@@ -483,11 +520,11 @@ class SpeculativeEngine:
         generated_tokens.append(token_id)
         
         grammar_complete = False
-        if grammar_constraint is not None:
+        if grammar_constraint is not None and token_id not in grammar_eos_ids:
             previous_state = grammar_state
             grammar_state = grammar_constraint.advance_state(grammar_state, token_id)
             grammar_constraint.release_state(previous_state)
-            if grammar_constraint.is_match_state(grammar_state):
+            if _grammar_finished(grammar_constraint, grammar_state):
                 grammar_complete = True
         
         if _has_stop_suffix(generated_tokens, stop_sequences) or grammar_complete:
@@ -514,7 +551,9 @@ class SpeculativeEngine:
                     
                     if grammar_constraint is not None and draft_grammar_aware:
                         mask_start = time.perf_counter()
-                        valid_tokens = grammar_constraint.get_valid_token_ids(draft_grammar_state)
+                        valid_tokens = _grammar_choices(
+                            grammar_constraint, draft_grammar_state, grammar_eos_ids
+                        )
                         mask_times.append(time.perf_counter() - mask_start)
                         
                         if not valid_tokens:
@@ -529,12 +568,13 @@ class SpeculativeEngine:
                     draft_token = next_draft.item()
                     draft_tokens.append(draft_token)
                     
-                    if grammar_constraint is not None and draft_grammar_aware:
+                    if (grammar_constraint is not None and draft_grammar_aware
+                            and draft_token not in grammar_eos_ids):
                         draft_grammar_state = grammar_constraint.advance_state(
                             draft_grammar_state, draft_token
                         )
                         draft_temp_states.append(draft_grammar_state)
-                        if grammar_constraint.is_match_state(draft_grammar_state):
+                        if _grammar_finished(grammar_constraint, draft_grammar_state):
                             break
                     
                     if _has_stop_suffix(generated_tokens + draft_tokens, stop_sequences):
@@ -565,7 +605,9 @@ class SpeculativeEngine:
                     
                     if grammar_constraint is not None:
                         mask_start = time.perf_counter()
-                        valid_tokens = grammar_constraint.get_valid_token_ids(verify_grammar_state)
+                        valid_tokens = _grammar_choices(
+                            grammar_constraint, verify_grammar_state, grammar_eos_ids
+                        )
                         mask_times.append(time.perf_counter() - mask_start)
                         
                         if not valid_tokens:
@@ -581,12 +623,12 @@ class SpeculativeEngine:
                         accepted_count += 1
                         generated_tokens.append(draft_token)
                         
-                        if grammar_constraint is not None:
+                        if grammar_constraint is not None and draft_token not in grammar_eos_ids:
                             verify_grammar_state = grammar_constraint.advance_state(
                                 verify_grammar_state, draft_token
                             )
                             verify_temp_states.append(verify_grammar_state)
-                            if grammar_constraint.is_match_state(verify_grammar_state):
+                            if _grammar_finished(grammar_constraint, verify_grammar_state):
                                 grammar_complete = True
                                 break
                         
@@ -595,12 +637,12 @@ class SpeculativeEngine:
                     else:
                         generated_tokens.append(target_pred)
                         
-                        if grammar_constraint is not None:
+                        if grammar_constraint is not None and target_pred not in grammar_eos_ids:
                             verify_grammar_state = grammar_constraint.advance_state(
                                 verify_grammar_state, target_pred
                             )
                             verify_temp_states.append(verify_grammar_state)
-                            if grammar_constraint.is_match_state(verify_grammar_state):
+                            if _grammar_finished(grammar_constraint, verify_grammar_state):
                                 grammar_complete = True
                         break
                 
@@ -728,6 +770,7 @@ class SpeculativeEngine:
         
         grammar_constraint = None
         grammar_state = None
+        grammar_eos_ids: List[int] = []
         mask_times = []
         
         if grammar_active:
@@ -744,6 +787,10 @@ class SpeculativeEngine:
                 grammar_constraint.compile_regex(regex)
             metrics["grammar_compile_time"] = time.perf_counter() - compile_start
             grammar_state = grammar_constraint.init_state()
+            grammar_eos_ids = _grammar_eos_ids(self.tokenizer, stop_sequences)
+            if _grammar_finished(grammar_constraint, grammar_state):
+                # Only the empty output matches, so there is nothing to generate.
+                return "", metrics
         
         generated_tokens = []
         generation_start = time.perf_counter()
@@ -755,7 +802,7 @@ class SpeculativeEngine:
         
         if grammar_constraint is not None:
             mask_start = time.perf_counter()
-            valid_tokens = grammar_constraint.get_valid_token_ids(grammar_state)
+            valid_tokens = _grammar_choices(grammar_constraint, grammar_state, grammar_eos_ids)
             mask_times.append(time.perf_counter() - mask_start)
             
             if valid_tokens:
@@ -775,11 +822,11 @@ class SpeculativeEngine:
         generated_tokens.append(token_id)
         
         grammar_complete = False
-        if grammar_constraint is not None:
+        if grammar_constraint is not None and token_id not in grammar_eos_ids:
             previous_state = grammar_state
             grammar_state = grammar_constraint.advance_state(grammar_state, token_id)
             grammar_constraint.release_state(previous_state)
-            if grammar_constraint.is_match_state(grammar_state):
+            if _grammar_finished(grammar_constraint, grammar_state):
                 grammar_complete = True
         
         if not _has_stop_suffix(generated_tokens, stop_sequences) and not grammar_complete:
@@ -790,7 +837,9 @@ class SpeculativeEngine:
                 
                 if grammar_constraint is not None:
                     mask_start = time.perf_counter()
-                    valid_tokens = grammar_constraint.get_valid_token_ids(grammar_state)
+                    valid_tokens = _grammar_choices(
+                        grammar_constraint, grammar_state, grammar_eos_ids
+                    )
                     mask_times.append(time.perf_counter() - mask_start)
                     
                     if not valid_tokens:
@@ -804,11 +853,11 @@ class SpeculativeEngine:
                 token_id = next_token.item()
                 generated_tokens.append(token_id)
                 
-                if grammar_constraint is not None:
+                if grammar_constraint is not None and token_id not in grammar_eos_ids:
                     previous_state = grammar_state
                     grammar_state = grammar_constraint.advance_state(grammar_state, token_id)
                     grammar_constraint.release_state(previous_state)
-                    if grammar_constraint.is_match_state(grammar_state):
+                    if _grammar_finished(grammar_constraint, grammar_state):
                         break
                 
                 if _has_stop_suffix(generated_tokens, stop_sequences):
@@ -884,6 +933,7 @@ class SpeculativeEngine:
 
         grammar_constraint = None
         grammar_state = None
+        grammar_eos_ids: List[int] = []
 
         if grammar_active:
             if _GrammarConstraint is None:
@@ -899,6 +949,12 @@ class SpeculativeEngine:
             metrics["grammar_compile_time"] = time.perf_counter() - compile_start
 
             grammar_state = grammar_constraint.init_state()
+            grammar_eos_ids = _grammar_eos_ids(self.tokenizer, stop_sequences)
+            if _grammar_finished(grammar_constraint, grammar_state):
+                # Only the empty output matches, so there is nothing to generate.
+                metrics["finish_reason"] = "grammar_complete"
+                yield "", metrics
+                return
 
         generated_tokens = []
         text_stream = TokenTextStream(self.tokenizer, stop_sequences)
@@ -915,7 +971,7 @@ class SpeculativeEngine:
 
         if grammar_constraint is not None:
             mask_start = time.perf_counter()
-            valid_tokens = grammar_constraint.get_valid_token_ids(grammar_state)
+            valid_tokens = _grammar_choices(grammar_constraint, grammar_state, grammar_eos_ids)
             mask_times.append(time.perf_counter() - mask_start)
 
             if valid_tokens:
@@ -932,11 +988,11 @@ class SpeculativeEngine:
         generated_tokens.append(token_id)
 
         grammar_complete = False
-        if grammar_constraint is not None:
+        if grammar_constraint is not None and token_id not in grammar_eos_ids:
             previous_state = grammar_state
             grammar_state = grammar_constraint.advance_state(grammar_state, token_id)
             grammar_constraint.release_state(previous_state)
-            if grammar_constraint.is_match_state(grammar_state):
+            if _grammar_finished(grammar_constraint, grammar_state):
                 grammar_complete = True
 
         yield text_stream.update(generated_tokens), None
@@ -962,7 +1018,9 @@ class SpeculativeEngine:
 
                     if grammar_constraint is not None and draft_grammar_aware:
                         mask_start = time.perf_counter()
-                        valid_tokens = grammar_constraint.get_valid_token_ids(draft_grammar_state)
+                        valid_tokens = _grammar_choices(
+                            grammar_constraint, draft_grammar_state, grammar_eos_ids
+                        )
                         mask_times.append(time.perf_counter() - mask_start)
 
                         if not valid_tokens:
@@ -977,12 +1035,13 @@ class SpeculativeEngine:
                     draft_token = next_draft.item()
                     draft_tokens.append(draft_token)
 
-                    if grammar_constraint is not None and draft_grammar_aware:
+                    if (grammar_constraint is not None and draft_grammar_aware
+                            and draft_token not in grammar_eos_ids):
                         draft_grammar_state = grammar_constraint.advance_state(
                             draft_grammar_state, draft_token
                         )
                         draft_temp_states.append(draft_grammar_state)
-                        if grammar_constraint.is_match_state(draft_grammar_state):
+                        if _grammar_finished(grammar_constraint, draft_grammar_state):
                             break
 
                     if _has_stop_suffix(generated_tokens + draft_tokens, stop_sequences):
@@ -1013,7 +1072,9 @@ class SpeculativeEngine:
 
                     if grammar_constraint is not None:
                         mask_start = time.perf_counter()
-                        valid_tokens = grammar_constraint.get_valid_token_ids(verify_grammar_state)
+                        valid_tokens = _grammar_choices(
+                            grammar_constraint, verify_grammar_state, grammar_eos_ids
+                        )
                         mask_times.append(time.perf_counter() - mask_start)
 
                         if not valid_tokens:
@@ -1029,12 +1090,12 @@ class SpeculativeEngine:
                         accepted_count += 1
                         generated_tokens.append(draft_token)
 
-                        if grammar_constraint is not None:
+                        if grammar_constraint is not None and draft_token not in grammar_eos_ids:
                             verify_grammar_state = grammar_constraint.advance_state(
                                 verify_grammar_state, draft_token
                             )
                             verify_temp_states.append(verify_grammar_state)
-                            if grammar_constraint.is_match_state(verify_grammar_state):
+                            if _grammar_finished(grammar_constraint, verify_grammar_state):
                                 grammar_complete = True
                                 break
 
@@ -1043,12 +1104,12 @@ class SpeculativeEngine:
                     else:
                         generated_tokens.append(target_pred)
 
-                        if grammar_constraint is not None:
+                        if grammar_constraint is not None and target_pred not in grammar_eos_ids:
                             verify_grammar_state = grammar_constraint.advance_state(
                                 verify_grammar_state, target_pred
                             )
                             verify_temp_states.append(verify_grammar_state)
-                            if grammar_constraint.is_match_state(verify_grammar_state):
+                            if _grammar_finished(grammar_constraint, verify_grammar_state):
                                 grammar_complete = True
                         break
 

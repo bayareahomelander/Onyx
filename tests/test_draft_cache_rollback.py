@@ -71,7 +71,8 @@ class CountingGrammar:
         return state + 1
 
     def get_valid_token_ids(self, state):
-        return list(range(VOCAB))
+        # A complete fixed-length match cannot grow.
+        return list(range(VOCAB)) if state < GRAMMAR_LENGTH else []
 
     def is_match_state(self, state):
         return state >= GRAMMAR_LENGTH

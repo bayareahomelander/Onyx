@@ -159,3 +159,97 @@ def test_draft_dead_end_is_left_to_the_target(monkeypatch, method, draft_grammar
 
     assert text == "xabcd"
     assert_grammar_complete(method, metrics)
+
+
+def assert_finish(method, metrics, reason):
+    # generate_adaptive and generate_baseline do not report a finish reason.
+    if method in ("generate", "stream_generate"):
+        assert metrics["finish_reason"] == reason
+
+
+# Token 0 is EOS: it has no grammar bytes and stops generation.
+DIGITS = [b"", b"5", b"x"]
+PREFER_DIGIT = [0.0, 3.0, 1.0]
+PREFER_EOS = [5.0, 3.0, 1.0]
+
+
+@pytest.mark.parametrize("method", SPECULATIVE + ["generate_baseline"])
+def test_match_that_can_grow_continues_until_it_cannot(monkeypatch, method):
+    # "5" already matches, but the model prefers more digits up to the limit.
+    engine = make_engine(monkeypatch, method, DIGITS, target=PREFER_DIGIT)
+
+    text, metrics = run(engine, method, "[0-9]{1,3}")
+
+    assert text == "555"
+    assert_finish(method, metrics, "grammar_complete")
+
+
+@pytest.mark.parametrize("method", SPECULATIVE + ["generate_baseline"])
+def test_model_ends_a_match_that_can_grow_with_eos(monkeypatch, method):
+    # EOS is not selectable before the first digit; afterwards the model picks it.
+    engine = make_engine(monkeypatch, method, DIGITS, target=PREFER_EOS)
+
+    text, metrics = run(engine, method, "[0-9]{1,3}")
+
+    assert text == "5"
+    assert_finish(method, metrics, "stop")
+
+
+@pytest.mark.parametrize("draft_grammar_aware", [True, False])
+@pytest.mark.parametrize("method", SPECULATIVE)
+@pytest.mark.parametrize(
+    "target, draft, expected",
+    [(PREFER_DIGIT, PREFER_EOS, "555"), (PREFER_EOS, PREFER_DIGIT, "5")],
+    ids=["target-continues", "target-ends"],
+)
+def test_target_decides_eos_when_the_draft_disagrees(
+    monkeypatch, method, draft_grammar_aware, target, draft, expected
+):
+    engine = make_engine(monkeypatch, method, DIGITS, target=target, draft=draft)
+
+    text, metrics = run(
+        engine, method, "[0-9]{1,3}", draft_grammar_aware=draft_grammar_aware
+    )
+
+    assert text == expected
+    assert_finish(method, metrics, "grammar_complete" if expected == "555" else "stop")
+
+
+@pytest.mark.parametrize("method", SPECULATIVE)
+@pytest.mark.parametrize(
+    "target, expected, reason",
+    [(PREFER_DIGIT, "5" * 10, "length"), (PREFER_EOS, "5", "stop")],
+    ids=["continues", "ends"],
+)
+def test_root_number_is_not_cut_at_its_first_digit(monkeypatch, method, target, expected, reason):
+    engine = make_engine(monkeypatch, method, DIGITS, target=target)
+
+    text, metrics = run(engine, method, None, json_schema='{"type": "integer"}')
+
+    if method == "generate_adaptive" and reason == "length":
+        # generate_adaptive does not cap its last proposal at the budget.
+        assert set(text) == {"5"} and len(text) >= len(expected)
+    else:
+        assert text == expected
+    assert_finish(method, metrics, reason)
+
+
+@pytest.mark.parametrize("method", SPECULATIVE + ["generate_baseline"])
+def test_empty_match_may_end_with_eos_at_once(monkeypatch, method):
+    engine = make_engine(monkeypatch, method, DIGITS, target=PREFER_EOS)
+
+    text, metrics = run(engine, method, "[0-9]*")
+
+    assert text == ""
+    assert_finish(method, metrics, "stop")
+
+
+@pytest.mark.parametrize("method", SPECULATIVE + ["generate_baseline"])
+def test_pattern_matching_only_empty_output_generates_nothing(monkeypatch, method):
+    engine = make_engine(monkeypatch, method, DIGITS, target=PREFER_DIGIT)
+
+    text, metrics = run(engine, method, "")
+
+    assert text == ""
+    assert_finish(method, metrics, "grammar_complete")
+    assert engine.target_model.calls == 0
